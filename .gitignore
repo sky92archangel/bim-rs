@@ -1,0 +1,47 @@
+# --- Rust / Cargo ---
+# 工作区根在 src/：target/ 不带前导斜杠，覆盖任意层级（含 /src/target/）
+target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+# src/Cargo.lock 有意提交：本仓库是可执行应用工作区
+
+# --- 测试样本 / 覆盖率产物：只保留手写小样本，忽略生成物 ---
+testdata/generated/
+coverage/
+tarpaulin-report.html
+flamegraph.svg
+perf.data*
+*.lcov
+lcov.info
+
+# --- 本地产物 ---
+/dist/
+/benchmarks/baseline.json
+.workbuddy/
+
+# --- 浏览器端（apps/web）---
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+
+# --- 环境变量 / 密钥 ---
+.env
+.env.*
+!.env.example
+
+# --- 日志 ---
+*.log
+
+# --- 编辑器 / 系统 ---
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.history/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+._*

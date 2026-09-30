@@ -1,0 +1,7 @@
+# 钉死工具链，保证全队编出同样的东西。
+# 当前与仓库安装一致：rustc 1.98.1 / rustup stable-x86_64-pc-windows-msvc。
+# 团队冻结版本后请把 channel 改为精确版本号（例如 "1.98.1"），不要长期挂 stable。
+[toolchain]
+channel = "stable"
+# rustfmt / clippy 已随 stable 安装；如需强制，可加：
+# components = ["rustfmt", "clippy"]

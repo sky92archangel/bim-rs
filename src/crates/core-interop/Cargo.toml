@@ -1,0 +1,27 @@
+[package]
+name = "core-interop"
+description = "四格式互操作：IFC / STEP / DXF / glTF（设计文档 7 章）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+core-model.workspace = true
+core-kernel.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+# M4 已启用：三格式读写的第三方库（版本统一走根 Cargo.toml 的版本目录）
+# - dxf：DXF 兼容子集**读取**（写出仍是自写序列化器，见 dxf.rs）
+# - gltf：glTF/GLB 结构 + 网格读取（只作三维预览，网格不进 B-Rep）
+# - ifc-lite-core：IFC4X3 实体级解析（MPL-2.0；选型见设计文档 7.5 与 readers.rs）
+#   ⚠ 不选 bimifc-parser：它强制传递依赖 eulumdat（AGPL-3.0-or-later），许可不可接受。
+dxf.workspace = true
+gltf.workspace = true
+ifc-lite-core.workspace = true
+# DWG 不在本清单：LibreDWG(GPLv3+) 绝不可链接进主程序，只能包成独立转换服务。

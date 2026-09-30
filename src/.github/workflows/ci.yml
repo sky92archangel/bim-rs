@@ -1,0 +1,73 @@
+# CI 门禁 —— 对应设计文档 2.6
+# 合并前必过：lint / deps / unit；golden / bench / license 随里程碑逐步启用。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  deps:
+    name: deps (架构方向 + 许可证)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 架构门禁：依赖方向单向向上（设计文档 2.2）
+      - run: cargo xtask check-deps
+      # 许可证白名单 + 禁依赖（cadrum / libredwg，见设计文档 1.4 / 7.8）
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  unit:
+    name: unit (纯逻辑)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+
+  # ---- 以下三项随里程碑启用，当前仅占位（不阻断合并）----
+  golden:
+    name: golden (出图黄金样本) [M5 启用]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo xtask golden
+
+  bench:
+    name: bench (性能回归) [M3 启用]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo xtask bench
+
+  license:
+    name: license (LGPL 声明随附) [发布前启用]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 发布产物必须随附 LGPL-2.1 声明，并保证终端用户可替换 WASM 组件（设计文档 10.4 R4）
+      - run: cargo xtask license-check

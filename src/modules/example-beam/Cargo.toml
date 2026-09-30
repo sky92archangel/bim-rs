@@ -1,0 +1,21 @@
+[package]
+name = "example-beam"
+description = "示例专业模块：只依赖 core-sdk，用来做 SDK 体检（设计文档第 9 章）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# ⚠ 铁律 3：模块只允许依赖 core-sdk（它自带 core-model 门面）。
+#   cargo xtask check-deps 会校验这一行不许长胖。
+core-sdk.workspace = true
+
+# M7b：JSON 往返单测（serde_json 是外部 crate，非内部依赖，不进铁律 3 的
+# 内部依赖校验——规则 B 只看 core-*；[dependencies] 段保持只有 core-sdk）。
+[dev-dependencies]
+serde_json.workspace = true

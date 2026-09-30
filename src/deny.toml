@@ -1,0 +1,64 @@
+# cargo-deny 配置 —— CI 的"依赖与许可"门禁（见设计文档 2.6）
+# 用法：cargo deny check
+#
+# 本文件按 **cargo-deny 0.20** 的配置语义维护。0.19→0.20 有两处会导致误报，
+# 已在下面就地说明（`private.ignore` / `allow-wildcard-paths`），改动理由见 M1 结论。
+
+[graph]
+all-features = false
+# 内核后端在 M0 才启用；此处不以其为准判定依赖图
+exclude-dev = false
+
+[advisories]
+ignore = []
+version = 2
+
+[licenses]
+# 只允许宽松 / 弱 copyleft（文件级）许可进入依赖图。
+#
+# 这是一份**前瞻白名单**：列表里若干项当前依赖图尚未使用（如为 M4 预留的 MPL-2.0），
+# 因此"未遇到该许可"的提醒对本项目没有信息量，关掉以免淹没真正的告警。
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",                 # ifc-lite / bimifc：文件级 copyleft，可静态链接（见 7.5）
+]
+confidence-threshold = 0.9
+# occt-wasm 的 Rust crate 本体是 MIT/Apache，其**内嵌 WASM 产物**为 LGPL-2.1-only。
+# WASM 以动态产物形态分发，须在发布产物中随附 LGPL 声明并保证可替换（见设计文档 10.4 R4）。
+exceptions = [
+    { allow = ["LGPL-2.1-only", "MIT", "Apache-2.0"], name = "occt-wasm" },
+]
+# 本仓库全部 crate 都 `publish = false`（平台层闭源，见根 Cargo.toml），
+# 因此 `license = "Proprietary"` 不构成 SPDX 解析问题——**它们不对外分发**。
+# cargo-deny 0.20 起要求显式声明这一点，否则会把它们报成 "unlicensed"。
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# 内部 crate 之间一律 `path` 依赖且 `publish = false`，其版本需求必然解析成 `*`。
+# 这不是"版本漂移风险"（这些 crate 不发到 registry），故对 path 依赖放行通配。
+# 没有任何一个**外部**依赖带通配版本——那仍会被 `wildcards = "deny"` 拦下。
+allow-wildcard-paths = true
+deny = [
+    # 一阶段明确不引入 cadrum（设计文档 1.4 决策二）
+    { name = "cadrum", reason = "一阶段不引入；仅作可选观察位（设计文档 1.4 决策二）" },
+    # DWG：GPLv3+ 有传染性，绝不可进依赖图，只能进程隔离（设计文档 7.8）
+    { name = "libredwg", reason = "GPLv3+ 只能包成独立转换服务，禁止静态链接（设计文档 7.8）" },
+    { name = "libredwg-sys", reason = "同上" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

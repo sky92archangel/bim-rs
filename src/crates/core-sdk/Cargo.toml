@@ -1,0 +1,19 @@
+[package]
+name = "core-sdk"
+description = "二次开发 SDK：trait 契约 + 注册表（只定义，不实现）（设计文档第 9 章）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# SDK 是"模块唯一被允许依赖的 crate"，因此它同时承担 core-model 的门面。
+# 模块里写 `use core_sdk::model::Element;` 即可，**不要**直接依赖 core-model。
+core-model.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true

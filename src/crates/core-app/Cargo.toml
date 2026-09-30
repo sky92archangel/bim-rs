@@ -1,0 +1,30 @@
+[package]
+name = "core-app"
+description = "应用服务层：用例编排、句柄映射、配方执行（设计文档第 8 章）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# 透传真实内核后端，使 `GeometryService::new()` 在本层可用：
+#   cargo test -p core-app --features occt --release
+# M1 起提供；未启用时 `Kernel::new()` 返回 Unsupported（**不**静默退回 mock）。
+occt = ["core-kernel/occt"]
+
+[dependencies]
+core-kernel.workspace = true
+core-model.workspace = true
+core-doc.workspace = true
+core-interop.workspace = true
+core-sdk.workspace = true
+thiserror.workspace = true
+glam.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+zip.workspace = true

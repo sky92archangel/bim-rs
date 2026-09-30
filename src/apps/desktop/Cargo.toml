@@ -1,0 +1,48 @@
+[package]
+name = "bim-desktop"
+description = "桌面端外壳：egui + wgpu（eframe），选型见设计文档 1.6"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bim-desktop"
+path = "src/main.rs"
+
+[features]
+# 默认【不】编译 GUI：eframe/wgpu 体量大（数百个依赖），而真正的视口、
+# 拾取、paint callback 属 M1+ 交付物。骨架期让 `cargo build --workspace`
+# 保持轻量、可秒级验证。需要真实窗口时：
+#   cargo run -p bim-desktop --features gui
+default = []
+gui = ["dep:eframe", "dep:egui", "dep:egui-wgpu"]
+# 透传真实内核后端（M1）：`cargo run -p bim-desktop --features occt` 用真内核。
+occt = ["core-kernel/occt", "core-app/occt"]
+
+[lints]
+workspace = true
+
+[dependencies]
+core-app.workspace = true
+core-doc.workspace = true
+core-interop.workspace = true
+core-kernel.workspace = true
+core-model.workspace = true
+core-sdk.workspace = true
+example-beam.workspace = true
+glam.workspace = true
+# GUI 依赖（默认关闭，见 [features]）
+eframe = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+egui-wgpu = { workspace = true, optional = true }
+
+# 仅测试用：e2e_mock.rs 直接开容器检查 drawing.json / views/ 段
+[dev-dependencies]
+zip.workspace = true
+# M7c：电力标杆模块 cable-tunnel 的 e2e（tests/e2e_power.rs）。
+# 铁律 8：根 Cargo.toml 仅 members 段允许加行（workspace.dependencies 不动），
+# 故此处用 path 直连而不是 workspace 继承（example-beam 的 workspace 继承先例
+# 在 M6 已就位，本批不动它）。
+cable-tunnel = { path = "../../modules/cable-tunnel" }

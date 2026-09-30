@@ -1,0 +1,24 @@
+[package]
+name = "core-kernel"
+description = "内核适配层：唯一直接接触 occt-wasm 的地方（设计文档第 3 章）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+glam.workspace = true
+# 真实内核后端（M0 接入）。以 optional 形式登记：默认构建【不编译】它，
+# 待 M0 把 Kernel::new() 接上 occt 后端后，用 --features occt 启用。
+# ⚠ 接入前先核对 v4 的实际 API 是否与设计文档 3.4 / 附录 C 一致。
+occt-wasm = { workspace = true, optional = true }
+
+[features]
+default = []
+# 启用真实 occt-wasm 后端（M0 交付物，当前尚未接线）
+occt = ["dep:occt-wasm"]

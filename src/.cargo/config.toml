@@ -1,0 +1,9 @@
+# Cargo 别名：让 README 里记录的 `cargo xtask <task>` 开箱即用。
+#
+# 展开后等价于：cargo run --quiet --package xtask -- <task>
+# 例：cargo xtask check-deps  →  cargo run --quiet -p xtask -- check-deps
+#
+# 说明：别名在**工作区根目录**生效（本文件所在目录即根）。xtask 自身通过
+# `env!("CARGO_MANIFEST_DIR")` 定位工作区根，因此从任意子目录执行结果一致。
+[alias]
+xtask = "run --quiet --package xtask --"

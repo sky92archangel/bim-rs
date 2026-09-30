@@ -1,0 +1,113 @@
+# =============================================================================
+# 轻量化 BIM 内核平台 —— Cargo workspace 根
+# 结构与依赖方向严格对应《轻量化BIM内核平台_软件设计文档》第 2 章。
+#
+# 三条铁律（见设计文档 1.2 / 2.2）：
+#   1. core-kernel 不向上暴露任何 occt_wasm:: 类型；
+#   2. 依赖方向单向向上，禁止循环依赖；
+#   3. modules/* 只允许依赖 core-sdk。
+# 用 `cargo xtask check-deps` 自动校验，CI 中为硬门禁。
+# =============================================================================
+
+[workspace]
+resolver = "3"
+members = [
+    "xtask",
+    "crates/core-kernel",
+    "crates/core-model",
+    "crates/core-doc",
+    "crates/core-interop",
+    "crates/core-sdk",
+    "crates/core-app",
+    "crates/core-testkit",
+    "modules/example-beam",
+    "modules/cable-tunnel",
+    "apps/desktop",
+    "apps/server",
+]
+# 说明：apps/web 是 TS + npm 工程，不是 cargo 成员（见 apps/web/README.md）。
+# vendor/occt-wasm 是上游 crate 的本地补丁副本（见 vendor/occt-wasm/PATCHES.md），
+# 由下方 [patch.crates-io] 指向；它是独立包、**不是** workspace 成员，故排除。
+exclude = ["vendor/occt-wasm"]
+
+# -----------------------------------------------------------------------------
+# 本地补丁：把 occt-wasm 4.0.0 指向本地修复副本。
+#
+# 上游 4.0.0 的 OcctKernel::new() 用空 Linker 实例化 Emscripten/WASI 产物，
+# 导致内核无法装载（unknown import: env::emscripten_get_preloaded_image_data）。
+# vendor/occt-wasm 内已修补（见其 PATCHES.md）。上游发布修复版后按该文档移除本段。
+# 注意：patch 只改 occt-wasm 的解析来源，不放宽依赖方向判定——core-kernel 仍是
+# 唯一允许出现 occt-wasm 的 crate（`cargo xtask check-deps` 仍为硬门禁）。
+# -----------------------------------------------------------------------------
+[patch.crates-io]
+occt-wasm = { path = "vendor/occt-wasm" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"          # occt-wasm 要求 Rust 1.95+（见设计文档 2.3）
+license = "Proprietary"        # 平台层闭源；仅内核为 LGPL-2.1-only 的 WASM 产物
+publish = false                # 平台层不发布到 crates.io
+
+[workspace.dependencies]
+# --- 本仓库内部 crate（统一在此声明，成员一律写 `xxx.workspace = true`）------
+# 好处：版本与路径只有一处；`cargo xtask check-deps` 读这一节即可画出依赖图。
+core-kernel = { path = "crates/core-kernel" }
+core-model = { path = "crates/core-model" }
+core-doc = { path = "crates/core-doc" }
+core-interop = { path = "crates/core-interop" }
+core-sdk = { path = "crates/core-sdk" }
+core-app = { path = "crates/core-app" }
+core-testkit = { path = "crates/core-testkit" }
+example-beam = { path = "modules/example-beam" }
+
+# --- 几何内核：仅 core-kernel / core-interop 使用（一阶段唯一内核依赖）--------
+# ⚠ 版本差异：设计文档 2.3 写作时为 v3；镜像实测最新为 4.0.0，故此处取 "4"。
+#   M0 接入前必须先核对 v4 的实际 API 是否与设计文档 3.4 的假设一致（见 README）。
+occt-wasm = { version = "4", default-features = false }
+
+# cadrum：一阶段【不引入】。若将来需要"原生性能快照"，再按可选 feature 单独加，
+# 且必须走独立合规评审（静态链接 OCCT 的 LGPL 义务更重）。见设计文档 1.4 决策二。
+# cadrum = { version = "0.8", optional = true }
+
+# --- 通用 --------------------------------------------------------------------
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+glam = { version = "0.30", features = ["serde"] }   # 向量/矩阵；内部统一用 glam（不用内核的 Vec3）
+#   ⚠ 必须开 serde：View/Entity2D/Sheet 里的 DVec2/DVec3 要能进 .bimdoc
+
+# --- 互操作（M4 已启用）-----------------------------------------------------
+# 由 core-interop 以 `xxx.workspace = true` 引用（版本只在本节维护一处）。
+# 三者许可均通过 deny.toml 白名单：dxf=MIT、gltf=MIT/Apache-2.0、ifc-lite-core=MPL-2.0。
+gltf = "1"                     # gltf-rs：结构 + 网格读取（三维预览）
+dxf = "0.6"                    # dxf-rs：DXF 兼容子集读取
+ifc-lite-core = "17"           # IFC4X3 纯 Rust 解析器（MPL-2.0）
+# DWG：不在本清单 —— LibreDWG(GPLv3+) 绝不可链接进主程序，只能包成独立转换服务，
+# 经 IPC/HTTP 调用（见设计文档 7.8）。
+
+# --- 文档容器（.bimdoc 的 zip 打包 / 解包，设计文档 4.2）---------------------
+# 只开 deflate：默认 features 会拖进 aes / bzip2 / zstd / time 等一串无关依赖。
+# 许可：zip 及其 deflate 依赖链均为 MIT / Apache-2.0（已在 deny.toml 白名单内）。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# --- 二维绘制（出图 / 投影，零新依赖，见设计文档 7.7）------------------------
+kurbo = "0.11"
+lyon = "1"
+
+# --- 渲染（桌面 / 服务端可选）------------------------------------------------
+wgpu = "24"
+
+# --- 桌面 GUI（仅 apps/desktop 使用，选型见设计文档 1.6）----------------------
+# 关键：egui + eframe(wgpu) + egui-wgpu 三者版本必须对齐。
+egui = "0.29"
+egui-wgpu = "0.29"
+eframe = { version = "0.29", default-features = false, features = ["wgpu"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"           # 内核适配层可局部 allow，但需评审
+
+[workspace.lints.clippy]
+unwrap_used = "deny"           # 生产代码禁止 unwrap（测试模块可 #[allow]）
+panic = "deny"                 # 生产代码禁止 panic（测试模块可 #[allow]）

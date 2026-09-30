@@ -1,0 +1,30 @@
+[package]
+name = "bim-server"
+description = "无头服务端外壳：批处理 / 转换服务（DWG 隔离运行的宿主，设计文档 7.8）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bim-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# 透传真实内核后端（M1）：无头服务端也能用真内核跑批处理。
+occt = ["core-kernel/occt", "core-app/occt"]
+
+[dependencies]
+core-app.workspace = true
+core-doc.workspace = true
+core-interop.workspace = true
+core-kernel.workspace = true
+core-model.workspace = true
+core-sdk.workspace = true
+example-beam.workspace = true
+glam.workspace = true

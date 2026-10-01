@@ -30,8 +30,11 @@
 //! **显式**选择占位后端，绝不静默把 `GeometryService::new()` 的失败吞掉。
 //! 真实内核待 `occt-wasm` 可实例化后再切（见仓库 README 的「M1」节）。
 
-use core_doc::{DraftingStandard, Drawing, Entity2D, View, ViewKind, ViewOrientation};
-use core_kernel::KernelError;
+use core_doc::{
+    Camera, DraftingStandard, Drawing, Entity2D, PickFilter, PickResult, View, ViewKind,
+    ViewOrientation,
+};
+use core_kernel::{KernelError, MeshData};
 use core_model::{Document, ElementId, PropertyMap, ShapeId, ViewId};
 use core_sdk::{Module, OpInput, SdkError};
 use std::collections::BTreeMap;
@@ -43,6 +46,7 @@ use crate::evolution_align::HistoryRecord;
 use crate::geometry_service::GeometryService;
 use crate::interop_service::InteropService;
 use crate::module_host::ModuleHost;
+use crate::picker_service::KernelPicker;
 use crate::projection_service::{project_shape, reproject_into};
 use crate::store;
 use crate::topo_naming::face_hash_names_from_handle;
@@ -590,6 +594,35 @@ impl CoreSession {
             view,
             standard,
         )
+    }
+
+    // ---------- 渲染 / 拾取（GUI 消费，M8 起点） ----------
+
+    /// 网格化某形状（渲染层消费；内部先 `resolve` 惰性重建句柄）。
+    ///
+    /// 为什么放会话层：网格化需要可变内核（`Kernel::tessellate` 是 `&mut self`），
+    /// 而 [`CoreSession::geometry`] 只给了只读访问——把 "resolve → tessellate"
+    /// 两步合成一个门面，调用方（桌面端视口）不再需要自己拆借用。
+    pub fn tessellate(&mut self, shape: ShapeId, linear: f64, angular: f64) -> AppResult<MeshData> {
+        let handle = self.geometry.resolve(self.document.doc(), shape)?;
+        Ok(self
+            .geometry
+            .kernel_mut()
+            .tessellate(handle, linear, angular)?)
+    }
+
+    /// 三维拾取（[`KernelPicker`] 的门面转发）：屏幕坐标 → 世界射线 → 面组粗筛 →
+    /// 内核精算 → 元素反查。
+    ///
+    /// 返回语义与 [`KernelPicker::pick`] 一致：**未命中是 `Ok(None)`、错误是 `Err`**（可区分）。
+    /// `&mut geometry` 与 `&document` 的借用拆分在门面内部完成（不相交字段），调用方不用自己拆。
+    pub fn pick_at(
+        &mut self,
+        screen: (f32, f32),
+        camera: &dyn Camera,
+        filter: PickFilter,
+    ) -> AppResult<Option<PickResult>> {
+        KernelPicker::new(&mut self.geometry, self.document.doc()).pick(screen, camera, filter)
     }
 
     // ---------- 持久化 ----------

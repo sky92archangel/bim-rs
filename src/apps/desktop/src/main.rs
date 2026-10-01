@@ -1,13 +1,17 @@
-//! # 桌面端外壳 `bim-desktop`（骨架期）
+//! # 桌面端外壳 `bim-desktop`
 //!
-//! 真实 GUI（egui + wgpu 视口、拾取、属性面板）属 M1+ 交付物。
-//! 当前 `main` 做一件更有价值的事：**把五层逐层装配、跑通端到端建模+出图闭环并打印诊断**——
+//! 两种运行形态（feature 分支，同一入口）：
+//!
+//! - **`--features gui`（M8 起点，已实现）**：真实图形窗口——视口（轨道相机 +
+//!   面着色渲染）、拾取（复用 §6.6 KernelPicker 链路）、属性面板、构件列表、
+//!   操作日志。实现见 [`gui`]。
+//! - **默认（无 feature）**：控制台端到端演示——把五层逐层装配、跑通端到端
+//!   建模+出图闭环并打印诊断：
 //!
 //! ```text
 //! CoreSession → 装载 ExampleBeam → 造一根梁 → 造几何 → 出图（俯视投影）→ 存 .bimdoc → 重开 → 断言
 //! ```
 //!
-//! 需要真实窗口时：`cargo run -p bim-desktop --features gui`（此时才编译 eframe）。
 //! 自动化断言载体：`apps/desktop/tests/e2e_mock.rs`（门禁自动跑，`assert!` 形态）。
 //!
 //! ## 为什么现在能直接用 `example-beam` 自己的算子
@@ -18,7 +22,7 @@
 //! 注册的算子**（`example.beam.rect`），不再需要骨架期那个临时的"只发一步
 //! MakeBox"方盒模块。
 //!
-//! ⚠ **注意本演示跑在占位内核上**：[`CoreSession::new`] 显式选用
+//! ⚠ **注意控制台演示跑在占位内核上**：[`CoreSession::new`] 显式选用
 //! [`core_app::GeometryService::with_mock_kernel`]，其平移只是把偏移累加进占位
 //! 几何的 `origin`（并写进 `MOCK-BREP v3` 文本），**不是** OCCT 的精确布尔/变换。
 //! 出图环的 P0 投影同理：mock 内核的投影是**理想化正面视（忽略视向）**，
@@ -28,10 +32,30 @@
 
 use std::process::ExitCode;
 
+#[cfg(feature = "gui")]
+mod gui;
+
+#[cfg(feature = "gui")]
+fn main() -> ExitCode {
+    match gui::run_gui() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("✗ {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "gui"))]
 use core_app::CoreSession;
+
+#[cfg(not(feature = "gui"))]
 use core_doc::{DraftingStandard, ViewOrientation};
+
+#[cfg(not(feature = "gui"))]
 use example_beam::{CATEGORY, ExampleBeam, GEOMETRY_OP_ID};
 
+#[cfg(not(feature = "gui"))]
 fn main() -> ExitCode {
     println!("轻量化 BIM 内核平台 —— 桌面端（骨架期）");
     println!("真实 GUI 属 M1+ 交付物；本次运行做的是端到端建模闭环演示。\n");
@@ -45,6 +69,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(not(feature = "gui"))]
 fn run() -> Result<(), String> {
     // --- 1. 组装会话并装载模块 ---
     let mut session = CoreSession::new().map_err(|e| e.to_string())?;

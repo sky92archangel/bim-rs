@@ -22,6 +22,7 @@ members = [
     "crates/core-testkit",
     "modules/example-beam",
     "modules/cable-tunnel",
+    "modules/hvac-duct",
     "apps/desktop",
     "apps/server",
 ]

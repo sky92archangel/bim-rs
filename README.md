@@ -59,7 +59,9 @@ cargo test -p core-kernel --features occt --release
 │  ├─ core-app/                # 第 4 层：应用服务（用例编排）
 │  └─ core-testkit/            # 测试夹具与黄金样本
 ├─ modules/
-│  └─ example-beam/            # 最小示例模块（用于给 SDK 接口"体检"）
+│  ├─ example-beam/            # 最小示例模块（用于给 SDK 接口"体检"）
+│  ├─ cable-tunnel/            # 电力侧标杆模块（M7c：矩形隧道段 / 电缆排管段）
+│  └─ hvac-duct/               # 建筑侧暖通模块（M7：矩形风管段 / 变径管 Loft）
 ├─ apps/
 │  ├─ desktop/                 # 桌面端壳（egui + wgpu，见 1.6）
 │  ├─ server/                  # 服务端壳（无头）
@@ -108,7 +110,14 @@ cargo test -p core-kernel --features occt --release
    （版本只在根 `Cargo.toml` 维护一处，避免走散）。
    `apps/desktop` 仍把 `egui` / `egui-wgpu` / `eframe` 声明为 **optional**（默认 feature 不开），
    因此 `cargo build --workspace` 仍**不编译**它们，骨架构建保持轻量。
-   要真实窗口时：`cargo run -p bim-desktop --features gui`。桌面壳在 M1 起启用。
+   ⚠ **订正（M7 时点，M8 已解决）**：M7 时点 `--features gui` 只负责**编译**
+   eframe/egui/egui-wgpu 依赖，`main.rs` 里没有任何窗口代码（开了也不弹窗）。
+   **M8 起点已实现第一版真实 GUI**：`cargo run -p bim-desktop --features gui`
+   弹出图形窗口——三维视口（轨道相机 + 面着色 + 地面网格/坐标轴）、单击拾取
+   （复用 §6.6 `KernelPicker` 链路，命中面高亮）、属性面板、构件列表（三个专业
+   模块的算子按钮）、操作日志。实现见 `apps/desktop/src/gui.rs`（egui 0.29，
+   CPU 画家算法，零自定义 shader；`--features occt` 时真内核）。控制台端到端
+   演示仍保留（不带 `gui` feature 的默认形态）。
 4. **apps/web**：非 cargo 成员，仅占位（见 `apps/web/README.md`）。
 
 ---
@@ -534,6 +543,90 @@ M4 落地后由**独立对抗式复核**（fresh-eyes，非实现者）打穿，
 
 ---
 
+## M7：专业模块（✅ 已完成，2026-09-30 —— 电力侧与建筑侧各至少一个可用模块）
+
+M7 的定义（设计文档 10.1）：**专业模块** —— 电力侧与建筑侧各至少一个可用模块（依赖 M6）。
+落地口径：模块以 Recipe 模式挂接（`GeometryOp::apply` 只产出 `BuildStep` 序列，由 `core-app` 执行），
+**零 SDK 改动、不碰内核**——继 `example-beam`、`cable-tunnel` 之后，`hvac-duct` 不改一行 SDK
+就能挂上，即立项 P0 风险（"SDK 接口若贴合单一专业就废了"）的持续证伪。
+
+### 交付
+
+| # | 事项 | 说明 |
+|---|---|---|
+| M7a | **变长算子** | `Loft`（截面 N≥2）/ `MakeWire`（边 N≥1），`arity_ok` 单一事实源；`core-sdk/src/geometry_op.rs` 有专门的 M7a 用例（变长标注、零输入被配方门禁拒绝） |
+| M7b | **example-beam 第二算子** | `example.beam.hole`：MakeBox→MakeCylinder→Cut→Translate（圆孔板，布尔 Cut 真派发）——M6b-3 候选的 M7 落地 |
+| M7c | **电力侧标杆模块 `cable-tunnel`** | `power.tunnel.rect`（矩形隧道段：MakeBox→MakeCylinder→Cut→Translate）+ `power.tunnel.ductbank`（电缆排管段：MakeLineEdge×4→MakeWire→**Pipe**）；16 条单测 |
+| M7d | **建筑侧暖通模块 `hvac-duct`** | `hvac.duct.rect`（矩形风管段：MakeBox→Translate）+ `hvac.duct.transition`（变径管：两端截面→MakeWire→**Loft**(is_solid+ruled)→Translate，11 步配方）+ `hvac.duct.width` 宽度标注规则；17 条单测。默认 500×320×1200 mm 镀锌钢板，宽 >2500 落 warning 不 fail |
+
+### 为什么变径管是 M7 的关键一仗
+
+`hvac.duct.transition` 是**第一个使用变长算子 Loft 的模块**：
+
+- 起端 400×400、末端 800×800、延米 1000，两截面绕同一 anchor 居中、`ruled=true` → **精确棱台**；
+- occt 腿体积 oracle 用解析式 `V = h/3 × (S1 + S2 + √(S1·S2))` = **373,333,333.33 mm³（±0.5%）**、
+  bbox 800×800×1000（±1e-6），实测全部命中；
+- mock 腿不硬凑：占位后端不支持 Loft，`hvac.duct.rect`（MakeBox/Translate）走 mock 五环，
+  变径管的真实 execute 断言放 occt 腿——**不假装支持**。
+
+### e2e（依赖终点铁律：模块的集成验证只放 `apps/desktop`）
+
+| 腿 | 文件 | 用例 | 结果 |
+|---|---|---|---|
+| mock（默认 CI） | `apps/desktop/tests/e2e_hvac.rs` | `hvac_module_passes_five_loop_minimal_check`：矩形风管五环（加载→建模→出图→存盘→再打开），含宽/高/延米属性往返与 Drawing 深相等 | ✅ 1 passed / 0.17s |
+| occt（`--features occt --release -- --test-threads=1`） | `apps/desktop/tests/e2e_hvac_occt.rs` | `duct_transition_loft_executes_with_exact_frustum_volume`（真内核 11 步 → Solid==1 → 棱台体积/bbox 双 oracle）+ `hvac_module_passes_five_loop_minimal_check_real`（真内核五环） | ✅ 2 passed / 19.74s |
+
+电力侧同构先例（M7c 时点已落）：`apps/desktop/tests/e2e_power.rs`（occt 腿 5 条：配方有序性 /
+配方可表达性 / rect 真执行落盘 / ductbank Pipe 端到端 / 五环）。
+
+### M7 门禁（2026-09-30 实测）
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| 格式 | `cargo fmt --all --check` | ✅ 0 |
+| clippy（默认腿） | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 |
+| clippy（occt 腿） | `cargo clippy -p bim-desktop --features occt --all-targets -- -D warnings` | ✅ 0 |
+| 架构 | `cargo xtask check-deps` | ✅ 合规（`hvac-duct` 内部依赖仅 `[core-sdk]`，铁律 3） |
+| 单元测试（默认腿全量） | `cargo test --workspace --no-fail-fast` | ✅ **720 passed / 0 failed / 2 ignored**（M6 收口基线 674 → +46：cable-tunnel 16 + hvac-duct 17 + e2e_hvac 1 + M7a/M7b 算子用例） |
+| 三模块单测 | `cargo test -p hvac-duct -p cable-tunnel -p example-beam` | ✅ **49 passed**（hvac-duct 17 + cable-tunnel 16 + example-beam 16） |
+| occt 腿（bim-desktop） | `cargo test -p bim-desktop --features occt --release -- --test-threads=1` | ✅ **14 passed / 0 failed**（e2e_mock 5 + e2e_occt 1 + e2e_power 5 + e2e_hvac 1 + e2e_hvac_occt 2） |
+
+> e2e_hvac.rs 踩过的两个小坑：`geometry_op_ids()` 迭代项是 `&&str`，`id == &str` 直接编译错，
+> 且 clippy 要求用 `.contains(&ID)` 而非 `iter().any()`；`ModuleHost` 没有直接的
+> `geometry_op_ids()` 方法，要走 `session.modules().registry().geometry_op_ids()`。
+
+---
+
+## M8：桌面端 GUI 第一版（✅ 已完成，2026-10-01 —— egui 真实窗口：视口 / 拾取 / 属性面板）
+
+**交付（`src/apps/desktop/src/gui.rs`，~900 行，`gui` feature 门控；egui 0.29 + eframe/wgpu）**：
+
+| 能力 | 说明 |
+|---|---|
+| 三维视口 | 轨道相机（Z 朝上，mm 单位）+ CPU 画家算法（三角形按相机空间深度降序组装进单个 `epaint::Mesh`，零自定义 shader、零 wgpu 生命周期代码）+ 双面光照平面着色（\|n·l\|）+ 地面网格（z=0，±6 m）与 RGB 坐标轴 |
+| 相机控制（实测校准） | 左键拖动旋转（**拖右＝物体右转、拖下＝相机降低**，两轴方向均按实机反馈校准）；右键或 Shift+左键平移；滚轮缩放（0.5 m ~ 500 m）；**无限俯仰**——越过极点由 `(pitch, yaw) → (±π−pitch, yaw+π)` 参数化翻转（同一眼点的等价参数化，画面无跳变），伴随 `pitch_drag_sign` 翻转保持拖动方向自洽 |
+| 拾取 | 视口相机实现 `core_doc::Camera::ray_through`（视口几何每帧喂给相机），单击走 `CoreSession::pick_at` → KernelPicker（网格粗筛 → 内核精算 → 元素反查）全链；命中面橙色高亮、选中构件 35% 混色。mock 腿下命中后精算必然 `Err`（无真面拓扑，"绝不假命中"铁律），日志响亮并**引导用真内核运行**；点击空白处不再静默（补"未命中"日志） |
+| 面板 | 顶栏（内核名 / 构件·几何·模块计数 / 适配视图 / 清空选择）；左栏构件列表 + 六条算子按钮（三模块；mock 不支持的算子点击后日志响亮报 `Unsupported`）；右栏属性面板（参数表 / 拾取信息 / 网格统计）；底栏日志（stick_to_bottom，cap 200） |
+| CJK 字体 | egui 默认字体无中文字形；运行时从 `C:/Windows/Fonts` 加载 msyh.ttc → simhei.ttf → simsun.ttc → Deng.ttf 兜底，push 到 families 末尾作 fallback |
+| `CoreSession` 两个门面 | `tessellate(shape, linear, angular)`（resolve→tessellate 合一，调用方不再拆借用）、`pick_at(screen, camera, filter)`（KernelPicker 转发，`&mut geometry` 与 `&document` 不相交字段借用拆分在门面内完成） |
+| 失败口径 | 全程不 panic 不 unwrap（workspace lint `unwrap_used`/`panic` = deny）；装载 / 建几何 / 网格化 / 拾取失败一律写底栏日志 |
+
+**启动**：`cargo run -p bim-desktop --features gui`（mock 内核，秒开）；`--features gui,occt`（**真内核**，首帧 JIT 编译 occt-wasm 慢，属正常）。控制台演示形态不变（无 `gui` feature 时仍走 `run()`）。
+
+**门禁（2026-10-01 实测）**：
+
+| 门禁 | 结果 |
+|---|---|
+| fmt | ✅ 0 |
+| clippy（default / gui / gui,occt 三腿，`-D warnings`） | ✅ 全 RC=0 |
+| 默认腿全量 | ✅ **720 passed / 0 failed / 2 ignored**（session 门面未破坏任何既有用例） |
+| GUI 实机（mock 腿） | ✅ 窗口持续 32 分 48 秒，退出码 0 |
+| GUI 实机（**occt 真内核腿，首次**） | ✅ 窗口持续 **1 小时 51 分 57 秒**，退出码 0（无 panic、无错误输出） |
+
+> egui 0.29 三个版本事实（升级时需复核）：① epaint `TextureId` 只有 `Managed(u64)` / `User(u64)`，字体纹理是 `Managed(0)`——**没有 `Egui` 变体**；② `FontDefinitions.font_data` 直接收 `FontData`（不收 `Arc<FontData>`）；③ 浮点字面量传 f32 参数须写 `1.0_f32`（rustc 淘汰 f32 回退，未来成硬错误）。
+
+---
+
 ## 下一步（对应设计文档 10.1 里程碑）
 
 | 里程碑 | 本仓库起点 |
@@ -543,3 +636,7 @@ M4 落地后由**独立对抗式复核**（fresh-eyes，非实现者）打穿，
 | **M2 数据层** | ✅ **已完成**（2026-09-23 收口）：四类内置基准元素 + Relations + 事务；并补上 §4.3 的**事务强制**（`Document` 字段私有化 + 只读访问器）、§4.6.4 的**轴号编号可配置**（跳 I/O/Z）、以及 §6.4 要用的**关系图遍历原语**（`graph.rs`）。门禁 **474 passed / 0 failed / 2 ignored**，详见上一节 |
 | **M3 几何构造** | ✅ **已完成**：新增 `MakeCone`/`MakeTorus`，并接线 `Rotate`/`Extrude`/`Revolve`（**不再**显式 `Unsupported`）；容差对齐设计文档 §5.2（`TOL_POINT`/`TOL_FACE`/`TOL_ANGLE`/`TOL_SELF_INTERSECTION` + 角度容差独立于长度）；布尔复合体按 §5.3 提供 `split_solids`/`single_solid`（多体**响亮报错**、空结果报 `EmptyResult`，绝不静默取 first）；补齐几何查询 `bounding_box`/`surface_area`。门禁 **509 passed / 0 failed / 2 ignored**，occt 腿（`core-kernel`）**89 passed / 0 failed** |
 | **M4 互操作基线** | ✅ **已完成（STEP 明确宣告未达成）**：**DXF / glTF / IFC4X3 三格式达标**（DXF 解析实体读写、glTF 真解析结构、IFC 达标线三要素「构件+属性集+空间层级」齐备），**STEP 不交付并显式报 `Err(Unsupported)`**（上游 `occt-wasm` 4.x 构建形态缺陷：文件系统未编入 WASM，host 侧不可修）；三个内核算子 `sew`/`sew_and_solidify`/`fix_shape`/`unify_same_domain` 接线完成；上游 trap 钉成 3 条"注定会失败"的缺陷钉子 + 声明层守卫"一把锁的两面"（含 glTF 导出）。经独立 QA 抓出并修复 3 条 P1。门禁 **533 passed / 0 failed / 2 ignored**，occt 腿（`core-kernel`）**92 passed / 0 failed**、`core-app` **159 passed / 0 failed**，详见上一节 |
+| **M5 出图 P0 子集** | ✅ **已完成**：真实视向投影（平面视图绑 `Level`、立面/剖面绑 `Grid`）；HLR 六类曲线 → 可编辑二维实体接线；`BuildOp` 八算子（Fillet/Chamfer/Shell/Offset/Thicken/Loft/Sweep/Pipe）随 M5-B6.2b 接线真实派发（24 变体全接线，后端不具备的能力仍显式 `Unsupported`）；"模型→视图→标注→图纸"闭环 + 关联更新（`rebuild_index`/`sync_drawing_registry`）；DXF 导出圆是真解析实体 |
+| **M6 SDK + 示例模块** | ✅ **已完成（2026-09-30 收口）**：五环接口体检全部落为自动化断言（mock 腿 5 条 + occt 腿 8 环 20 断言，真内核全链 17.17s）；容器 v2（`FORMAT_VERSION` 1→2，`drawing.json` + `views/<viewid>.json`，修复「重开丢图纸」）；CoreSession 出图门面（`create_view`/`regenerate_view`/`project_shape`）；`rebuild_geometry` 为 `update_after_commit` 首个生产调用方（复用原 `ShapeId`、演化优先/指纹退避、定向重投+标脏）。门禁 **674 passed / 0 failed / 2 ignored**，bim-desktop occt 腿 6 passed |
+| **M7 专业模块** | ✅ **已完成（2026-09-30）**：电力侧 `cable-tunnel`（矩形隧道段 + 电缆排管段 MakeWire→Pipe）+ 建筑侧 `hvac-duct`（矩形风管段 + 变径管 Loft，首个变长算子模块）；变长算子 `Loft`/`MakeWire`（`arity_ok` 单一事实源）；example-beam 第二算子（布尔 Cut 圆孔板）。全部**零 SDK 改动**挂接。门禁 **720 passed / 0 failed / 2 ignored**，三模块 49 单测，bim-desktop occt 腿 **14 passed**（含棱台体积 oracle），详见「M7」节 |
+| **M8 桌面 GUI（新增起点）** | ✅ **已完成（2026-10-01）**：egui 0.29 + eframe/wgpu 真实窗口（`src/apps/desktop/src/gui.rs`，`gui` feature 门控）；三维视口（轨道相机 + CPU 画家算法 + 双面光照）、相机控制（实测校准两轴方向 + 无限俯仰过极点翻转）、拾取全链（`ray_through` → KernelPicker）、CJK 字体、`CoreSession` 两个门面（`tessellate`/`pick_at`）。门禁 fmt/clippy 三腿全绿、默认腿 720 passed；GUI 实机：mock 腿 32m48s / **occt 真内核腿 1h51m57s** 均退出码 0，详见「M8」节 |

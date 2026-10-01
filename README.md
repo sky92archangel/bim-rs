@@ -622,6 +622,7 @@ M7 的定义（设计文档 10.1）：**专业模块** —— 电力侧与建筑
 | 默认腿全量 | ✅ **720 passed / 0 failed / 2 ignored**（session 门面未破坏任何既有用例） |
 | GUI 实机（mock 腿） | ✅ 窗口持续 32 分 48 秒，退出码 0 |
 | GUI 实机（**occt 真内核腿，首次**） | ✅ 窗口持续 **1 小时 51 分 57 秒**，退出码 0（无 panic、无错误输出） |
+| occt 腿全量（**M7 遗留拆环收口**） | ✅ **21 passed / 0 failed**（e2e_mock 5 + **e2e_occt 8**〔8 环拆为独立用例，104.56s〕+ e2e_power 5 + e2e_hvac 1 + e2e_hvac_occt 2） |
 
 > egui 0.29 三个版本事实（升级时需复核）：① epaint `TextureId` 只有 `Managed(u64)` / `User(u64)`，字体纹理是 `Managed(0)`——**没有 `Egui` 变体**；② `FontDefinitions.font_data` 直接收 `FontData`（不收 `Arc<FontData>`）；③ 浮点字面量传 f32 参数须写 `1.0_f32`（rustc 淘汰 f32 回退，未来成硬错误）。
 

@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use core_kernel::{Kernel, KernelError, KernelResult, MeshData, ShapeHandle};
-use core_model::{Document, GeometryRecord, ShapeId};
+use core_model::{Document, GeometryRecord, ShapeId, Value};
 use core_sdk::{BuildOp, OpOutput};
 
 use crate::error::{AppError, AppResult};
@@ -470,6 +470,59 @@ impl GeometryService {
         Ok(ExecutedRecipe {
             results,
             warnings,
+            evolutions,
+        })
+    }
+
+    /// **对既有句柄直接执行单算子**（G3 原生算子门面的执行底座）。
+    ///
+    /// 与 [`Self::execute`] 的差异：输入不是配方步骤，而是**调用方解析好的句柄**
+    /// （文档既有几何经 [`Self::resolve`] 懒重建）；配方由本方法构造——单步
+    /// `BuildStep::new(op)` + `args` + `inputs` 顺序引用（第 k 个输入即
+    /// `inputs[k]`）。
+    ///
+    /// 复用 [`Self::execute_step`] 的**全部算子分派**（含 `Fillet`/`Chamfer`/`Shell`
+    /// 的 `single_solid` 子选择链路与 `Fuse`/`Cut` 的带历史布尔）与回滚纪律：
+    /// 本步失败无产出可回滚；**输入句柄是调用方的**（文档既有几何），不在此释放
+    /// ——`execute_step` 内部的临时句柄（`single_solid` / 选择器解析）照旧自管。
+    ///
+    /// # Errors
+    /// 元数不匹配（[`BuildOp::arity_ok`] 单一口径）或算子执行失败时返回
+    /// [`AppError::RecipeNotExecutable`] / [`AppError::Kernel`]。
+    pub fn execute_native(
+        &mut self,
+        op: BuildOp,
+        args: &BTreeMap<String, Value>,
+        inputs: &[ShapeHandle],
+    ) -> AppResult<ExecutedRecipe> {
+        if !op.arity_ok(inputs.len()) {
+            return Err(AppError::RecipeNotExecutable(format!(
+                "{} 需要 {} 个输入形状，实得 {}",
+                op.label(),
+                op.arity(),
+                inputs.len()
+            )));
+        }
+        let mut step = core_sdk::BuildStep::new(op);
+        step.args = args.clone();
+        step.inputs = (0..inputs.len()).collect();
+
+        let mut results: Vec<ShapeHandle> = Vec::new();
+        let mut notices: Vec<String> = Vec::new();
+        let mut evolutions: Vec<(usize, HistoryRecord)> = Vec::new();
+        match self.execute_step(0, &step, inputs, &mut notices) {
+            Ok((handle, evolution)) => {
+                results.push(handle);
+                if let Some(evo) = evolution {
+                    evolutions.push((0, evo));
+                }
+            }
+            // 失败即净：本步无产出；输入句柄归调用方，不在此释放。
+            Err(err) => return Err(err),
+        }
+        Ok(ExecutedRecipe {
+            results,
+            warnings: notices,
             evolutions,
         })
     }
@@ -3045,5 +3098,165 @@ mod tests {
             (a_outer - a_wire).abs() < 1e-6,
             "外环与原 wire 面积应一致（{a_outer:.4} vs {a_wire:.4}）"
         );
+    }
+
+    // ===== G3：param_defs 键 ↔ execute 缺参报错对齐（计划 §8 风险 1）========
+
+    /// 全部 29 算子（与 core-sdk 清点钉同款清单；exhaustive match 保证同步）。
+    fn all_ops() -> Vec<BuildOp> {
+        let all: [BuildOp; 29] = [
+            BuildOp::MakeBox,
+            BuildOp::MakeCylinder,
+            BuildOp::MakeSphere,
+            BuildOp::MakeCone,
+            BuildOp::MakeTorus,
+            BuildOp::Extrude,
+            BuildOp::Revolve,
+            BuildOp::Fuse,
+            BuildOp::Cut,
+            BuildOp::Common,
+            BuildOp::Translate,
+            BuildOp::Rotate,
+            BuildOp::Sew,
+            BuildOp::SewAndSolidify,
+            BuildOp::FixShape,
+            BuildOp::UnifySameDomain,
+            BuildOp::Fillet,
+            BuildOp::Chamfer,
+            BuildOp::Shell,
+            BuildOp::Offset,
+            BuildOp::Thicken,
+            BuildOp::Loft,
+            BuildOp::Sweep,
+            BuildOp::Pipe,
+            BuildOp::MakeLineEdge,
+            BuildOp::MakeArcEdge,
+            BuildOp::MakeWire,
+            BuildOp::MakeFace,
+            BuildOp::ExtractWire,
+        ];
+        all.into_iter().collect()
+    }
+
+    /// 占位参数值（钉子补齐"其它必填键"用；选择器经 encode helper，禁手搓 JSON）。
+    fn placeholder_value(d: &core_sdk::ParamDef) -> Value {
+        use core_sdk::ParamKind;
+        match d.kind {
+            ParamKind::Length | ParamKind::Angle => Value::Float(1.0),
+            ParamKind::Int => Value::Int(1),
+            ParamKind::Bool => Value::Bool(true),
+            ParamKind::Selectors => {
+                if d.key == "face_selectors" {
+                    Value::Text(face_json(&[FaceSelector::ByIndex(0)]))
+                } else {
+                    Value::Text(edge_json(&[EdgeSelector::ByIndex(0)]))
+                }
+            }
+        }
+    }
+
+    /// **G3 钉 3（计划 §8 风险 1，正向）**：遍历全部算子，`param_defs` 的每个
+    /// **required** 键在「只缺它」时，`execute` 必须报**含该键名**的错误——
+    /// 防「表单改了、execute 不认」（`need()` 键名与 `param_defs` 漂移）。
+    ///
+    /// 构造：前置喂足输入（`a_cube`）+ 补齐该键**之前**的必填键（placeholder）——
+    /// `execute` 臂内参数从左到右求值、先报靠前缺键，所以「只缺第 i 个」须补齐
+    /// 前 i 个；这条顺序约定同时钉住了 `param_defs` 的**键序 = 臂内求值顺序**。
+    #[test]
+    fn param_defs_required_keys_align_with_execute_errors() {
+        for op in all_ops() {
+            let required: Vec<core_sdk::ParamDef> =
+                op.param_defs().into_iter().filter(|d| d.required).collect();
+            for (i, missing) in required.iter().enumerate() {
+                let mut step = core_sdk::BuildStep::new(op).from_steps((0..op.arity()).collect());
+                for d in &required[..i] {
+                    step.args.insert(d.key.to_string(), placeholder_value(d));
+                }
+                let mut steps: Vec<core_sdk::BuildStep> =
+                    (0..op.arity()).map(|_| a_cube()).collect();
+                steps.push(step);
+                let recipe = OpOutput::of(steps);
+
+                let mut g = GeometryService::with_mock_kernel();
+                match g.execute(&recipe) {
+                    Err(AppError::RecipeNotExecutable(msg)) => assert!(
+                        msg.contains(missing.key),
+                        "{op:?} 缺 `{}` 应报含键名错误，实得 {msg}",
+                        missing.key
+                    ),
+                    other => panic!(
+                        "{op:?} 只缺 `{}`（已补齐前 {i} 个必填键）应报缺参，实得 {other:?}",
+                        missing.key
+                    ),
+                }
+                assert_eq!(g.kernel().live_count(), 0, "缺参失败应回滚");
+            }
+        }
+    }
+
+    /// **G3 钉 4（反向）**：全部 `param_defs` 声明键补齐（required 用 placeholder、
+    /// 可选用各自 default）+ 喂足输入 → `execute` 的 Err（若有）**不含「缺少参数」**
+    /// ——证明 execute 需要的键都被 `param_defs` 覆盖（漏声明的键会报
+    /// 「缺少参数 X」；mock 后端对算子本身的 Unsupported / Geometry 照常透传）。
+    #[test]
+    fn all_declared_keys_satisfy_execute_so_no_missing_param_error() {
+        for op in all_ops() {
+            let mut step = core_sdk::BuildStep::new(op).from_steps((0..op.arity()).collect());
+            for d in op.param_defs() {
+                let v = match d.default {
+                    Some(core_sdk::ParamDefault::Float(f)) => Value::Float(f),
+                    Some(core_sdk::ParamDefault::Int(i)) => Value::Int(i),
+                    Some(core_sdk::ParamDefault::Bool(b)) => Value::Bool(b),
+                    Some(core_sdk::ParamDefault::Text(t)) => Value::Text(t.to_string()),
+                    // required 无预填 → placeholder
+                    None => placeholder_value(&d),
+                };
+                step.args.insert(d.key.to_string(), v);
+            }
+            let mut steps: Vec<core_sdk::BuildStep> = (0..op.arity()).map(|_| a_cube()).collect();
+            steps.push(step);
+            let recipe = OpOutput::of(steps);
+
+            let mut g = GeometryService::with_mock_kernel();
+            if let Err(AppError::RecipeNotExecutable(msg)) = g.execute(&recipe) {
+                assert!(
+                    !msg.contains("缺少参数") && !msg.contains("缺少第"),
+                    "{op:?} 全声明键补齐后仍报缺参（param_defs 漏声明），实得 {msg}"
+                );
+            }
+        }
+    }
+
+    /// **G3 钉 5：`execute_native` 元数校验**——0/1/2 输入算子喂错个数响亮报错；
+    /// 正确个数 + 输入句柄执行成功（mock 基本体链路），输入句柄归调用方
+    /// （`execute_native` 失败不释放输入）。
+    #[test]
+    fn execute_native_validates_arity_and_keeps_caller_inputs() {
+        let mut g = GeometryService::with_mock_kernel();
+        let box_h = g.kernel_mut().make_box(10.0, 10.0, 10.0).unwrap();
+
+        // 0 输入算子喂 1 个输入 → 报错；输入句柄仍存活（归调用方）。
+        let got = g.execute_native(BuildOp::MakeBox, &BTreeMap::new(), &[box_h]);
+        assert!(got.is_err(), "MakeBox 喂 1 输入应报错");
+        assert!(g.kernel().is_alive(box_h), "输入句柄归调用方，失败不释放");
+
+        // 1 输入算子喂 0 个输入 → 报错。
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), Value::Float(100.0));
+        args.insert("y".to_string(), Value::Float(0.0));
+        args.insert("z".to_string(), Value::Float(0.0));
+        let got = g.execute_native(BuildOp::Translate, &args, &[]);
+        assert!(got.is_err(), "Translate 喂 0 输入应报错");
+
+        // 正确链路：Translate(box, (100,0,0)) → 新句柄存活、体积不变。
+        let executed = g
+            .execute_native(BuildOp::Translate, &args, &[box_h])
+            .expect("Translate 单步应执行成功");
+        assert_eq!(executed.step_count(), 1);
+        let moved = executed.final_handle().unwrap();
+        assert!(g.kernel().is_alive(moved));
+        assert!((g.kernel_mut().volume(moved).unwrap() - 1000.0).abs() < 1e-9);
+        // vendor 语义：返回新句柄、原句柄仍有效。
+        assert!(g.kernel().is_alive(box_h), "平移后原句柄仍有效");
     }
 }

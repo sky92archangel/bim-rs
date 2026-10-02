@@ -55,7 +55,9 @@ pub use core_model as model;
 pub use annotation::{AnnotationContext, AnnotationNeed, AnnotationRule};
 pub use error::{SdkError, SdkResult};
 pub use factory::{CreateRequest, ElementFactory, build_element};
-pub use geometry_op::{BuildOp, BuildStep, GeometryOp, OpInput, OpOutput};
+pub use geometry_op::{
+    BuildOp, BuildStep, GeometryOp, OpInput, OpOutput, ParamDef, ParamDefault, ParamKind,
+};
 pub use module::{Module, ModuleId, ModuleManifest, SDK_API_VERSION};
 pub use registry::{CategoryInfo, LayerSpec, Registry, RegistrySummary};
 

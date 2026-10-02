@@ -6,7 +6,8 @@
 //! ┌────────────────────────────────────────────────────────────┐
 //! │ 菜单栏: 文件 编辑 视图 帮助                                  │
 //! ├────────────────────────────────────────────────────────────┤
-//! │ 工具栏: 适配 清选 | 拾取:面/边/顶点 | 基线 | 日志开关          │
+//! │ 工具栏: 构建(基本体/线框/扫掠放样/布尔/变换/修饰/修复) 模块配方 │
+//! │         适配 清选 | 拾取:面/边/顶点 | 基线 | 日志开关          │
 //! ├────────────┬─────────────────────────────┬─────────────────┤
 //! │ 左栏(页签)  │                             │ 右栏(页签)       │
 //! │  元素/类型  │        三维视口              │  属性/图纸       │
@@ -15,6 +16,23 @@
 //! │ 日志（可折叠，失败响亮可见，不弹窗不吞错）                    │
 //! └────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! ## 构建链路（G3：原生算子门面 + 参数表单）
+//!
+//! 工具栏七组（基本体 / 线框 / 扫掠放样 / 布尔 / 变换 / 修饰 / 修复，计划
+//! §5.1）+ 模块配方分组：点算子 → **参数表单浮窗**（[`ParamKind`] 路由控件，
+//! `core_sdk::BuildOp::param_defs` 单一事实源）→ 确定 → 按元数路由执行：
+//!
+//! | 元数 | 路由 | 语义 |
+//! |---|---|---|
+//! | 0 输入 | `create_generic_element` + `build_native` | 新构件 |
+//! | 1 输入（非变长）| `modify_native` | 替换选中构件几何（关联更新）|
+//! | 2 输入（非变长）| `combine_native` | 主选 + 副选（Ctrl+单击）→ 新构件收结果 |
+//! | 变长 | —（占位）| Loft / MakeWire 走 G4 草图流程 |
+//!
+//! 参数换算：角度 GUI 用度（提交时 `to_radians()`）、长度 mm、选择器 JSON
+//! 文本（必填，空串拒绝提交——空选择会让算子静默无效）。
+//! 所有 GUI 动作可被纯 API 复现（session.rs 的 G3 API 复现用例）。
 //!
 //! ## 渲染路线（为什么不用 wgpu paint callback）
 //!
@@ -53,7 +71,7 @@ use core_app::CoreSession;
 use core_doc::{Camera, PickFilter, PickKind, PickParam, PickResult, Ray, ViewOrientation};
 use core_interop::{Drawing2D, Format};
 use core_model::{ElementId, PropertyMap, ShapeId, Value, ViewId};
-use core_sdk::Module;
+use core_sdk::{BuildOp, Module, ParamDef, ParamDefault, ParamKind};
 use example_beam::{
     CATEGORY as BEAM_CATEGORY, ExampleBeam, GEOMETRY_OP_ID as OP_BEAM_RECT,
     GEOMETRY_OP_ID_HOLE as OP_BEAM_HOLE,
@@ -372,6 +390,42 @@ struct BimApp {
     right_page: Page,
     /// 日志面板显示开关（G2：可折叠，菜单"视图"或工具栏切换）
     show_logs: bool,
+    /// 待确认的原生算子参数表单（G3：点工具栏算子项 → 表单浮窗 → 确认执行）
+    op_form: Option<OpForm>,
+    /// 副选构件（G3：布尔 / 扫掠类第二输入；元素列表 / 视口 Ctrl+单击设置）
+    secondary: Option<ElementId>,
+}
+
+/// 原生算子参数表单状态（G3：确认时换算成 PropertyMap → build/modify/combine_native）。
+struct OpForm {
+    op: BuildOp,
+    /// 编辑中的值（键 → 表单值；初始由 param_defs 的 default 预填）
+    values: BTreeMap<&'static str, FormValue>,
+}
+
+/// 表单里的值（提交时按 ParamKind 换算成 Value：角度度 → 弧度）。
+enum FormValue {
+    /// 长度 mm / 角度度（Angle 提交时 `to_radians()`）
+    Float(f64),
+    Int(i64),
+    Bool(bool),
+    /// 选择器 JSON（`Value::Text`）
+    Text(String),
+}
+
+/// 由参数定义取表单初始值（default 预填；无 default 落零值——必填选择器落
+/// 空串，提交时校验拒绝，空选择会让算子静默无效）。
+fn form_value_from_default(def: &ParamDef) -> FormValue {
+    match (def.kind, &def.default) {
+        (ParamKind::Bool, Some(ParamDefault::Bool(b))) => FormValue::Bool(*b),
+        (ParamKind::Bool, _) => FormValue::Bool(false),
+        (ParamKind::Int, Some(ParamDefault::Int(i))) => FormValue::Int(*i),
+        (ParamKind::Int, _) => FormValue::Int(0),
+        (ParamKind::Selectors, _) => FormValue::Text(String::new()),
+        (ParamKind::Length, Some(ParamDefault::Float(f)))
+        | (ParamKind::Angle, Some(ParamDefault::Float(f))) => FormValue::Float(*f),
+        (_, _) => FormValue::Float(0.0),
+    }
 }
 
 /// 一次参数编辑的暂存（选中构件时快照；"应用并重建"提交）。
@@ -499,6 +553,8 @@ impl BimApp {
             left_page: Page::Elements,
             right_page: Page::Props,
             show_logs: true,
+            op_form: None,
+            secondary: None,
         })
     }
 
@@ -550,6 +606,8 @@ impl BimApp {
             left_page: Page::Elements,
             right_page: Page::Props,
             show_logs: true,
+            op_form: None,
+            secondary: None,
         })
     }
 
@@ -841,12 +899,18 @@ impl BimApp {
     }
 
     /// 视口拾取（单击）：屏幕坐标 → 图元（面 / 边 / 顶点按当前拾取模式）。
-    fn do_pick(&mut self, screen: (f32, f32)) {
+    ///
+    /// Ctrl+单击 = 设**副选**（G3：布尔 / 扫掠类第二输入）；普通单击 = 主选。
+    fn do_pick(&mut self, screen: (f32, f32), ctrl: bool) {
         let camera = &self.camera;
         let filter = self.pick_mode.filter();
         match self.session.pick_at(screen, camera, filter) {
             Ok(Some(hit)) => {
-                self.selected = Some(hit.element);
+                if ctrl {
+                    self.secondary = Some(hit.element);
+                } else {
+                    self.selected = Some(hit.element);
+                }
                 let p = hit.world_point;
                 let kind = match hit.kind {
                     PickKind::Face => "面",
@@ -907,6 +971,7 @@ impl BimApp {
                 if ui.button("清空选择").clicked() {
                     self.selected = None;
                     self.picked = None;
+                    self.secondary = None;
                     ui.close_menu();
                 }
             });
@@ -938,12 +1003,84 @@ impl BimApp {
         });
     }
 
-    /// 工具栏（G2：适配 / 清选 / 拾取模式 / 性能基线 / 日志开关；构建分组 G3 填充——
-    /// 计划 §5.1 的七组算子按钮落这里）。
+    /// 工具栏（G2/G3：构建七组 + 模块配方 / 适配 / 清选 / 拾取模式 / 性能基线 /
+    /// 日志开关——计划 §5.1 的七组算子按钮落这里）。
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
         ui.horizontal(|ui| {
-            // —— 构建（G3 预留：基本体 / 线框 / 扫掠放样 / 布尔 / 变换 / 修饰 / 修复）——
+            // —— 构建七组（G3：0 输入 → 新构件；1 输入 → 选中构件；2 输入 →
+            //    主选 + 副选；变长 Loft / MakeWire 走 G4 草图流程占位）——
+            self.build_group(
+                ui,
+                ph::CUBE,
+                "基本体",
+                &[
+                    BuildOp::MakeBox,
+                    BuildOp::MakeCylinder,
+                    BuildOp::MakeSphere,
+                    BuildOp::MakeCone,
+                    BuildOp::MakeTorus,
+                ],
+            );
+            self.build_group(
+                ui,
+                ph::SHAPES,
+                "线框",
+                &[BuildOp::MakeLineEdge, BuildOp::MakeArcEdge],
+            );
+            // 拉伸 / 旋转扫掠 / 放样三入口的完整流程（草图 → 特征）在 G4；
+            // 单输入的 Extrude / Revolve 先经选中构件直接操作。
+            self.build_group(
+                ui,
+                ph::PATH,
+                "扫掠放样",
+                &[BuildOp::Extrude, BuildOp::Revolve],
+            );
+            self.build_group(
+                ui,
+                ph::UNITE,
+                "布尔",
+                &[BuildOp::Fuse, BuildOp::Cut, BuildOp::Common],
+            );
+            self.build_group(
+                ui,
+                ph::ARROWS_OUT_LINE_HORIZONTAL,
+                "变换",
+                &[BuildOp::Translate, BuildOp::Rotate],
+            );
+            self.build_group(
+                ui,
+                ph::MAGIC_WAND,
+                "修饰",
+                &[
+                    BuildOp::Fillet,
+                    BuildOp::Chamfer,
+                    BuildOp::Shell,
+                    BuildOp::Offset,
+                    BuildOp::Thicken,
+                ],
+            );
+            self.build_group(
+                ui,
+                ph::WRENCH,
+                "修复",
+                &[
+                    BuildOp::Sew,
+                    BuildOp::SewAndSolidify,
+                    BuildOp::FixShape,
+                    BuildOp::UnifySameDomain,
+                ],
+            );
+            // —— 模块配方（现有 6 条按钮移入工具栏，计划 §5.1）——
+            ui.menu_button(format!("{} 模块配方", ph::PACKAGE), |ui| {
+                for btn in op_buttons() {
+                    if ui.button(btn.label).clicked() {
+                        self.build_op(btn.category, btn.op_id, btn.label);
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
             if ui
                 .button(format!("{} 适配", ph::ARROWS_OUT))
                 .on_hover_text("适配视图")
@@ -953,11 +1090,12 @@ impl BimApp {
             }
             if ui
                 .button(format!("{} 清选", ph::BROOM))
-                .on_hover_text("清空选择")
+                .on_hover_text("清空选择（含副选）")
                 .clicked()
             {
                 self.selected = None;
                 self.picked = None;
+                self.secondary = None;
             }
             ui.separator();
             // —— 拾取模式（M12：面 / 边 / 顶点三态单选）——
@@ -988,6 +1126,282 @@ impl BimApp {
                 self.show_logs = !self.show_logs;
             }
         });
+    }
+
+    // ---- 构建链路（G3：原生算子门面 + 参数表单） ----
+
+    /// 一个构建分组菜单（G3）：算子项按元数启用——0 输入恒可用；1 输入需选中
+    /// 构件；2 输入需主选 + 副选（Ctrl+单击）；变长（Loft / MakeWire）G4 草图
+    /// 流程接入前禁用（tooltip 说明，绝不静默）。
+    fn build_group(&mut self, ui: &mut egui::Ui, icon: &str, name: &str, ops: &[BuildOp]) {
+        ui.menu_button(format!("{icon} {name}"), |ui| {
+            for &op in ops {
+                let (ready, tip) = if op.is_variadic() {
+                    (false, "变长输入：G4 草图流程接入后可用")
+                } else {
+                    match op.arity() {
+                        0 => (true, ""),
+                        1 => (
+                            self.selected.is_some(),
+                            "先选中一个构件（视口单击或元素列表）",
+                        ),
+                        2 => (
+                            self.selected.is_some() && self.secondary.is_some(),
+                            "先选主选构件，再 Ctrl+单击 副选构件",
+                        ),
+                        _ => (false, "不支持的元数"),
+                    }
+                };
+                if ui
+                    .add_enabled(ready, egui::Button::new(op.label()))
+                    .on_disabled_hover_text(tip)
+                    .clicked()
+                {
+                    self.open_op_form(op);
+                    ui.close_menu();
+                }
+            }
+        });
+    }
+
+    /// 打开参数表单浮窗：按 [`BuildOp::param_defs`] 的 default 预填（G3 单一
+    /// 事实源——表单不另立参数表）。
+    fn open_op_form(&mut self, op: BuildOp) {
+        let mut values = BTreeMap::new();
+        for def in op.param_defs() {
+            values.insert(def.key, form_value_from_default(&def));
+        }
+        self.op_form = Some(OpForm { op, values });
+    }
+
+    /// 参数表单浮窗（G3）：[`ParamKind`] 路由控件 + 确定提交。
+    ///
+    /// 控件路由：Length → DragValue + "mm"；Angle → DragValue + "°"（GUI 用度，
+    /// 提交时 `to_radians()`）；Int → DragValue；Bool → checkbox；Selectors →
+    /// 单行文本（JSON，必填，空串提交被拒）。
+    fn op_form_window(&mut self, ctx: &egui::Context) {
+        if self.op_form.is_none() {
+            return;
+        }
+        // 标题与参数定义先取出（窗口闭包内只借 self.op_form 的值槽）。
+        let (title, defs) = {
+            let form = self.op_form.as_ref().expect("checked above");
+            (format!("参数：{}", form.op.label()), form.op.param_defs())
+        };
+        let mut open = true;
+        let mut confirmed = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                let form = self.op_form.as_mut().expect("checked above");
+                egui::Grid::new("op_form_grid")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for def in &defs {
+                            ui.label(def.label);
+                            let v = form
+                                .values
+                                .get_mut(def.key)
+                                .expect("values keyed by param_defs");
+                            match v {
+                                FormValue::Float(f) => match def.kind {
+                                    ParamKind::Angle => {
+                                        // 角度 GUI 用度，步幅 10° 便于转整角度。
+                                        ui.add(egui::DragValue::new(f).speed(10.0).suffix("°"));
+                                    }
+                                    ParamKind::Length => {
+                                        ui.add(egui::DragValue::new(f).speed(1.0).suffix(" mm"));
+                                    }
+                                    _ => {
+                                        ui.add(egui::DragValue::new(f).speed(0.1));
+                                    }
+                                },
+                                FormValue::Int(i) => {
+                                    ui.add(egui::DragValue::new(i).speed(1.0));
+                                }
+                                FormValue::Bool(b) => {
+                                    ui.checkbox(b, "");
+                                }
+                                FormValue::Text(s) => {
+                                    ui.add(
+                                        egui::TextEdit::singleline(s)
+                                            .hint_text("选择器 JSON（必填）")
+                                            .desired_width(180.0),
+                                    );
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if ui.button("确定").clicked() {
+                    confirmed = true;
+                }
+            });
+        if !open {
+            self.op_form = None;
+        }
+        if confirmed {
+            self.confirm_op_form();
+        }
+    }
+
+    /// 提交参数表单（G3）：必填校验 → 表单值换算成 [`PropertyMap`]（角度度 →
+    /// 弧度）→ 按元数路由 [`Self::do_native_build`] / [`Self::do_native_modify`]
+    /// / [`Self::do_native_combine`]。
+    ///
+    /// 校验失败（必填选择器空串）或执行失败：表单**保持打开**（用户可改后重试）；
+    /// 成功才关闭。失败一律写日志，不吞错。
+    fn confirm_op_form(&mut self) {
+        // 校验 + 换算（借用圈在块内；路由在块外做可变调用）。
+        let (op, args) = {
+            let Some(form) = self.op_form.as_ref() else {
+                return;
+            };
+            let mut args = PropertyMap::new(format!("native:{}", form.op.label()));
+            for def in form.op.param_defs() {
+                let Some(v) = form.values.get(def.key) else {
+                    continue;
+                };
+                // 必填选择器空串拒绝：空选择会让 Fillet / Chamfer / Shell 静默无效。
+                if def.required
+                    && let FormValue::Text(s) = v
+                    && s.trim().is_empty()
+                {
+                    self.log(format!(
+                        "✗ {}：{}（{}）为必填，请填选择器 JSON",
+                        form.op.label(),
+                        def.label,
+                        def.key
+                    ));
+                    return;
+                }
+                let converted = match (def.kind, v) {
+                    (ParamKind::Angle, FormValue::Float(deg)) => Value::Float(deg.to_radians()),
+                    (ParamKind::Length, FormValue::Float(mm)) => Value::Float(*mm),
+                    (ParamKind::Int, FormValue::Int(i)) => Value::Int(*i),
+                    (ParamKind::Bool, FormValue::Bool(b)) => Value::Bool(*b),
+                    (ParamKind::Selectors, FormValue::Text(s)) => Value::Text(s.clone()),
+                    // 种类与定义不匹配（不应发生）：落缺，由内核缺参报错兜底。
+                    _ => continue,
+                };
+                args.set(def.key.to_string(), converted);
+            }
+            (form.op, args)
+        };
+        // 按元数路由执行；成功关表单，失败保持打开（已写日志，可改后重试）。
+        let ok = match op.arity() {
+            0 => self.do_native_build(op, args),
+            1 => self.do_native_modify(op, args),
+            2 => self.do_native_combine(op, args),
+            _ => {
+                self.log(format!("· {} 是变长输入算子，G4 草图流程接入", op.label()));
+                false
+            }
+        };
+        if ok {
+            self.op_form = None;
+        }
+    }
+
+    /// 0 输入算子（G3）：建通用构件 + [`CoreSession::build_native`]
+    /// （新构件收几何；失败写日志，不 panic）。
+    fn do_native_build(&mut self, op: BuildOp, args: PropertyMap) -> bool {
+        let name = op.label();
+        match self.session.create_generic_element(name) {
+            Ok(id) => match self.session.build_native(id, op, &args) {
+                Ok(out) => {
+                    self.after_geometry_change(id, out.shape);
+                    self.log(format!("✓ {name}：新构件已建几何（ShapeId {}）", out.shape));
+                    for w in &out.warnings {
+                        self.log(format!("⚠ {w}"));
+                    }
+                    true
+                }
+                Err(e) => {
+                    self.log(format!("✗ {name} 建几何失败：{e}"));
+                    false
+                }
+            },
+            Err(e) => {
+                self.log(format!("✗ 创建 {name} 构件失败：{e}"));
+                false
+            }
+        }
+    }
+
+    /// 1 输入算子（G3）：[`CoreSession::modify_native`] 替换选中构件几何
+    /// （复用 ShapeId + 关联更新，图纸跟着动）。
+    fn do_native_modify(&mut self, op: BuildOp, args: PropertyMap) -> bool {
+        let Some(id) = self.selected else {
+            return false; // 菜单按选中态启用，正常到不了这里
+        };
+        match self.session.modify_native(id, op, &args) {
+            Ok(report) => {
+                self.dirty = true;
+                // M12 增量重建：只网格化本次被改的形状（modify 复用原 ShapeId）。
+                if !report.changed_shapes.is_empty() {
+                    self.dirty_shapes = Some(report.changed_shapes.iter().copied().collect());
+                }
+                self.log(format!(
+                    "✓ {}:关联更新：演化直连 {} + 指纹回退 {}，重投 {} 图元、重算 {} 标注、{} 视图已标脏",
+                    op.label(),
+                    report.evolution_resolved,
+                    report.fingerprint_resolved,
+                    report.reprojected_entities,
+                    report.remeasured_annotations,
+                    report.stale_views
+                ));
+                for w in &report.warnings {
+                    self.log(format!("⚠ {w}"));
+                }
+                true
+            }
+            Err(e) => {
+                self.log(format!("✗ {} 修改失败：{e}", op.label()));
+                false
+            }
+        }
+    }
+
+    /// 2 输入算子（G3）：[`CoreSession::combine_native`] 主选 + 副选 →
+    /// 新构件收结果（不动原有两构件；布尔消费语义 G6+ 撤销引擎后完善）。
+    fn do_native_combine(&mut self, op: BuildOp, args: PropertyMap) -> bool {
+        let (Some(primary), Some(sec)) = (self.selected, self.secondary) else {
+            return false; // 菜单按选中态启用，正常到不了这里
+        };
+        match self.session.combine_native(primary, sec, op, &args) {
+            Ok(out) => {
+                self.after_geometry_change(out.element, out.shape);
+                // 布尔完成，副选清空（下一次组合需重新 Ctrl+单击）。
+                self.secondary = None;
+                self.log(format!(
+                    "✓ {}：新构件已收结果（ShapeId {}，原两构件不动）",
+                    op.label(),
+                    out.shape
+                ));
+                for w in &out.warnings {
+                    self.log(format!("⚠ {w}"));
+                }
+                true
+            }
+            Err(e) => {
+                self.log(format!("✗ {} 组合失败：{e}", op.label()));
+                false
+            }
+        }
+    }
+
+    /// 几何变化后的 GUI 状态收尾（build / combine 共用）：选中新构件、
+    /// 增量网格化新形状、下一帧适配视图。
+    fn after_geometry_change(&mut self, element: ElementId, shape: ShapeId) {
+        self.selected = Some(element);
+        self.picked = None;
+        self.dirty = true;
+        // M12 增量重建：只网格化新建的形状。
+        self.dirty_shapes = Some([shape].into_iter().collect());
+        self.fit_pending = true;
     }
 
     /// 左栏（G2 五区布局）：自制页签（元素 / 类型）+ 页面切换。
@@ -1114,16 +1528,21 @@ impl BimApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (id, label, has_geom) in items {
                 let text = if has_geom {
-                    label
+                    label.clone()
                 } else {
                     format!("{label}（无几何）")
                 };
-                if ui
-                    .selectable_label(self.selected == Some(id), text)
-                    .clicked()
-                {
-                    self.selected = Some(id);
-                    self.picked = None;
+                // 副选构件同高亮（G3：布尔 / 扫掠类的第二输入）。
+                let is_sel = self.selected == Some(id) || self.secondary == Some(id);
+                if ui.selectable_label(is_sel, text).clicked() {
+                    // Ctrl+单击 = 设副选；普通单击 = 主选（与视口 do_pick 同语义）。
+                    if ui.input(|i| i.modifiers.ctrl) {
+                        self.secondary = Some(id);
+                        self.log(format!("✓ 已设副选：{label}"));
+                    } else {
+                        self.selected = Some(id);
+                        self.picked = None;
+                    }
                 }
             }
         });
@@ -1582,11 +2001,12 @@ impl BimApp {
                     .clamp(MIN_DISTANCE, MAX_DISTANCE);
             }
         }
-        // —— 拾取（单击）——
+        // —— 拾取（单击；Ctrl+单击 = 副选，G3）——
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            self.do_pick((pos.x, pos.y));
+            let ctrl = ui.input(|i| i.modifiers.ctrl);
+            self.do_pick((pos.x, pos.y), ctrl);
         }
 
         // —— 画：地面网格 → 实体（画家算法）——
@@ -1857,6 +2277,8 @@ impl eframe::App for BimApp {
             .show(ctx, |ui| self.viewport(ui));
         // M11：浮动图纸预览窗口（"图纸"页签选中视图后点"预览"打开）。
         self.drawing_preview_window(ctx);
+        // G3：原生算子参数表单浮窗（工具栏构建七组的算子项点击后打开）。
+        self.op_form_window(ctx);
     }
 }
 

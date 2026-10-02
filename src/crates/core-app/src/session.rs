@@ -36,7 +36,7 @@ use core_doc::{
 };
 use core_kernel::{KernelError, MeshData};
 use core_model::{Document, ElementId, PropertyMap, ShapeId, ViewId};
-use core_sdk::{Module, OpInput, SdkError};
+use core_sdk::{BuildOp, Module, OpInput, SdkError};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -75,6 +75,19 @@ pub struct CoreSession {
     interop: InteropService,
     /// 专业模块宿主
     modules: ModuleHost,
+}
+
+/// 原生算子执行结果（G3：build_native / combine_native 的统一返回）。
+///
+/// `warnings` 是执行层的**可观测回退说明**（如后端不支持带历史布尔的回退）——
+/// 调用方（GUI / SDK）必须显示，绝不静默丢弃。
+pub struct NativeOutcome {
+    /// 结果元素：build_native 时即目标元素；combine_native 时为**新构件**
+    pub element: ElementId,
+    /// 新几何 `ShapeId`
+    pub shape: ShapeId,
+    /// 执行警告（可观测回退说明）
+    pub warnings: Vec<String>,
 }
 
 impl CoreSession {
@@ -172,6 +185,257 @@ impl CoreSession {
     pub fn create_element(&mut self, category: &str, name: &str) -> AppResult<ElementId> {
         let element = self.modules.create_named(category, name)?;
         self.document.add_element(element)
+    }
+
+    /// **新建通用元素**（不走模块工厂；原生算子构件用，G3）。
+    ///
+    /// [`CoreSession::create_element`] 走模块工厂（品类必须已注册）；原生算子
+    /// （长方体 / 球 / 直边……）不属于任何专业模块，用本方法造通用品类元素，
+    /// 随后 [`CoreSession::build_native`] 回填几何。
+    pub fn create_generic_element(&mut self, name: &str) -> AppResult<ElementId> {
+        let element = core_model::Element::new(core_model::Category::generic(), name);
+        self.document.add_element(element)
+    }
+
+    /// 把一次配方执行的最终句柄落成几何记录并装进元素
+    /// （`build_geometry` ④④′⑤ 的共用段：build_native / combine_native 复用）。
+    ///
+    /// snapshot → `document.edit`（insert_geometry + `geometry_ref` 回填）→
+    /// remember_history（结果句柄即最终句柄的布尔演化）→ 释放全部句柄
+    /// （句柄可丢，文本为真相——设计文档 3.3）。返回执行警告（可观测透传）。
+    fn install_executed(
+        &mut self,
+        element: ElementId,
+        executed: &crate::geometry_service::ExecutedRecipe,
+    ) -> AppResult<(ShapeId, Vec<String>)> {
+        let handles: Vec<core_kernel::ShapeHandle> = executed.handles().to_vec();
+        let final_handle = *handles.last().ok_or_else(|| {
+            AppError::RecipeNotExecutable("算子执行为空，没有产生任何形状".to_string())
+        })?;
+
+        let shape = ShapeId::new();
+        let record = self.geometry.snapshot(shape, final_handle)?;
+        self.document.edit(|doc| {
+            doc.insert_geometry(record)?;
+            let e = doc.element_mut(element)?;
+            e.geometry_ref = Some(shape);
+            Ok(())
+        })?;
+
+        // 布尔演化（结果句柄即最终句柄的那条）绑定新 ShapeId 登记（M6b 路径 B）。
+        if let Some((_, hrec)) = executed
+            .evolutions()
+            .iter()
+            .find(|(_, rec)| rec.evolution.result == final_handle)
+        {
+            self.geometry.remember_history(shape, hrec.clone());
+        }
+
+        for handle in &handles {
+            let _ = self.geometry.kernel_mut().release(*handle);
+        }
+        Ok((shape, executed.warnings.clone()))
+    }
+
+    /// **原生算子构造**（G3：无模块配方的算子，GUI / SDK 直用）。
+    ///
+    /// 与 [`CoreSession::build_geometry`] 的差异：原生算子**无配方**（不走模块
+    /// 注册表），由本门面构造**单步配方** `BuildStep::new(op)` + 调用方参数 →
+    /// [`GeometryService::execute`] → 装元素。仅支持 **0 输入算子**（基本体 /
+    /// 直边 / 三点弧）；有输入算子走 [`CoreSession::modify_native`] /
+    /// [`CoreSession::combine_native`]。
+    ///
+    /// 参数键名见 [`core_sdk::BuildOp::param_defs`]（单一事实源）；长度 mm、
+    /// 角度弧度（GUI 提交前换算）。
+    ///
+    /// # Errors
+    /// 元素不存在 / 已有几何、算子需要输入、配方执行失败时返回错误。
+    pub fn build_native(
+        &mut self,
+        element: ElementId,
+        op: BuildOp,
+        args: &PropertyMap,
+    ) -> AppResult<NativeOutcome> {
+        // ① 元素必须存在，且尚未有几何（照 build_geometry ①）
+        let already = {
+            let e = self.document.doc().element(element).ok_or(AppError::Model(
+                core_model::ModelError::ElementNotFound(element),
+            ))?;
+            e.has_geometry()
+        };
+        if already {
+            return Err(AppError::RecipeNotExecutable(format!(
+                "元素 {element} 已有几何，拒绝重复构造（先删旧几何再重建）"
+            )));
+        }
+        // ② 仅 0 输入算子（有输入算子的输入来自文档既有几何，走 modify / combine）
+        if op.arity() != 0 {
+            return Err(AppError::RecipeNotExecutable(format!(
+                "build_native 只支持无输入算子（{} 需要 {} 个输入；有输入算子走 modify_native / combine_native）",
+                op.label(),
+                op.arity()
+            )));
+        }
+        // ③ 单步配方（参数直接来自调用方，不经模块算子）→ 执行
+        let mut step = core_sdk::BuildStep::new(op).with_note(format!("原生构造：{}", op.label()));
+        for (k, v) in &args.values {
+            step.args.insert(k.clone(), v.clone());
+        }
+        let recipe = core_sdk::OpOutput::of(vec![step]);
+        let executed = self.geometry.execute(&recipe)?;
+
+        // ④ 落盘 + 装元素 + 演化登记 + 释放（共用段）
+        let (shape, warnings) = self.install_executed(element, &executed)?;
+        Ok(NativeOutcome {
+            element,
+            shape,
+            warnings,
+        })
+    }
+
+    /// **原生算子对既有构件操作**（G3：变换 / 修饰 / 修复类，替换该构件几何）。
+    ///
+    /// 流程照 [`CoreSession::rebuild_geometry`]：元素**已有**几何 →
+    /// [`GeometryService::resolve`] 懒重建句柄 →
+    /// [`GeometryService::execute_native`] **直接对句柄**执行单算子 → snapshot
+    /// **复用原 `ShapeId`** 收进文档（构件身份不变，remove + insert 同 id）→
+    /// 缝合 histories → [`update_after_commit`] 关联更新（定向重投 + 标注重算 +
+    /// 标脏）。
+    ///
+    /// 缓存纪律照 `carve_geometry` ⑤：替换后**先 `forget` 旧形状的句柄映射再
+    /// release**（旧几何已被算子消费 / 取代，映射不得悬垂指向陈旧形状）。
+    ///
+    /// # Errors
+    /// 元素不存在 / 尚无几何、算子元数非 1、算子执行失败时返回错误。
+    pub fn modify_native(
+        &mut self,
+        element: ElementId,
+        op: BuildOp,
+        args: &PropertyMap,
+    ) -> AppResult<UpdateReport> {
+        // ① 元素必须存在，且已有几何（照 rebuild_geometry ①）
+        let old_shape = {
+            let e = self.document.doc().element(element).ok_or(AppError::Model(
+                core_model::ModelError::ElementNotFound(element),
+            ))?;
+            e.geometry_ref.ok_or(AppError::RecipeNotExecutable(format!(
+                "元素 {element} 尚无几何，无从做 {}（请先走 build_geometry / build_native 构造）",
+                op.label()
+            )))?
+        };
+        // ② 仅 1 输入非变长算子（变长的 Loft / MakeWire 需要多输入，走 G4 草图流程）
+        if op.arity() != 1 || op.is_variadic() {
+            return Err(AppError::RecipeNotExecutable(format!(
+                "modify_native 只支持单输入非变长算子（{} 的元数为 {}）",
+                op.label(),
+                op.arity()
+            )));
+        }
+        // ③ resolve 懒重建旧句柄 → 直接对句柄执行
+        let old_handle = self.geometry.resolve(self.document.doc(), old_shape)?;
+        let executed = self
+            .geometry
+            .execute_native(op, &args.values, &[old_handle])?;
+        let handles = executed.handles().to_vec();
+        let final_handle = *handles.last().ok_or_else(|| {
+            AppError::RecipeNotExecutable(format!("{} 的执行为空，没有产生任何形状", op.label()))
+        })?;
+
+        // ④ snapshot 复用原 ShapeId 收进文档（构件身份不变，照 rebuild_geometry ③）
+        let record = self.geometry.snapshot(old_shape, final_handle)?;
+        self.document.edit(|doc| {
+            doc.remove_geometry(old_shape);
+            doc.insert_geometry(record)?;
+            Ok(())
+        })?;
+
+        // ⑤ 缝合 histories（照 rebuild_geometry ④）：无布尔演化则空 → 键解析退避指纹。
+        let histories: Vec<(ShapeId, HistoryRecord)> = executed
+            .evolutions()
+            .iter()
+            .filter(|(_, rec)| rec.evolution.result == final_handle)
+            .map(|(_, rec)| (old_shape, rec.clone()))
+            .collect();
+
+        // ⑥ 释放（照 carve_geometry ⑤）：先解除旧形状的句柄映射（旧几何已被
+        //    算子取代，映射不得悬垂），再释放旧句柄 + 新结果句柄。
+        if let Some(cached) = self.geometry.forget(old_shape) {
+            let _ = self.geometry.kernel_mut().release(cached);
+        }
+        for handle in &handles {
+            let _ = self.geometry.kernel_mut().release(*handle);
+        }
+
+        // ⑦ 关联更新（照 rebuild_geometry ⑥）
+        let kernel = self.geometry.kernel_mut();
+        let report = self.document.with_doc_and_drawing_mut(|doc, drawing| {
+            update_after_commit(kernel, doc, drawing, &[old_shape], &histories)
+        })?;
+        Ok(report)
+    }
+
+    /// **原生算子组合两个既有构件**（G3：布尔 / 扫掠类，结果收进**新构件**）。
+    ///
+    /// 两个构件的几何句柄直接参与运算（[`GeometryService::execute_native`]），
+    /// 结果收进按主选品类新建的构件——**不动原有数据**（破坏性语义等 G6 撤销
+    /// 引擎后完善），日志 / 返回值由调用方说明。
+    ///
+    /// 输入顺序与算子语义一致：`Fuse(a, b)` / `Cut(a − b)` / `Common(a ∩ b)` /
+    /// `Sweep(profile, spine)` / `Pipe(profile, spine)`——主选在前、副选在后。
+    ///
+    /// # Errors
+    /// 元素不存在 / 尚无几何、算子元数非 2（或变长）、算子执行失败时返回错误。
+    pub fn combine_native(
+        &mut self,
+        primary: ElementId,
+        secondary: ElementId,
+        op: BuildOp,
+        args: &PropertyMap,
+    ) -> AppResult<NativeOutcome> {
+        // ① 两元素必须存在且都有几何
+        let mut shapes = [None; 2];
+        for (slot, element) in [(0usize, primary), (1, secondary)] {
+            let e = self.document.doc().element(element).ok_or(AppError::Model(
+                core_model::ModelError::ElementNotFound(element),
+            ))?;
+            shapes[slot] = Some(e.geometry_ref.ok_or(AppError::RecipeNotExecutable(format!(
+                "元素 {element} 尚无几何，无从做 {}（请先构造）",
+                op.label()
+            )))?);
+        }
+        // ② 仅 2 输入非变长算子（Loft / MakeWire 变长走 G4 草图流程）
+        if op.arity() != 2 || op.is_variadic() {
+            return Err(AppError::RecipeNotExecutable(format!(
+                "combine_native 只支持双输入非变长算子（{} 的元数为 {}）",
+                op.label(),
+                op.arity()
+            )));
+        }
+        // ③ resolve 两句柄 → 直接执行（输入顺序：主选在前）
+        let [primary_shape, secondary_shape] = shapes.map(|s| s.expect("上方已填充"));
+        let ha = self.geometry.resolve(self.document.doc(), primary_shape)?;
+        let hb = self
+            .geometry
+            .resolve(self.document.doc(), secondary_shape)?;
+        let executed = self.geometry.execute_native(op, &args.values, &[ha, hb])?;
+
+        // ④ 新构件（主选品类）收结果——不动原有数据。
+        let category = self
+            .document
+            .doc()
+            .element(primary)
+            .map(|e| e.category.clone())
+            .unwrap_or_else(core_model::Category::generic);
+        let element = core_model::Element::new(category, op.label());
+        let new_id = element.id;
+        self.document.add_element(element)?;
+
+        let (shape, warnings) = self.install_executed(new_id, &executed)?;
+        Ok(NativeOutcome {
+            element: new_id,
+            shape,
+            warnings,
+        })
     }
 
     /// **造几何**：走 SDK 的几何算子 → 执行配方 → 落盘 → 回填元素。
@@ -1372,5 +1636,150 @@ mod tests {
         assert_ne!(new_text, old_text, "carve 后几何记录必须是切削结果");
         // 句柄全部释放（旧缓存句柄 + 刀具句柄 + 新句柄）
         assert_eq!(s.geometry().kernel().live_count(), 0);
+    }
+
+    // ===== G3：原生算子门面（API 复现用例，计划 §2.1 执行规则 2）=========
+
+    /// **G3 API 复现用例**：GUI 的「构建」动作可用纯 API 复现——
+    /// `create_generic_element` + `build_native`（基本体）/ `modify_native`
+    /// （平移）/ `combine_native`（布尔），不依赖 GUI。
+    #[test]
+    fn native_build_modify_combine_reproduce_the_gui_actions() {
+        use core_sdk::BuildOp;
+        let mut s = CoreSession::new().unwrap();
+
+        // ① 基本体（0 输入算子）：通用元素 + MakeBox 参数 → 新几何
+        let box_id = s.create_generic_element("长方体").unwrap();
+        let box_args = PropertyMap::new("native")
+            .with("dx", Value::Float(600.0))
+            .with("dy", Value::Float(400.0))
+            .with("dz", Value::Float(200.0));
+        let box_shape = s
+            .build_native(box_id, BuildOp::MakeBox, &box_args)
+            .unwrap()
+            .shape;
+        assert_eq!(
+            s.document().doc().element(box_id).unwrap().geometry_ref,
+            Some(box_shape),
+            "几何应回填元素"
+        );
+
+        // ② 球（0 输入）：用于布尔
+        let sphere_id = s.create_generic_element("球").unwrap();
+        s.build_native(
+            sphere_id,
+            BuildOp::MakeSphere,
+            &PropertyMap::new("native").with("radius", Value::Float(150.0)),
+        )
+        .unwrap();
+
+        // ③ 变换（1 输入算子）：平移长方体 → 复用 ShapeId 替换几何
+        let report = s
+            .modify_native(
+                box_id,
+                BuildOp::Translate,
+                &PropertyMap::new("native")
+                    .with("x", Value::Float(1000.0))
+                    .with("y", Value::Float(0.0))
+                    .with("z", Value::Float(0.0)),
+            )
+            .unwrap();
+        assert_eq!(
+            report.changed_shapes,
+            vec![box_shape],
+            "changed_shapes 应为被改形状"
+        );
+        assert_eq!(
+            s.document().doc().element(box_id).unwrap().geometry_ref,
+            Some(box_shape),
+            "modify 复用原 ShapeId（构件身份不变）"
+        );
+
+        // ④ 布尔（2 输入算子）：Fuse(长方体, 球) → 新构件收结果
+        let fused = s
+            .combine_native(
+                box_id,
+                sphere_id,
+                BuildOp::Fuse,
+                &PropertyMap::new("native"),
+            )
+            .unwrap();
+        let (fused_id, fused_shape) = (fused.element, fused.shape);
+        assert_ne!(fused_id, box_id, "布尔结果应是新构件");
+        assert_ne!(fused_shape, box_shape);
+        let fused_elem = s.document().doc().element(fused_id).unwrap();
+        assert_eq!(fused_elem.geometry_ref, Some(fused_shape));
+        assert_eq!(fused_elem.name, "布尔并", "新构件名取算子名");
+        // 原两构件不动（布尔消费语义 G6+ 撤销引擎后完善）
+        assert!(s.document().doc().element(box_id).unwrap().has_geometry());
+        assert!(
+            s.document()
+                .doc()
+                .element(sphere_id)
+                .unwrap()
+                .has_geometry()
+        );
+
+        // ⑤ 元素计数：2 原生 + 1 布尔结果；两个输入构件的懒缓存句柄存活
+        //    （M1 懒重建：缓存句柄供拾取 / 后续修改用），布尔执行的句柄已释放
+        //    （句柄可丢，文本为真相）。
+        assert_eq!(s.document().element_count(), 3);
+        assert_eq!(s.geometry().cached_count(), 2, "两个输入构件懒缓存");
+        assert_eq!(s.geometry().kernel().live_count(), 2, "缓存句柄存活");
+    }
+
+    /// **G3 门面元数门**：build_native 拒绝有输入算子 / 重复构造；
+    /// modify_native 拒绝 0 输入算子；combine_native 拒绝 1 输入算子 / 无几何元素。
+    #[test]
+    fn native_gates_refuse_wrong_arity_ops() {
+        use core_sdk::BuildOp;
+        let mut s = CoreSession::new().unwrap();
+        let id = s.create_generic_element("长方体").unwrap();
+        let args = PropertyMap::new("native")
+            .with("dx", Value::Float(600.0))
+            .with("dy", Value::Float(400.0))
+            .with("dz", Value::Float(200.0));
+        let shape = s.build_native(id, BuildOp::MakeBox, &args).unwrap().shape;
+
+        // build_native 拒绝 1 输入算子（Translate）与重复构造（已有几何）
+        assert!(
+            s.build_native(id, BuildOp::Translate, &PropertyMap::new("native"))
+                .is_err(),
+            "build_native 拒绝有输入算子"
+        );
+        assert!(
+            s.build_native(id, BuildOp::MakeBox, &args).is_err(),
+            "已有几何拒绝重复构造"
+        );
+
+        // modify_native 拒绝 0 输入算子（MakeBox）
+        assert!(matches!(
+            s.modify_native(id, BuildOp::MakeBox, &PropertyMap::new("native")),
+            Err(AppError::RecipeNotExecutable(_))
+        ));
+
+        // combine_native 拒绝 1 输入算子（Translate）
+        let other = s.create_generic_element("球").unwrap();
+        s.build_native(
+            other,
+            BuildOp::MakeSphere,
+            &PropertyMap::new("native").with("radius", Value::Float(50.0)),
+        )
+        .unwrap();
+        assert!(matches!(
+            s.combine_native(id, other, BuildOp::Translate, &PropertyMap::new("native")),
+            Err(AppError::RecipeNotExecutable(_))
+        ));
+
+        // combine_native 拒绝尚无几何的元素
+        let bare = s.create_generic_element("空").unwrap();
+        assert!(matches!(
+            s.combine_native(id, bare, BuildOp::Fuse, &PropertyMap::new("native")),
+            Err(AppError::RecipeNotExecutable(_))
+        ));
+
+        // 句柄全部释放
+        assert_eq!(s.geometry().kernel().live_count(), 0);
+        let _ = shape;
     }
 }

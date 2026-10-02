@@ -111,6 +111,103 @@ pub enum BuildOp {
 /// 直接取它，模块侧若要声明缺省也看得到。
 pub const DEFAULT_SEW_TOLERANCE_MM: f64 = 1e-7;
 
+/// 参数种类（G3 参数表单路由：GUI 据此选控件，计划 §5.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    /// 长度（mm；GUI 控件 DragValue + "mm" 后缀）
+    Length,
+    /// 角度（**GUI 用度**，配方统一弧度——GUI 提交时 `to_radians()`）
+    Angle,
+    /// 整数
+    Int,
+    /// 布尔
+    Bool,
+    /// 子形状选择器（`Value::Text` JSON 数组，GUI 文本框）
+    Selectors,
+}
+
+/// 参数缺省值（与 [`Value`] 的标量对应；`Ref` 不是算子参数）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamDefault {
+    /// 浮点（长度 mm / 角度——`Angle` 键存**度**，GUI 预填直接用）
+    Float(f64),
+    /// 整数
+    Int(i64),
+    /// 布尔
+    Bool(bool),
+    /// 文本（选择器 JSON 之类）
+    Text(&'static str),
+}
+
+/// 一条参数定义（**execute 校验 + GUI 表单共用，单一事实源**，计划 §5.2）。
+///
+/// - `required = true`：`core-app` 执行时缺它会**响亮报错**（`need()` /
+///   `require_*_selectors`）；此时 [`Self::default`] 只是 **GUI 表单预填值**，
+///   不是执行缺省。
+/// - `required = false`：执行缺省（`arg_*().unwrap_or(…)`）；此时
+///   [`Self::default`] **必须与内核缺省一致**（G3 钉子保证）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamDef {
+    /// args 键名（与 `core-app` `execute` 的 `need()` / `arg_*()` 逐臂对照）
+    pub key: &'static str,
+    /// 中文标签（GUI 表单行名）
+    pub label: &'static str,
+    /// 种类（GUI 控件路由）
+    pub kind: ParamKind,
+    /// 执行必填（execute 缺它响亮报错）
+    pub required: bool,
+    /// 预填 / 缺省值
+    pub default: Option<ParamDefault>,
+}
+
+impl ParamDef {
+    /// 必填参数（无预填——调用方 / 用户必须给值）。
+    #[must_use]
+    pub const fn required(key: &'static str, label: &'static str, kind: ParamKind) -> Self {
+        Self {
+            key,
+            label,
+            kind,
+            required: true,
+            default: None,
+        }
+    }
+
+    /// 必填参数（带 GUI 预填值；execute 仍必填——预填只是表单初始值）。
+    #[must_use]
+    pub const fn prefilled(
+        key: &'static str,
+        label: &'static str,
+        kind: ParamKind,
+        default: ParamDefault,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            kind,
+            required: true,
+            default: Some(default),
+        }
+    }
+
+    /// 可选参数（执行缺省；`default` 与内核缺省一致，G3 钉子保证）。
+    #[must_use]
+    pub const fn optional(
+        key: &'static str,
+        label: &'static str,
+        kind: ParamKind,
+        default: ParamDefault,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            kind,
+            required: false,
+            default: Some(default),
+        }
+    }
+}
+
 impl BuildOp {
     /// 该算子需要几个输入形状。
     ///
@@ -201,6 +298,323 @@ impl BuildOp {
             Self::MakeWire => "线框",
             Self::MakeFace => "由线框造面",
             Self::ExtractWire => "提取外环",
+        }
+    }
+
+    /// 参数定义表（**execute 校验 + GUI 表单共用，单一事实源**，计划 §5.2）。
+    ///
+    /// 键名与 `core-app` `execute` 的 match 臂**逐臂对照**（G3 钉子保证：每个
+    /// `required` 键在缺参时产生含该键的报错；全声明键补齐后不再报缺参）。
+    ///
+    /// **键序 = `execute` 臂内的求值顺序**（Rust 参数从左到右、块内语句按序——
+    /// 缺参报错先报靠前的键，钉子依赖这一顺序逐键"补前缺后"）。
+    ///
+    /// [`ParamKind::Angle`] 的 [`ParamDefault::Float`] 存**度**（GUI 预填直接用；
+    /// 提交时 GUI 换算弧度写入配方）。
+    #[must_use]
+    pub fn param_defs(self) -> Vec<ParamDef> {
+        match self {
+            Self::MakeBox => vec![
+                ParamDef::prefilled(
+                    "dx",
+                    "X 向尺寸",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+                ParamDef::prefilled(
+                    "dy",
+                    "Y 向尺寸",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+                ParamDef::prefilled(
+                    "dz",
+                    "Z 向尺寸",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+            ],
+            Self::MakeCylinder => vec![
+                ParamDef::prefilled(
+                    "radius",
+                    "半径",
+                    ParamKind::Length,
+                    ParamDefault::Float(500.0),
+                ),
+                ParamDef::prefilled(
+                    "height",
+                    "高度",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+            ],
+            Self::MakeSphere => vec![ParamDef::prefilled(
+                "radius",
+                "半径",
+                ParamKind::Length,
+                ParamDefault::Float(500.0),
+            )],
+            Self::MakeCone => vec![
+                ParamDef::prefilled(
+                    "r1",
+                    "下底半径",
+                    ParamKind::Length,
+                    ParamDefault::Float(500.0),
+                ),
+                ParamDef::prefilled(
+                    "r2",
+                    "上底半径",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "height",
+                    "高度",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+            ],
+            Self::MakeTorus => vec![
+                ParamDef::prefilled(
+                    "major_radius",
+                    "主半径",
+                    ParamKind::Length,
+                    ParamDefault::Float(500.0),
+                ),
+                ParamDef::prefilled(
+                    "minor_radius",
+                    "管半径",
+                    ParamKind::Length,
+                    ParamDefault::Float(100.0),
+                ),
+            ],
+            // 拉伸向量（对输入 wire/face）；G4 草图「拉伸 500mm」语义由草图层填 (0,0,500)。
+            Self::Extrude => vec![
+                ParamDef::prefilled(
+                    "dx",
+                    "X 向拉伸",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "dy",
+                    "Y 向拉伸",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "dz",
+                    "Z 向拉伸",
+                    ParamKind::Length,
+                    ParamDefault::Float(500.0),
+                ),
+            ],
+            // 旋转轴：过 (px,py,pz)、方向 (dx,dy,dz)；预填 Z 轴 + 360°。
+            Self::Revolve => vec![
+                ParamDef::prefilled("px", "轴点 X", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("py", "轴点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("pz", "轴点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled(
+                    "dx",
+                    "轴方向 X",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "dy",
+                    "轴方向 Y",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "dz",
+                    "轴方向 Z",
+                    ParamKind::Length,
+                    ParamDefault::Float(1.0),
+                ),
+                ParamDef::prefilled(
+                    "angle_rad",
+                    "旋转角（度）",
+                    ParamKind::Angle,
+                    ParamDefault::Float(360.0),
+                ),
+            ],
+            // 无参数算子（输入由选择 / 草图决定）。
+            Self::Fuse
+            | Self::Cut
+            | Self::Common
+            | Self::FixShape
+            | Self::UnifySameDomain
+            | Self::MakeWire
+            | Self::MakeFace
+            | Self::ExtractWire
+            | Self::Pipe => vec![],
+            Self::Translate => vec![
+                ParamDef::prefilled("x", "X 位移", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("y", "Y 位移", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("z", "Z 位移", ParamKind::Length, ParamDefault::Float(0.0)),
+            ],
+            // 刚体旋转：轴点 / 轴方向 / 角度；预填 Z 轴 + 90°。
+            Self::Rotate => vec![
+                ParamDef::prefilled("px", "轴点 X", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("py", "轴点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("pz", "轴点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled(
+                    "dx",
+                    "轴方向 X",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "dy",
+                    "轴方向 Y",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "dz",
+                    "轴方向 Z",
+                    ParamKind::Length,
+                    ParamDefault::Float(1.0),
+                ),
+                ParamDef::prefilled(
+                    "angle_rad",
+                    "旋转角（度）",
+                    ParamKind::Angle,
+                    ParamDefault::Float(90.0),
+                ),
+            ],
+            Self::Sew | Self::SewAndSolidify => vec![ParamDef::optional(
+                "tolerance",
+                "缝合容差（mm）",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_SEW_TOLERANCE_MM),
+            )],
+            // 子形状选择器必填（JSON，`Value::Text`）——空选择会让算子静默无效，
+            // 故无预填（GUI 必须给值）；缺省容差与内核口径一致。
+            Self::Fillet => vec![
+                ParamDef::prefilled(
+                    "radius",
+                    "圆角半径",
+                    ParamKind::Length,
+                    ParamDefault::Float(5.0),
+                ),
+                ParamDef::required("edge_selectors", "边选择器（JSON）", ParamKind::Selectors),
+            ],
+            Self::Chamfer => vec![
+                ParamDef::prefilled(
+                    "distance",
+                    "倒角距离",
+                    ParamKind::Length,
+                    ParamDefault::Float(5.0),
+                ),
+                ParamDef::required("edge_selectors", "边选择器（JSON）", ParamKind::Selectors),
+            ],
+            Self::Shell => vec![
+                ParamDef::prefilled(
+                    "thickness",
+                    "壁厚",
+                    ParamKind::Length,
+                    ParamDefault::Float(10.0),
+                ),
+                ParamDef::required("face_selectors", "面选择器（JSON）", ParamKind::Selectors),
+                ParamDef::optional(
+                    "tolerance",
+                    "建模容差（mm）",
+                    ParamKind::Length,
+                    ParamDefault::Float(DEFAULT_SEW_TOLERANCE_MM),
+                ),
+            ],
+            Self::Offset => vec![
+                ParamDef::prefilled(
+                    "distance",
+                    "偏置距离",
+                    ParamKind::Length,
+                    ParamDefault::Float(5.0),
+                ),
+                ParamDef::optional(
+                    "tolerance",
+                    "建模容差（mm）",
+                    ParamKind::Length,
+                    ParamDefault::Float(DEFAULT_SEW_TOLERANCE_MM),
+                ),
+            ],
+            Self::Thicken => vec![
+                ParamDef::prefilled(
+                    "thickness",
+                    "厚度",
+                    ParamKind::Length,
+                    ParamDefault::Float(10.0),
+                ),
+                ParamDef::optional(
+                    "tolerance",
+                    "建模容差（mm）",
+                    ParamKind::Length,
+                    ParamDefault::Float(DEFAULT_SEW_TOLERANCE_MM),
+                ),
+            ],
+            // 放样：变长输入（N ≥ 2 截面），执行缺省与内核一致。
+            Self::Loft => vec![
+                ParamDef::optional(
+                    "is_solid",
+                    "实体化",
+                    ParamKind::Bool,
+                    ParamDefault::Bool(true),
+                ),
+                ParamDef::optional("ruled", "直纹", ParamKind::Bool, ParamDefault::Bool(false)),
+            ],
+            Self::Sweep => vec![ParamDef::optional(
+                "transition_mode",
+                "过渡模式",
+                ParamKind::Int,
+                ParamDefault::Int(0),
+            )],
+            // 直边：两端点（mm）。
+            Self::MakeLineEdge => vec![
+                ParamDef::prefilled("x1", "起点 X", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("y1", "起点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("z1", "起点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled(
+                    "x2",
+                    "终点 X",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+                ParamDef::prefilled("y2", "终点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("z2", "终点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
+            ],
+            // 三点弧：起点 / 中间点 / 终点（vendor 三点式，无角度参数）。
+            Self::MakeArcEdge => vec![
+                ParamDef::prefilled("x1", "起点 X", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("y1", "起点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("z1", "起点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled(
+                    "x2",
+                    "中间点 X",
+                    ParamKind::Length,
+                    ParamDefault::Float(500.0),
+                ),
+                ParamDef::prefilled(
+                    "y2",
+                    "中间点 Y",
+                    ParamKind::Length,
+                    ParamDefault::Float(500.0),
+                ),
+                ParamDef::prefilled(
+                    "z2",
+                    "中间点 Z",
+                    ParamKind::Length,
+                    ParamDefault::Float(0.0),
+                ),
+                ParamDef::prefilled(
+                    "x3",
+                    "终点 X",
+                    ParamKind::Length,
+                    ParamDefault::Float(1000.0),
+                ),
+                ParamDef::prefilled("y3", "终点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
+                ParamDef::prefilled("z3", "终点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
+            ],
         }
     }
 }
@@ -970,5 +1384,137 @@ mod tests {
                 | BuildOp::ExtractWire => {}
             }
         }
+    }
+
+    /// **G3 钉 1（param_defs 清点，计划 §5.2/§8 风险 1）**：29 个算子全有参数定义；
+    /// 每算子键唯一、label 非空；`kind` 与 `default` 类型匹配；选择器键必填无预填
+    /// （空选择会让算子静默无效，GUI 必须给值）。
+    #[test]
+    fn param_defs_cover_every_op_with_consistent_kinds() {
+        let all: [BuildOp; 29] = [
+            BuildOp::MakeBox,
+            BuildOp::MakeCylinder,
+            BuildOp::MakeSphere,
+            BuildOp::MakeCone,
+            BuildOp::MakeTorus,
+            BuildOp::Extrude,
+            BuildOp::Revolve,
+            BuildOp::Fuse,
+            BuildOp::Cut,
+            BuildOp::Common,
+            BuildOp::Translate,
+            BuildOp::Rotate,
+            BuildOp::Sew,
+            BuildOp::SewAndSolidify,
+            BuildOp::FixShape,
+            BuildOp::UnifySameDomain,
+            BuildOp::Fillet,
+            BuildOp::Chamfer,
+            BuildOp::Shell,
+            BuildOp::Offset,
+            BuildOp::Thicken,
+            BuildOp::Loft,
+            BuildOp::Sweep,
+            BuildOp::Pipe,
+            BuildOp::MakeLineEdge,
+            BuildOp::MakeArcEdge,
+            BuildOp::MakeWire,
+            BuildOp::MakeFace,
+            BuildOp::ExtractWire,
+        ];
+        for op in all {
+            let defs = op.param_defs();
+            for (i, d) in defs.iter().enumerate() {
+                assert!(
+                    !defs[..i].iter().any(|x| x.key == d.key),
+                    "{op:?} 的参数键 `{}` 重复",
+                    d.key
+                );
+                assert!(
+                    !d.label.is_empty(),
+                    "{op:?} 的参数键 `{}` 缺中文标签",
+                    d.key
+                );
+                match d.kind {
+                    ParamKind::Length | ParamKind::Angle => match &d.default {
+                        Some(ParamDefault::Float(_)) | None => {}
+                        other => panic!(
+                            "{op:?} 键 `{}` 是长度/角度，default 应为 Float 或无，实得 {other:?}",
+                            d.key
+                        ),
+                    },
+                    ParamKind::Int => match &d.default {
+                        Some(ParamDefault::Int(_)) | None => {}
+                        other => panic!(
+                            "{op:?} 键 `{}` 是整数，default 应为 Int 或无，实得 {other:?}",
+                            d.key
+                        ),
+                    },
+                    ParamKind::Bool => match &d.default {
+                        Some(ParamDefault::Bool(_)) | None => {}
+                        other => panic!(
+                            "{op:?} 键 `{}` 是布尔，default 应为 Bool 或无，实得 {other:?}",
+                            d.key
+                        ),
+                    },
+                    ParamKind::Selectors => {
+                        assert!(
+                            d.default.is_none(),
+                            "{op:?} 键 `{}` 是选择器，必须必填无预填",
+                            d.key
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **G3 钉 2**：可选键的 `default` 与 `execute` 的执行缺省**逐字一致**
+    /// ——防"表单预填与内核 fallback 漂移"（tolerance / is_solid / ruled /
+    /// transition_mode 四键全点对齐）。
+    #[test]
+    fn optional_param_defaults_match_the_execute_fallbacks() {
+        // tolerance（缝合 / 建模容差五算子）→ DEFAULT_SEW_TOLERANCE_MM。
+        for op in [
+            BuildOp::Sew,
+            BuildOp::SewAndSolidify,
+            BuildOp::Shell,
+            BuildOp::Offset,
+            BuildOp::Thicken,
+        ] {
+            let d = op
+                .param_defs()
+                .into_iter()
+                .find(|d| d.key == "tolerance")
+                .unwrap_or_else(|| panic!("{op:?} 应声明 tolerance 可选参数"));
+            assert!(!d.required, "{op:?} 的 tolerance 应为可选");
+            assert_eq!(
+                d.default,
+                Some(ParamDefault::Float(DEFAULT_SEW_TOLERANCE_MM)),
+                "{op:?} 的 tolerance 缺省必须与 execute fallback 一致"
+            );
+        }
+        // Loft：is_solid=true / ruled=false（execute 的 unwrap_or 逐字一致）。
+        let loft = BuildOp::Loft.param_defs();
+        let is_solid = loft
+            .iter()
+            .find(|d| d.key == "is_solid")
+            .expect("Loft 应声明 is_solid 可选参数");
+        assert!(!is_solid.required);
+        assert_eq!(is_solid.default, Some(ParamDefault::Bool(true)));
+        let ruled = loft
+            .iter()
+            .find(|d| d.key == "ruled")
+            .expect("Loft 应声明 ruled 可选参数");
+        assert!(!ruled.required);
+        assert_eq!(ruled.default, Some(ParamDefault::Bool(false)));
+        // Sweep：transition_mode=0。
+        let sweep = BuildOp::Sweep.param_defs();
+        let mode = sweep
+            .iter()
+            .find(|d| d.key == "transition_mode")
+            .expect("Sweep 应声明 transition_mode 可选参数");
+        assert!(!mode.required);
+        assert_eq!(mode.default, Some(ParamDefault::Int(0)));
     }
 }

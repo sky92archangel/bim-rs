@@ -70,7 +70,7 @@ use cable_tunnel::{
 use core_app::CoreSession;
 use core_doc::{Camera, PickFilter, PickKind, PickParam, PickResult, Ray, ViewOrientation};
 use core_interop::{Drawing2D, Format};
-use core_model::{ElementId, PropertyMap, ShapeId, Value, ViewId};
+use core_model::{ElementId, FieldType, PropertyMap, ShapeId, Value, ViewId};
 use core_sdk::{BuildOp, Module, ParamDef, ParamDefault, ParamKind};
 use example_beam::{
     CATEGORY as BEAM_CATEGORY, ExampleBeam, GEOMETRY_OP_ID as OP_BEAM_RECT,
@@ -82,6 +82,7 @@ use hvac_duct::{
 };
 
 use crate::sketch_editor::SketchEntry;
+use crate::types_editor::{self, TypesEdit};
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -398,6 +399,8 @@ struct BimApp {
     secondary: Option<ElementId>,
     /// 草图编辑器状态（G4-M15：Some = 草图浮窗开着；三入口共用一个编辑器）
     sketch: Option<crate::sketch_editor::SketchEditorState>,
+    /// 类型编辑器状态（G5-M20：Some = Types 页编辑中——新建 / 编辑 PropertySchema）
+    types_edit: Option<TypesEdit>,
 }
 
 /// 原生算子参数表单状态（G3：确认时换算成 PropertyMap → build/modify/combine_native）。
@@ -561,6 +564,7 @@ impl BimApp {
             op_form: None,
             secondary: None,
             sketch: None,
+            types_edit: None,
         })
     }
 
@@ -615,6 +619,7 @@ impl BimApp {
             op_form: None,
             secondary: None,
             sketch: None,
+            types_edit: None,
         })
     }
 
@@ -1513,10 +1518,7 @@ impl BimApp {
         ui.separator();
         match self.left_page {
             Page::Elements => self.elements_panel(ui),
-            Page::Types => {
-                ui.label("类型管理器");
-                ui.label("（G5 交付：PropertySchema 可视化编辑，见 GUI 计划 §5.3）");
-            }
+            Page::Types => self.types_panel(ui),
             _ => {}
         }
     }
@@ -1633,6 +1635,192 @@ impl BimApp {
                     } else {
                         self.selected = Some(id);
                         self.picked = None;
+                    }
+                }
+            }
+        });
+    }
+
+    /// 左栏 · 类型管理器（G5-M20：§5.3——类型列表 + 新建 / 编辑 PropertySchema）。
+    ///
+    /// 编辑语义（`types_editor` 模块文档同款）：新建模式重名校验拒绝（新建不
+    /// 该静默覆盖既有类型）；编辑模式 type_name 只读（不做改名语义——改名会
+    /// 插入新条目、旧条目残留）、保存走 `upsert_schema` 覆盖。约束（诚实提示）：
+    /// ①覆盖**只影响新实例**——既有实例 PropertyMap 是落成时刻快照不回写；
+    /// ②schema 是**会话态**——`.bimdoc` 不持久化 registry，重开文档后自定义
+    /// 类型丢失。
+    fn types_panel(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        ui.horizontal(|ui| {
+            ui.label("已注册类型：");
+            if ui.small_button(format!("{} 新建类型", ph::PLUS)).clicked() {
+                self.types_edit = Some(TypesEdit::new_blank());
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // —— 类型列表（按名有序；M19 list_schemas）——
+            let schemas = self.session.list_schemas();
+            if schemas.is_empty() {
+                ui.label("（无已注册类型）");
+            }
+            for schema in &schemas {
+                let editing = self
+                    .types_edit
+                    .as_ref()
+                    .is_some_and(|t| !t.is_new && t.type_name == schema.type_name);
+                let text = format!("{}（{} 字段）", schema.type_name, schema.fields.len());
+                if ui.selectable_label(editing, text).clicked() {
+                    self.types_edit = Some(TypesEdit::from_schema(schema));
+                }
+            }
+            // —— 编辑区渲染段（types_edit 可变借用圈在块内；照 props_panel
+            //    「渲染收集动作」同款，动作在借用结束后执行）——
+            let mut save_clicked = false;
+            let mut cancel_clicked = false;
+            if let Some(edit) = self.types_edit.as_mut() {
+                ui.separator();
+                ui.heading(if edit.is_new {
+                    "新建类型"
+                } else {
+                    "编辑类型"
+                });
+                ui.weak(if edit.is_new {
+                    "保存后可在属性面板给构件挂该类型（非法值会被 validate 拦截）"
+                } else {
+                    "⚠ 覆盖保存只影响新实例：既有构件的属性是落成时刻快照，不回写"
+                });
+                ui.weak("（自定义类型是会话态：不随 .bimdoc 持久化，重开文档后丢失）");
+                ui.horizontal(|ui| {
+                    ui.label("类型名：");
+                    if edit.is_new {
+                        ui.text_edit_singleline(&mut edit.type_name);
+                    } else {
+                        ui.monospace(&edit.type_name);
+                        ui.weak("（只读；保存将覆盖已注册定义）");
+                    }
+                });
+                // 字段表格（名 / 类型 / 单位 / 必填 / 默认值 / 说明 + 删行）
+                let mut remove: Option<usize> = None;
+                egui::Grid::new("types_fields_grid")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (i, row) in edit.fields.iter_mut().enumerate() {
+                            ui.text_edit_singleline(&mut row.name).on_hover_text(
+                                if row.doc.is_empty() {
+                                    "字段名".to_string()
+                                } else {
+                                    row.doc.clone()
+                                },
+                            );
+                            egui::ComboBox::from_id_salt(format!("ft_{i}"))
+                                .selected_text(types_editor::type_label(&row.field_type))
+                                .show_ui(ui, |ui| {
+                                    for ft in &types_editor::FIELD_TYPES {
+                                        let is_enum = matches!(ft, FieldType::Enum(_))
+                                            && matches!(row.field_type, FieldType::Enum(_));
+                                    if ui
+                                        .selectable_label(
+                                            is_enum || row.field_type == *ft,
+                                            types_editor::type_label(ft),
+                                        )
+                                        .clicked()
+                                        && !is_enum
+                                    {
+                                            // 切到枚举清空旧类型；已是枚举时再点不重置选项
+                                            row.field_type = ft.clone();
+                                        }
+                                    }
+                                });
+                            ui.text_edit_singleline(&mut row.unit)
+                                .on_hover_text("单位（空 = 无）");
+                            ui.checkbox(&mut row.required, "必填");
+                            ui.checkbox(&mut row.has_default, "默认");
+                            match (&row.field_type, row.has_default) {
+                                (_, false) => {
+                                    ui.weak("—");
+                                }
+                                (FieldType::Ref, true) => {
+                                    ui.weak("引用无默认");
+                                }
+                                _ => {
+                                    ui.text_edit_singleline(&mut row.default_text);
+                                }
+                            }
+                            ui.text_edit_singleline(&mut row.doc)
+                                .on_hover_text("说明（字段名悬停展示）");
+                            if ui.small_button(format!("{} 删", ph::TRASH)).clicked() {
+                                remove = Some(i);
+                            }
+                            ui.end_row();
+                            if matches!(row.field_type, FieldType::Enum(_)) {
+                                ui.label("选项");
+                                ui.text_edit_singleline(&mut row.enum_options)
+                                    .on_hover_text("枚举选项（逗号分隔）");
+                                ui.end_row();
+                            }
+                        }
+                    });
+                if let Some(i) = remove {
+                    edit.fields.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button(format!("{} 加字段", ph::PLUS)).clicked() {
+                        edit.fields.push(types_editor::FieldRow::blank());
+                    }
+                });
+                if let Some(msg) = &edit.message {
+                    ui.colored_label(egui::Color32::RED, msg.clone());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("保存").clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            }
+            // —— 动作段（edit 借用结束；照 props_panel 同款）——
+            if cancel_clicked {
+                self.types_edit = None;
+            }
+            if save_clicked {
+                let outcome: Result<Option<(String, usize)>, String> =
+                    match self.types_edit.as_ref() {
+                        Some(e) => match e.build_schema() {
+                            Ok(schema) => {
+                                let name = schema.type_name.clone();
+                                let count = schema.fields.len();
+                                // 新建模式重名校验（编辑模式覆盖语义——upsert 直接落库）
+                                let exists = self
+                                    .session
+                                    .list_schemas()
+                                    .iter()
+                                    .any(|s| s.type_name == name);
+                                if e.is_new && exists {
+                                    Err(format!("类型名已存在：{name}"))
+                                } else {
+                                    match self.session.upsert_schema(schema) {
+                                        Ok(()) => Ok(Some((name, count))),
+                                        Err(err) => Err(err.to_string()),
+                                    }
+                                }
+                            }
+                            Err(msg) => Err(msg),
+                        },
+                        None => Ok(None),
+                    };
+                match outcome {
+                    Ok(Some((name, count))) => {
+                        self.types_edit = None;
+                        self.log(format!("✓ 类型「{name}」已保存（{count} 个字段）"));
+                    }
+                    Ok(None) => {}
+                    Err(msg) => {
+                        if let Some(e) = self.types_edit.as_mut() {
+                            e.message = Some(msg);
+                        }
                     }
                 }
             }

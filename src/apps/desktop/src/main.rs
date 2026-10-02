@@ -44,6 +44,9 @@ mod sketch_geom;
 /// 草图工具纯逻辑（G4-M15）：状态机 + 捕捉 / 正交纯函数，不门控 feature（默认腿可单测）。
 mod sketch_tool;
 
+/// 类型编辑器纯逻辑（G5-M20）：Types 页状态 + 快照 / 校验 / 构造纯函数，不门控 feature（默认腿可单测）。
+mod types_editor;
+
 /// 草图编辑器浮窗（G4-M15）：egui 渲染与交互（依赖 gui feature）。
 #[cfg(feature = "gui")]
 mod sketch_editor;

@@ -334,6 +334,11 @@ impl Kernel {
             .make_arc_edge(x1, y1, z1, x2, y2, z2, x3, y3, z3)
     }
 
+    /// **贝塞尔样条边**：由 N（≥ 2）个控制点定一条 Bézier 样条边。返回新句柄。
+    pub fn make_bezier_edge(&mut self, points: &[[f64; 3]]) -> KernelResult<ShapeHandle> {
+        self.backend.make_bezier_edge(points)
+    }
+
     /// **线框**：把一组边按序连成 wire（N ≥ 1，空表响亮拒绝）。返回新句柄。
     pub fn make_wire(&mut self, edges: &[ShapeHandle]) -> KernelResult<ShapeHandle> {
         self.backend.make_wire(edges)

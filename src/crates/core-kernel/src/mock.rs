@@ -106,6 +106,12 @@ enum ShapeKind {
     /// **三点弧占位**（M7a）：**记录型**——`origin` / `size` / `rotation`
     /// 依次记起点 / 中间点 / 终点（9 坐标折进既有字段，v3 格式不变）。
     EdgeArc,
+    /// **贝塞尔样条边占位**（G4-M13）：**记录型**——`origin` / `size` 依次记
+    /// 第 1 / 末位控制点（⚠ 对线种类，`size` 携带**端点坐标**而非包围盒尺寸，
+    /// 同 `EdgeLine` 口径），`rotation[0]` 记**控制点个数**（同 `Wire` 记边数
+    /// 口径）。中间控制点不入档——占位只保 extents 近似（起终点）+ 计数存证，
+    /// occt 腿才有真样条。
+    EdgeSpline,
     /// **线框占位**（M7a）：extents（成员边记录点的 min/max）折进 `origin` /
     /// `size`，**边数**记在 `rotation[0]`。
     Wire,
@@ -128,6 +134,7 @@ impl ShapeKind {
             Self::Shell => "shell",
             Self::EdgeLine => "edge_line",
             Self::EdgeArc => "edge_arc",
+            Self::EdgeSpline => "edge_spline",
             Self::Wire => "wire",
             Self::Face => "face",
         }
@@ -147,6 +154,7 @@ impl ShapeKind {
             "shell" => Some(Self::Shell),
             "edge_line" => Some(Self::EdgeLine),
             "edge_arc" => Some(Self::EdgeArc),
+            "edge_spline" => Some(Self::EdgeSpline),
             "wire" => Some(Self::Wire),
             "face" => Some(Self::Face),
             _ => None,
@@ -558,6 +566,8 @@ fn member_points(s: &Shape) -> Vec<[f64; 3]> {
     match s.kind {
         ShapeKind::EdgeLine => vec![s.origin, s.size],
         ShapeKind::EdgeArc => vec![s.origin, s.size, s.rotation],
+        // 样条边占位：extents 按首末控制点近似（中间控制点不入档，见 EdgeSpline 文档）。
+        ShapeKind::EdgeSpline => vec![s.origin, s.size],
         // Wire / Face 的 extents 已折进 origin/size，取其两角点
         ShapeKind::Wire | ShapeKind::Face => vec![s.origin, s.aabb_max()],
         _ => Vec::new(),
@@ -1200,6 +1210,30 @@ impl KernelBackend for MockBackend {
         Ok(self.arena.alloc(out))
     }
 
+    /// 占位"贝塞尔样条边"（G4-M13）：**记录型**——`origin` / `size` 记首末
+    /// 控制点、`rotation[0]` 记控制点个数（同 `EdgeArc` 记录型口径）；点数 < 2
+    /// 或任一坐标非有限数 → [`KernelError::InvalidArgument`] **响亮拒绝**。
+    fn make_bezier_edge(&mut self, points: &[[f64; 3]]) -> KernelResult<ShapeHandle> {
+        if points.len() < 2 {
+            return Err(KernelError::InvalidArgument(format!(
+                "make_bezier_edge: 至少需要 2 个控制点，实得 {}",
+                points.len()
+            )));
+        }
+        for (i, p) in points.iter().enumerate() {
+            for (k, v) in p.iter().enumerate() {
+                finite_arg("make_bezier_edge", &format!("points[{i}][{k}]"), *v)?;
+            }
+        }
+        let first = points[0];
+        let last = *points.last().expect("len >= 2 checked above");
+        let mut out = Shape::new(ShapeKind::EdgeSpline, last, 0.0);
+        out.origin = first;
+        out.rotation = [points.len() as f64, 0.0, 0.0];
+        out.solid_count = 0;
+        Ok(self.arena.alloc(out))
+    }
+
     /// 占位"线框"：**记录型**——extents（成员边记录点的 min/max）折进
     /// `origin` / `size`，**边数**记在 `rotation[0]`；空表 →
     /// [`KernelError::InvalidArgument`] **响亮拒绝**（与 occt 腿同款，内核层把关）。
@@ -1301,7 +1335,9 @@ impl KernelBackend for MockBackend {
             | ShapeKind::Shell
             | ShapeKind::Face => box_mesh(s.size[0], s.size[1], s.size[2]),
             // 占位：线与线框没有可细分的表面 —— 返回空网格（线无表面，如实记账）。
-            ShapeKind::EdgeLine | ShapeKind::EdgeArc | ShapeKind::Wire => empty_mesh(),
+            ShapeKind::EdgeLine | ShapeKind::EdgeArc | ShapeKind::EdgeSpline | ShapeKind::Wire => {
+                empty_mesh()
+            }
         };
         // **origin 纳入计算**：网格顶点整体挪到定位点。占位网格本是理想化结果，
         // 但位置必须如实反映——否则平移后的构件会"看起来还在原点"。
@@ -1343,8 +1379,9 @@ impl KernelBackend for MockBackend {
                 rect_lines(&mut visible, s.size[0], s.size[1], LineClass::Sharp, offset);
             }
             // 占位：边种类投成一条线段（两端点 / 记录点的 x/y；三点弧退化为
-            // 起点→中间点线段，理想化结果与既有占位口径一致）。
-            ShapeKind::EdgeLine | ShapeKind::EdgeArc => {
+            // 起点→中间点线段，理想化结果与既有占位口径一致；样条边投成
+            // 首末控制点线段——中间控制点不入档，见 EdgeSpline 文档）。
+            ShapeKind::EdgeLine | ShapeKind::EdgeArc | ShapeKind::EdgeSpline => {
                 push_line(
                     &mut visible,
                     DVec2::new(s.origin[0], s.origin[1]),

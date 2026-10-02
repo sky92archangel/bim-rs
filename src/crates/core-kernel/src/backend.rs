@@ -321,6 +321,14 @@ pub trait KernelBackend {
         z3: f64,
     ) -> KernelResult<ShapeHandle>;
 
+    /// **贝塞尔样条边**（G4 前置）：由 N（≥ 2）个**控制点**（mm）定一条
+    /// Bézier 样条边（vendor `make_bezier_edge` 扁平点直通；N−1 阶）。
+    ///
+    /// `points` 为空表或单点时返回
+    /// [`KernelError::InvalidArgument`](crate::KernelError::InvalidArgument)；
+    /// 任一坐标非有限数同样拒绝（`finite` 逐点校验，照 `make_line_edge` 口径）。
+    fn make_bezier_edge(&mut self, points: &[[f64; 3]]) -> KernelResult<ShapeHandle>;
+
     /// **线框**：把一组边按序连成 wire（**变长**，N ≥ 1，边顺序即连接序）。
     ///
     /// `edges` 为**空表**时返回

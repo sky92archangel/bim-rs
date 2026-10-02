@@ -92,6 +92,9 @@ pub enum BuildOp {
     MakeLineEdge,
     /// 三点弧：起点 / 中间点 / 终点（vendor make_arc_edge 为三点式，无角度参数）
     MakeArcEdge,
+    /// 贝塞尔样条边：N（≥ 2）控制点定一条 Bézier 样条边（G4 前置：vendor
+    /// `make_bezier_edge` 已有，Kernel trait M13 接线；`points` 键 JSON 坐标数组）
+    MakeSplineEdge,
     /// 线框：把一组边按序连成 wire（变长）
     MakeWire,
     /// 由 wire 造面
@@ -124,6 +127,9 @@ pub enum ParamKind {
     Bool,
     /// 子形状选择器（`Value::Text` JSON 数组，GUI 文本框）
     Selectors,
+    /// 样条控制点（`Value::Text` JSON `[[x,y,z],...]`，GUI 文本框；G4 草图
+    /// 交互后自动填，表单阶段可手填）
+    Points,
 }
 
 /// 参数缺省值（与 [`Value`] 的标量对应；`Ref` 不是算子参数）。
@@ -234,7 +240,7 @@ impl BuildOp {
             Self::Fuse | Self::Cut | Self::Common => 2,
             Self::Fillet | Self::Chamfer | Self::Shell | Self::Offset | Self::Thicken => 1,
             Self::Loft | Self::Sweep | Self::Pipe => 2,
-            Self::MakeLineEdge | Self::MakeArcEdge => 0,
+            Self::MakeLineEdge | Self::MakeArcEdge | Self::MakeSplineEdge => 0,
             Self::MakeWire => 1,
             Self::MakeFace | Self::ExtractWire => 1,
         }
@@ -295,6 +301,7 @@ impl BuildOp {
             Self::Pipe => "管道",
             Self::MakeLineEdge => "直边",
             Self::MakeArcEdge => "三点弧",
+            Self::MakeSplineEdge => "样条边",
             Self::MakeWire => "线框",
             Self::MakeFace => "由线框造面",
             Self::ExtractWire => "提取外环",
@@ -615,6 +622,9 @@ impl BuildOp {
                 ParamDef::prefilled("y3", "终点 Y", ParamKind::Length, ParamDefault::Float(0.0)),
                 ParamDef::prefilled("z3", "终点 Z", ParamKind::Length, ParamDefault::Float(0.0)),
             ],
+            // 贝塞尔样条边（G4 前置）：控制点 JSON 数组（必填，N ≥ 2）——
+            // 草图交互后自动填（M15+），表单阶段可手填 JSON。
+            Self::MakeSplineEdge => vec![ParamDef::required("points", "控制点", ParamKind::Points)],
         }
     }
 }
@@ -1315,11 +1325,12 @@ mod tests {
         assert!(ok.is_well_ordered(), "MakeWire 变长 step 的有序判定应通过");
     }
 
-    /// **M7a 钉子 3（清点钉）**：`BuildOp` 恰为 29 个变体（M6 的 24 + M7a 的 5）；
-    /// exhaustive match 保证清单与枚举同步——M7b+ 新增变体时同步更新此钉。
+    /// **清点钉（M7a 钉子 3，G4-M13 更新）**：`BuildOp` 恰为 30 个变体
+    /// （M6 的 24 + M7a 的 5 + G4 前置的 `MakeSplineEdge`）；exhaustive match
+    /// 保证清单与枚举同步——后续新增变体时同步更新此钉。
     #[test]
-    fn m7a_build_op_variant_count_is_twenty_nine() {
-        let all: [BuildOp; 29] = [
+    fn build_op_variant_count_is_thirty() {
+        let all: [BuildOp; 30] = [
             BuildOp::MakeBox,
             BuildOp::MakeCylinder,
             BuildOp::MakeSphere,
@@ -1346,6 +1357,7 @@ mod tests {
             BuildOp::Pipe,
             BuildOp::MakeLineEdge,
             BuildOp::MakeArcEdge,
+            BuildOp::MakeSplineEdge,
             BuildOp::MakeWire,
             BuildOp::MakeFace,
             BuildOp::ExtractWire,
@@ -1379,6 +1391,7 @@ mod tests {
                 | BuildOp::Pipe
                 | BuildOp::MakeLineEdge
                 | BuildOp::MakeArcEdge
+                | BuildOp::MakeSplineEdge
                 | BuildOp::MakeWire
                 | BuildOp::MakeFace
                 | BuildOp::ExtractWire => {}
@@ -1386,12 +1399,12 @@ mod tests {
         }
     }
 
-    /// **G3 钉 1（param_defs 清点，计划 §5.2/§8 风险 1）**：29 个算子全有参数定义；
-    /// 每算子键唯一、label 非空；`kind` 与 `default` 类型匹配；选择器键必填无预填
-    /// （空选择会让算子静默无效，GUI 必须给值）。
+    /// **G3 钉 1（param_defs 清点，计划 §5.2/§8 风险 1，G4-M13 更新）**：30 个
+    /// 算子全有参数定义；每算子键唯一、label 非空；`kind` 与 `default` 类型匹配；
+    /// 选择器 / 控制点键必填无预填（空选择会让算子静默无效，GUI 必须给值）。
     #[test]
     fn param_defs_cover_every_op_with_consistent_kinds() {
-        let all: [BuildOp; 29] = [
+        let all: [BuildOp; 30] = [
             BuildOp::MakeBox,
             BuildOp::MakeCylinder,
             BuildOp::MakeSphere,
@@ -1418,6 +1431,7 @@ mod tests {
             BuildOp::Pipe,
             BuildOp::MakeLineEdge,
             BuildOp::MakeArcEdge,
+            BuildOp::MakeSplineEdge,
             BuildOp::MakeWire,
             BuildOp::MakeFace,
             BuildOp::ExtractWire,
@@ -1457,10 +1471,10 @@ mod tests {
                             d.key
                         ),
                     },
-                    ParamKind::Selectors => {
+                    ParamKind::Selectors | ParamKind::Points => {
                         assert!(
-                            d.default.is_none(),
-                            "{op:?} 键 `{}` 是选择器，必须必填无预填",
+                            d.default.is_none() && d.required,
+                            "{op:?} 键 `{}` 是选择器/控制点，必须必填无预填",
                             d.key
                         );
                     }

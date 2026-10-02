@@ -834,6 +834,30 @@ impl KernelBackend for OcctBackend {
         Ok(self.alloc(h))
     }
 
+    /// **贝塞尔样条边**（G4-M13）：vendor `make_bezier_edge`（`:1825`，扁平点
+    /// 切片）直通；N ≥ 2 校验 + 逐坐标 `finite_arg`；控制点退化（共线等）时
+    /// 内核报错，**原样透传，不做预判**。
+    fn make_bezier_edge(&mut self, points: &[[f64; 3]]) -> KernelResult<ShapeHandle> {
+        if points.len() < 2 {
+            return Err(KernelError::InvalidArgument(format!(
+                "make_bezier_edge: 至少需要 2 个控制点，实得 {}",
+                points.len()
+            )));
+        }
+        let mut flat = Vec::with_capacity(points.len() * 3);
+        for (i, p) in points.iter().enumerate() {
+            for (k, v) in p.iter().enumerate() {
+                finite_arg("make_bezier_edge", &format!("points[{i}][{k}]"), *v)?;
+                flat.push(*v);
+            }
+        }
+        let h = self
+            .kernel
+            .make_bezier_edge(&flat)
+            .map_err(op_err("make_bezier_edge"))?;
+        Ok(self.alloc(h))
+    }
+
     /// **线框**：vendor `make_wire`（`:1625`）直通；`edges` 空表 →
     /// [`KernelError::InvalidArgument`] **响亮拒绝**（照 `loft` 空截面模式）。
     fn make_wire(&mut self, edges: &[ShapeHandle]) -> KernelResult<ShapeHandle> {
@@ -3371,6 +3395,73 @@ mod tests {
         assert!(
             matches!(b.make_wire(&[]), Err(KernelError::InvalidArgument(_))),
             "空边集应返回 InvalidArgument（响亮拒绝，绝不静默成功）"
+        );
+    }
+
+    /// **G4-M13 occt 钉 1：真实贝塞尔样条边**——vendor `make_bezier_edge`
+    /// 直通：4 控制点（非共线）建边成功、包围盒覆盖首末点且曲线不出控制点
+    /// 凸包、两条样条边可聚合 wire、单点输入响亮拒绝。
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "真实内核用例在 debug 下 wasmtime 编译过慢，请用 --release 运行"
+    )]
+    fn make_bezier_edge_builds_a_real_spline() {
+        let Some(mut b) = try_backend() else { return };
+        // 单点输入：InvalidArgument 响亮拒绝（内核层把关，先于 vendor）。
+        assert!(
+            matches!(
+                b.make_bezier_edge(&[[0.0, 0.0, 0.0]]),
+                Err(KernelError::InvalidArgument(_))
+            ),
+            "单点样条应返回 InvalidArgument（响亮拒绝）"
+        );
+
+        // 4 控制点三次贝塞尔（首末点 X 覆盖 [0,100]，Y 鼓到 75）。
+        let pts = [
+            [0.0, 0.0, 0.0],
+            [30.0, 100.0, 0.0],
+            [70.0, 100.0, 0.0],
+            [100.0, 0.0, 0.0],
+        ];
+        let edge = b.make_bezier_edge(&pts).expect("真内核应建出贝塞尔边");
+        assert_eq!(
+            b.sub_shape_count(edge, SubShapeKind::Edge).unwrap(),
+            1,
+            "一条贝塞尔边应恰为 1 个 Edge"
+        );
+        let bb = b.bounding_box(edge).unwrap();
+        assert!(
+            bb.min.iter().all(|v| v.abs() < 1e-6),
+            "包围盒 min 应覆盖首控制点 (0,0,0)，实得 {:?}",
+            bb.min
+        );
+        assert!(
+            (bb.max[0] - 100.0).abs() < 1e-6,
+            "包围盒 max.x 应覆盖末控制点 x=100，实得 {:?}",
+            bb.max
+        );
+        // Y 极值：精确极值 75（300·t(1−t)）或凸包上界 100——两者都在 (70, 100]。
+        assert!(
+            bb.max[1] > 70.0 && bb.max[1] <= 100.0 + 1e-6,
+            "包围盒 max.y 应在曲线极值/凸包上界内，实得 {:?}",
+            bb.max
+        );
+
+        // 两条样条边聚合 wire（G4 草图组装链路的地基）。
+        let e2 = b
+            .make_bezier_edge(&[
+                [100.0, 0.0, 0.0],
+                [130.0, -50.0, 0.0],
+                [170.0, -50.0, 0.0],
+                [200.0, 0.0, 0.0],
+            ])
+            .expect("第二条贝塞尔边");
+        let wire = b.make_wire(&[edge, e2]).expect("两条样条边应可聚合成 wire");
+        assert_eq!(
+            b.sub_shape_count(wire, SubShapeKind::Edge).unwrap(),
+            2,
+            "wire 应恰含 2 条成员边"
         );
     }
 }

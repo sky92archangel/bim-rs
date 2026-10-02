@@ -764,6 +764,13 @@ impl GeometryService {
                 }
                 (self.kernel.make_wire(&edges)?, None)
             }
+            // 贝塞尔样条边（G4 前置）：`points` 键 JSON 坐标数组（必填），
+            // 解析见 `require_spline_points`（缺 key / 格式错一律响亮报错）。
+            BuildOp::MakeSplineEdge => (
+                self.kernel
+                    .make_bezier_edge(&require_spline_points(step, index)?)?,
+                None,
+            ),
             BuildOp::MakeFace => (self.kernel.make_face(input(0)?)?, None),
             BuildOp::ExtractWire => (self.kernel.outer_wire(input(0)?)?, None),
         };
@@ -952,6 +959,34 @@ fn require_face_selectors(
     parse_face_selectors(text).map_err(|err| {
         AppError::RecipeNotExecutable(format!("第 {index} 步（{}）：{err}", step.op.label()))
     })
+}
+
+/// 取并解析**必填**的 `points`（贝塞尔样条控制点，`Value::Text` JSON
+/// `[[x,y,z],...]`，N ≥ 2）——`MakeSplineEdge` 专用（G4 前置）。
+///
+/// 缺 key / 解析失败 / 点数不足一律 [`AppError::RecipeNotExecutable`]
+///（**绝不静默**）。
+fn require_spline_points(step: &core_sdk::BuildStep, index: usize) -> AppResult<Vec<[f64; 3]>> {
+    let text = step.arg_text("points").ok_or_else(|| {
+        AppError::RecipeNotExecutable(format!(
+            "第 {index} 步（{}）缺少参数 `points`",
+            step.op.label()
+        ))
+    })?;
+    let raw: Vec<[f64; 3]> = serde_json::from_str(text).map_err(|err| {
+        AppError::RecipeNotExecutable(format!(
+            "第 {index} 步（{}）：`points` JSON 解析失败：{err}",
+            step.op.label()
+        ))
+    })?;
+    if raw.len() < 2 {
+        return Err(AppError::RecipeNotExecutable(format!(
+            "第 {index} 步（{}）：`points` 至少需要 2 个控制点，实得 {}",
+            step.op.label(),
+            raw.len()
+        )));
+    }
+    Ok(raw)
 }
 
 /// [`GeometryService::on_single_solid`] 的选择器种类（边 / 面）。
@@ -3102,9 +3137,9 @@ mod tests {
 
     // ===== G3：param_defs 键 ↔ execute 缺参报错对齐（计划 §8 风险 1）========
 
-    /// 全部 29 算子（与 core-sdk 清点钉同款清单；exhaustive match 保证同步）。
+    /// 全部 30 算子（与 core-sdk 清点钉同款清单；exhaustive match 保证同步）。
     fn all_ops() -> Vec<BuildOp> {
-        let all: [BuildOp; 29] = [
+        let all: [BuildOp; 30] = [
             BuildOp::MakeBox,
             BuildOp::MakeCylinder,
             BuildOp::MakeSphere,
@@ -3131,6 +3166,7 @@ mod tests {
             BuildOp::Pipe,
             BuildOp::MakeLineEdge,
             BuildOp::MakeArcEdge,
+            BuildOp::MakeSplineEdge,
             BuildOp::MakeWire,
             BuildOp::MakeFace,
             BuildOp::ExtractWire,
@@ -3138,13 +3174,15 @@ mod tests {
         all.into_iter().collect()
     }
 
-    /// 占位参数值（钉子补齐"其它必填键"用；选择器经 encode helper，禁手搓 JSON）。
+    /// 占位参数值（钉子补齐"其它必填键"用；选择器经 encode helper、控制点经
+    /// 常量 JSON，禁手搓；三点不共线，occt 腿贝塞尔直通也能过）。
     fn placeholder_value(d: &core_sdk::ParamDef) -> Value {
         use core_sdk::ParamKind;
         match d.kind {
             ParamKind::Length | ParamKind::Angle => Value::Float(1.0),
             ParamKind::Int => Value::Int(1),
             ParamKind::Bool => Value::Bool(true),
+            ParamKind::Points => Value::Text(SPLINE_POINTS_JSON.to_string()),
             ParamKind::Selectors => {
                 if d.key == "face_selectors" {
                     Value::Text(face_json(&[FaceSelector::ByIndex(0)]))
@@ -3258,5 +3296,98 @@ mod tests {
         assert!((g.kernel_mut().volume(moved).unwrap() - 1000.0).abs() < 1e-9);
         // vendor 语义：返回新句柄、原句柄仍有效。
         assert!(g.kernel().is_alive(box_h), "平移后原句柄仍有效");
+    }
+
+    // ===== G4-M13：MakeSplineEdge（贝塞尔样条边）接线钉子 ====================
+
+    /// 占位样条控制点（钉子补齐 `points` 键 / 构造样条步骤用；三点不共线）。
+    const SPLINE_POINTS_JSON: &str = "[[0.0,0.0,0.0],[100.0,0.0,0.0],[100.0,100.0,0.0]]";
+
+    /// 一个样条边步骤（3 控制点）。
+    fn a_spline_edge() -> core_sdk::BuildStep {
+        let mut step = core_sdk::BuildStep::new(BuildOp::MakeSplineEdge);
+        step.args.insert(
+            "points".to_string(),
+            Value::Text(SPLINE_POINTS_JSON.to_string()),
+        );
+        step
+    }
+
+    /// **M13 钉 1（mock 记录型 + wire 聚合）**：3 控制点样条边经 `execute` 成功；
+    /// `MakeWire` 能把它当成员边聚合——extents（首末控制点）折进 wire 包围盒。
+    #[test]
+    fn make_spline_edge_records_and_wires_in_mock() {
+        let recipe = OpOutput::of(vec![a_spline_edge()]);
+        let mut g = GeometryService::with_mock_kernel();
+        let executed = g.execute(&recipe).expect("样条边应执行成功");
+        let edge = executed.final_handle().unwrap();
+
+        // 聚合成 wire：首末控制点 (0,0,0)/(100,100,0) 折进包围盒。
+        let wire = g
+            .execute_native(BuildOp::MakeWire, &BTreeMap::new(), &[edge])
+            .expect("单边 wire 应成功")
+            .final_handle()
+            .unwrap();
+        let bb = g.kernel_mut().bounding_box(wire).unwrap();
+        let (min, max) = (bb.min, bb.max);
+        assert!(
+            min.iter().all(|v| v.abs() < 1e-9),
+            "wire 包围盒 min 应为首控制点 (0,0,0)，实得 {min:?}"
+        );
+        assert!(
+            max.iter()
+                .zip([100.0, 100.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire 包围盒 max 应为末控制点 (100,100,0)，实得 {max:?}"
+        );
+    }
+
+    /// **M13 钉 2（解析响亮拒绝）**：`points` 点数 < 2、JSON 格式错一律
+    /// [`AppError::RecipeNotExecutable`]——绝不静默放行。
+    #[test]
+    fn make_spline_edge_refuses_bad_points_json() {
+        let mut g = GeometryService::with_mock_kernel();
+
+        // 点数 < 2。
+        let mut step = core_sdk::BuildStep::new(BuildOp::MakeSplineEdge);
+        step.args
+            .insert("points".to_string(), Value::Text("[[1.0,2.0,3.0]]".into()));
+        let got = g.execute(&OpOutput::of(vec![step]));
+        assert!(
+            matches!(&got, Err(AppError::RecipeNotExecutable(msg))
+                if msg.contains("至少需要 2 个控制点")),
+            "单点样条应响亮拒绝，实得 {got:?}"
+        );
+
+        // JSON 格式错。
+        let mut step = core_sdk::BuildStep::new(BuildOp::MakeSplineEdge);
+        step.args
+            .insert("points".to_string(), Value::Text("不是 JSON".into()));
+        let got = g.execute(&OpOutput::of(vec![step]));
+        assert!(
+            matches!(&got, Err(AppError::RecipeNotExecutable(msg))
+                if msg.contains("解析失败")),
+            "坏 JSON 应响亮拒绝，实得 {got:?}"
+        );
+
+        // 两条失败路径都不得留下句柄（回滚干净）。
+        assert_eq!(g.kernel().live_count(), 0, "解析失败应回滚");
+    }
+
+    /// **M13 钉 3（execute_native 直通）**：`execute_native` 同样吃
+    /// `MakeSplineEdge`（G3 原生门面自动复用新算子臂）。
+    #[test]
+    fn execute_native_dispatches_make_spline_edge() {
+        let mut args = BTreeMap::new();
+        args.insert(
+            "points".to_string(),
+            Value::Text(SPLINE_POINTS_JSON.to_string()),
+        );
+        let mut g = GeometryService::with_mock_kernel();
+        let executed = g
+            .execute_native(BuildOp::MakeSplineEdge, &args, &[])
+            .expect("原生门面应直通样条边");
+        assert_eq!(executed.step_count(), 1);
+        assert!(executed.final_handle().is_some());
     }
 }

@@ -422,6 +422,7 @@ fn form_value_from_default(def: &ParamDef) -> FormValue {
         (ParamKind::Int, Some(ParamDefault::Int(i))) => FormValue::Int(*i),
         (ParamKind::Int, _) => FormValue::Int(0),
         (ParamKind::Selectors, _) => FormValue::Text(String::new()),
+        (ParamKind::Points, _) => FormValue::Text(String::new()),
         (ParamKind::Length, Some(ParamDefault::Float(f)))
         | (ParamKind::Angle, Some(ParamDefault::Float(f))) => FormValue::Float(*f),
         (_, _) => FormValue::Float(0.0),
@@ -1227,7 +1228,7 @@ impl BimApp {
                                 FormValue::Text(s) => {
                                     ui.add(
                                         egui::TextEdit::singleline(s)
-                                            .hint_text("选择器 JSON（必填）")
+                                            .hint_text("JSON（必填）")
                                             .desired_width(180.0),
                                     );
                                 }
@@ -1282,7 +1283,9 @@ impl BimApp {
                     (ParamKind::Length, FormValue::Float(mm)) => Value::Float(*mm),
                     (ParamKind::Int, FormValue::Int(i)) => Value::Int(*i),
                     (ParamKind::Bool, FormValue::Bool(b)) => Value::Bool(*b),
-                    (ParamKind::Selectors, FormValue::Text(s)) => Value::Text(s.clone()),
+                    (ParamKind::Selectors | ParamKind::Points, FormValue::Text(s)) => {
+                        Value::Text(s.clone())
+                    }
                     // 种类与定义不匹配（不应发生）：落缺，由内核缺参报错兜底。
                     _ => continue,
                 };

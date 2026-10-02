@@ -35,7 +35,7 @@
 //! 与本仓铁律一致：**不 panic、不吞错**。装载 / 建几何 / 网格化 / 拾取的
 //! 失败一律写进底栏日志（错误原文），窗口照常可操作。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -46,8 +46,9 @@ use cable_tunnel::{
     GEOMETRY_OP_ID_RECT as OP_TUNNEL_RECT,
 };
 use core_app::CoreSession;
-use core_doc::{Camera, PickFilter, PickResult, Ray};
-use core_model::{ElementId, ShapeId, Value};
+use core_doc::{Camera, PickFilter, PickResult, Ray, ViewOrientation};
+use core_interop::{Format, Drawing2D};
+use core_model::{ElementId, PropertyMap, ShapeId, Value, ViewId};
 use core_sdk::Module;
 use example_beam::{
     CATEGORY as BEAM_CATEGORY, ExampleBeam, GEOMETRY_OP_ID as OP_BEAM_RECT,
@@ -242,9 +243,34 @@ fn op_buttons() -> Vec<OpButton> {
     ]
 }
 
+/// 一个"新建视图"的视向预设（M11 图纸面板）。
+struct ViewPreset {
+    label: &'static str,
+    orientation: ViewOrientation,
+}
+
+/// 三个内置视向：俯视 / 前视用 [`ViewOrientation`] 内置构造；
+/// 右视按 front() 同款模式推导（观察方向 -X、向右 +Y、向上 +Z，
+/// `x_axis = view_dir × up = (−X)×Z = +Y`）。
+fn view_presets() -> Vec<ViewPreset> {
+    vec![
+        ViewPreset {
+            label: "俯视（平面）",
+            orientation: ViewOrientation::top(),
+        },
+        ViewPreset {
+            label: "前视（立面）",
+            orientation: ViewOrientation::front(),
+        },
+        ViewPreset {
+            label: "右视（立面）",
+            orientation: ViewOrientation::new(DVec3::new(1.0, 0.0, 0.0), DVec3::NEG_X, DVec3::Y),
+        },
+    ]
+}
+
 /// 按品类取基色（构件分色，便于区分模块）。
-fn base_color(category: &str) -> [u8; 3] {
-    match category {
+fn base_color(category: &str) -> [u8; 3] {    match category {
         BEAM_CATEGORY => [0x8a, 0x93, 0xa6],   // 混凝土灰蓝
         DUCT_CATEGORY => [0xbd, 0xc3, 0xcc],   // 镀锌钢板银灰
         TUNNEL_CATEGORY => [0xa6, 0xa0, 0x96], // 隧道混凝土灰
@@ -291,6 +317,27 @@ struct BimApp {
     file_path: Option<PathBuf>,
     /// 上次同步到窗口标题的文字（避免每帧重复 SetWindowText）
     last_title: Option<String>,
+    /// 参数编辑暂存（选中构件时快照；"应用并重建"提交，M10）
+    edit: Option<ParamEdit>,
+    /// ElementId → 建几何用的算子 id（rebuild 需要同款算子；build_op / new 时记录，M10）
+    op_by_element: HashMap<ElementId, String>,
+    /// 图纸面板选中的视图（M11）
+    selected_view: Option<ViewId>,
+    /// 浮动图纸预览窗口开关（M11）
+    preview_open: bool,
+}
+
+/// 一次参数编辑的暂存（选中构件时快照；"应用并重建"提交）。
+#[derive(Clone)]
+struct ParamEdit {
+    /// 编辑中的构件
+    element: ElementId,
+    /// 重建用的算子（= 该构件当初建几何的算子）
+    op_id: String,
+    /// 属性模式名（重建参数要带上）
+    schema: String,
+    /// 编辑中的参数快照（含未提交修改）
+    values: BTreeMap<String, Value>,
 }
 
 /// 装载全部三个专业模块（new / open 共用；失败逐条写日志，不 panic）。
@@ -327,11 +374,15 @@ impl BimApp {
 
         let mut logs: Vec<String> = Vec::new();
         install_modules(&mut session, &mut logs);
+        let mut op_by_element: HashMap<ElementId, String> = HashMap::new();
 
         // 起手造一根梁，让视口不空。
         match session.create_element(BEAM_CATEGORY, "") {
             Ok(id) => match session.build_geometry(id, OP_BEAM_RECT) {
-                Ok(shape) => logs.push(format!("✓ 初始构件：梁已建几何（ShapeId {shape}）")),
+                Ok(shape) => {
+                    op_by_element.insert(id, OP_BEAM_RECT.to_string());
+                    logs.push(format!("✓ 初始构件：梁已建几何（ShapeId {shape}）"));
+                }
                 Err(e) => logs.push(format!("✗ 初始梁建几何失败：{e}")),
             },
             Err(e) => logs.push(format!("✗ 初始构件创建失败：{e}")),
@@ -349,6 +400,10 @@ impl BimApp {
             real_kernel,
             file_path: None,
             last_title: None,
+            edit: None,
+            op_by_element,
+            selected_view: None,
+            preview_open: false,
         })
     }
 
@@ -389,6 +444,12 @@ impl BimApp {
             real_kernel,
             file_path: Some(path.to_path_buf()),
             last_title: None,
+            edit: None,
+            // 打开的文档无算子记录（build_op 只在本次会话记录）——
+            // 这些构件参数只读、不可重建，GUI 里如实提示。
+            op_by_element: HashMap::new(),
+            selected_view: None,
+            preview_open: false,
         })
     }
 
@@ -473,6 +534,42 @@ impl BimApp {
         }
     }
 
+    // ---- 关联更新（M10：属性可编辑 → rebuild_geometry → stale → regenerate） ----
+
+    /// 提交参数编辑：走 `rebuild_geometry`（M6 关联更新首链在 GUI 生效）——
+    /// 网格重建（dirty）+ 定向重投 + stale 视图标脏；警告逐条入日志，不被吞。
+    fn apply_rebuild(&mut self) {
+        let Some(edit) = self.edit.clone() else {
+            return;
+        };
+        let mut params = PropertyMap::new(edit.schema.clone());
+        for (k, v) in &edit.values {
+            params.set(k.clone(), v.clone());
+        }
+        match self
+            .session
+            .rebuild_geometry(edit.element, &edit.op_id, params)
+        {
+            Ok(report) => {
+                self.dirty = true;
+                self.log(format!(
+                    "✓ 关联更新：演化直连 {} + 指纹回退 {}，重投 {} 图元、重算 {} 标注、{} 视图已标脏",
+                    report.evolution_resolved,
+                    report.fingerprint_resolved,
+                    report.reprojected_entities,
+                    report.remeasured_annotations,
+                    report.stale_views
+                ));
+                for w in &report.warnings {
+                    self.log(format!("⚠ {w}"));
+                }
+                // 重建后重新快照（内核可能归一参数；选中不变）。
+                self.edit = None;
+            }
+            Err(e) => self.log(format!("✗ 关联更新失败：{e}")),
+        }
+    }
+
     /// 脏标记置位时重建全部网格（占位内核便宜；真实内核单次也只是一次网格化）。
     fn refresh_meshes(&mut self) {
         if !self.dirty {
@@ -543,6 +640,8 @@ impl BimApp {
                     self.picked = None;
                     self.dirty = true;
                     self.fit_pending = true;
+                    // 记录算子（M10：rebuild 需要同款算子）。
+                    self.op_by_element.insert(elem, op_id.to_string());
                     self.log(format!("✓ {label}：{op_id} 已建几何（ShapeId {shape}）"));
                 }
                 Err(e) => self.log(format!("✗ {label}：{op_id} 建几何失败：{e}")),
@@ -680,10 +779,12 @@ impl BimApp {
         let Some(id) = self.selected else {
             ui.label("未选中构件");
             ui.label("（列表单击，或视口内单击拾取）");
+            self.edit = None;
             return;
         };
         let Some(elem) = self.session.document().doc().element(id).cloned() else {
             ui.label("构件不存在");
+            self.edit = None;
             return;
         };
         egui::Grid::new("props_grid").striped(true).show(ui, |ui| {
@@ -706,17 +807,80 @@ impl BimApp {
 
         ui.separator();
         ui.heading("参数");
-        if elem.properties.is_empty() {
-            ui.label("（无属性）");
-        } else {
-            ui.label(format!("模式：{}", elem.properties.schema));
-            egui::Grid::new("params_grid").striped(true).show(ui, |ui| {
-                for (k, v) in &elem.properties.values {
-                    ui.label(k.clone());
-                    ui.label(format_value(v));
-                    ui.end_row();
-                }
+        // —— M10：选中变化时重置编辑暂存（快照当前参数 + 该构件的算子）——
+        if self.edit.as_ref().map(|e| e.element) != Some(id) {
+            self.edit = self.op_by_element.get(&id).map(|op| ParamEdit {
+                element: id,
+                op_id: op.clone(),
+                schema: elem.properties.schema.clone(),
+                values: elem.properties.values.clone(),
             });
+        }
+        // 渲染收集动作（edit 可变借用只圈在渲染段；动作在借用结束后执行）。
+        let mut apply_clicked = false;
+        let mut revert_clicked = false;
+        match self.edit.as_mut() {
+            // 无算子记录（打开的文档构件 / 无几何构件）：参数只读展示。
+            None => {
+                if elem.properties.is_empty() {
+                    ui.label("（无属性）");
+                } else {
+                    ui.label(format!("模式：{}", elem.properties.schema));
+                    egui::Grid::new("params_grid").striped(true).show(ui, |ui| {
+                        for (k, v) in &elem.properties.values {
+                            ui.label(k.clone());
+                            ui.label(format_value(v));
+                            ui.end_row();
+                        }
+                    });
+                }
+                ui.label("（该构件未在本会话造过几何，无算子记录；参数只读）");
+            }
+            Some(edit) => {
+                ui.label(format!(
+                    "模式：{}（可编辑，改后点\"应用并重建\"）",
+                    elem.properties.schema
+                ));
+                egui::Grid::new("params_edit_grid").striped(true).show(ui, |ui| {
+                    for (k, v) in edit.values.iter_mut() {
+                        ui.label(k.clone());
+                        match v {
+                            Value::Float(f) => {
+                                ui.add(egui::DragValue::new(f).speed(1.0).suffix(" mm"));
+                            }
+                            Value::Int(i) => {
+                                ui.add(egui::DragValue::new(i));
+                            }
+                        Value::Text(s) => {
+                            ui.text_edit_singleline(s);
+                        }
+                            Value::Bool(b) => {
+                                ui.checkbox(b, "");
+                            }
+                            Value::Ref(r) => {
+                                ui.label(format!("→ {r}"));
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("应用并重建").clicked() {
+                        apply_clicked = true;
+                    }
+                    if ui.button("还原").clicked() {
+                        revert_clicked = true;
+                    }
+                });
+            }
+        }
+        if apply_clicked {
+            self.apply_rebuild();
+        }
+        if revert_clicked
+            && let Some(e) = self.edit.as_mut()
+        {
+            e.values = elem.properties.values.clone();
         }
 
         ui.separator();
@@ -780,6 +944,233 @@ impl BimApp {
                     ui.monospace(line.clone());
                 }
             });
+    }
+
+    // ---- 图纸面板（M11：视图列表 + 新建视图 + 重新出图 + DXF 导出 + 2D 预览） ----
+
+    fn views_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("图纸");
+        ui.separator();
+        // —— 新建视图（三个内置视向预设）——
+        ui.label("新建视图：");
+        let presets = view_presets();
+        ui.horizontal_wrapped(|ui| {
+            for p in &presets {
+                if ui.small_button(p.label).clicked() {
+                    match self.session.create_view(p.label, p.orientation) {
+                        Ok(vid) => {
+                            self.selected_view = Some(vid);
+                            self.log(format!("✓ 视图已创建：{}（ViewId {vid}）", p.label));
+                        }
+                        Err(e) => self.log(format!("✗ 创建视图失败：{e}")),
+                    }
+                }
+            }
+        });
+        ui.separator();
+        // 视图列表（先收集再交互，避免边遍历边改状态）。
+        let items: Vec<(ViewId, String, bool, usize)> = self
+            .session
+            .document()
+            .drawing()
+            .views
+            .iter()
+            .map(|(id, v)| (*id, v.name.clone(), v.up_to_date, v.entities.len()))
+            .collect();
+        if items.is_empty() {
+            ui.label("（无视图，从上方按钮新建）");
+            return;
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (id, name, up_to_date, entity_count) in items {
+                let text = if up_to_date {
+                    name
+                } else {
+                    format!("{name} ⚠过期")
+                };
+                if ui
+                    .selectable_label(self.selected_view == Some(id), text)
+                    .clicked()
+                {
+                    self.selected_view = Some(id);
+                }
+                // 选中视图的操作条（M10 stale 徽章 + 重新出图在这里落地）。
+                if self.selected_view == Some(id) {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("重新出图").clicked() {
+                            self.regenerate_selected();
+                        }
+                        if ui.small_button("导出 DXF").clicked() {
+                            self.export_dxf(id);
+                        }
+                        if ui.small_button("预览").clicked() {
+                            self.preview_open = true;
+                        }
+                    });
+                    ui.label(format!("图元 {entity_count} 条"));
+                    ui.separator();
+                }
+            }
+        });
+    }
+
+    /// "重新出图"：走 `regenerate_view`（写回 + up_to_date 翻回 true；警告逐条可见）。
+    fn regenerate_selected(&mut self) {
+        let Some(vid) = self.selected_view else {
+            return;
+        };
+        let standard = self.session.document().drawing().standard.clone();
+        match self.session.regenerate_view(vid, &standard) {
+            Ok((written, warnings)) => {
+                self.log(format!("✓ 重新出图：写入 {written} 图元"));
+                for w in warnings {
+                    self.log(format!("⚠ {w}"));
+                }
+            }
+            Err(e) => self.log(format!("✗ 重新出图失败：{e}")),
+        }
+    }
+
+    /// 导出选中视图为 DXF（`core-interop` 既有能力；rfd 选路径 → 写文件）。
+    fn export_dxf(&mut self, vid: ViewId) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("DXF", &["dxf"])
+            .set_file_name("视图.dxf")
+            .save_file()
+        else {
+            self.log("· DXF 导出已取消".to_string());
+            return;
+        };
+        let Some(view) = self.session.document().drawing().view(vid).cloned() else {
+            self.log("✗ 导出失败：视图不存在".to_string());
+            return;
+        };
+        let standard = self.session.document().drawing().standard.clone();
+        match self
+            .session
+            .interop()
+            .export_view(Format::Dxf, &view, &standard)
+        {
+            Ok(out) => match std::fs::write(&path, &out.bytes) {
+                Ok(()) => self.log(format!(
+                    "✓ DXF 已导出：{}（{} 字节）",
+                    path.display(),
+                    out.bytes.len()
+                )),
+                Err(e) => self.log(format!("✗ DXF 写文件失败：{e}")),
+            },
+            Err(e) => self.log(format!("✗ DXF 导出失败：{e}")),
+        }
+    }
+
+    /// 浮动"图纸预览"窗口：把选中视图摊平成 Drawing2D 后用 egui 画。
+    fn drawing_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.preview_open {
+            return;
+        }
+        let mut open = self.preview_open;
+        egui::Window::new("图纸预览")
+            .open(&mut open)
+            .default_width(720.0)
+            .default_height(520.0)
+            .show(ctx, |ui| {
+                let Some(vid) = self.selected_view else {
+                    ui.label("（图纸面板未选中视图）");
+                    return;
+                };
+                let Some(view) = self.session.document().drawing().view(vid).cloned() else {
+                    ui.label("视图不存在");
+                    return;
+                };
+                let standard = self.session.document().drawing().standard.clone();
+                match core_app::interop_service::view_to_2d(&view, &standard) {
+                    Ok(d2) => {
+                        self.draw_drawing_2d(ui, &d2, view.name.clone());
+                    }
+                    Err(e) => {
+                        ui.label(format!("投影失败：{e}"));
+                    }
+                }
+            });
+        self.preview_open = open;
+    }
+
+    /// 画一张 2D 图纸（Drawing2D → egui）。
+    ///
+    /// 坐标系：图纸 mm、Y 轴朝上；画布 px、Y 轴向下——线性变换 y 取负。
+    /// **解析圆走 `painter.circle_stroke`（egui 真圆，不是折线近似）**——
+    /// "圆是真圆"是 M11 的验收线；弧 / 椭圆按角度采样（egui 无弧 primitive）。
+    fn draw_drawing_2d(&mut self, ui: &mut egui::Ui, d2: &Drawing2D, name: String) {
+        ui.label(format!(
+            "{name}（图幅 {:.0}×{:.0} mm，{} 曲线 / {} 文字）",
+            d2.width_mm,
+            d2.height_mm,
+            d2.curves.len(),
+            d2.texts.len()
+        ));
+        let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0xf5, 0xf4, 0xf0));
+        // 图幅 → 画布：留 16px 边距、等比缩放、居中（mm 域算比例，px 域落点）。
+        let avail_w = ((rect.width() - 32.0).max(1.0)) as f64;
+        let avail_h = ((rect.height() - 32.0).max(1.0)) as f64;
+        let k = (avail_w / d2.width_mm.max(1.0)).min(avail_h / d2.height_mm.max(1.0));
+        let ox = rect.left() as f64 + 16.0 + (avail_w - d2.width_mm * k) / 2.0;
+        let oy = rect.bottom() as f64 - 16.0 - (avail_h - d2.height_mm * k) / 2.0;
+        let to_px = |p: [f64; 2]| {
+            egui::Pos2::new((ox + p[0] * k) as f32, (oy - p[1] * k) as f32)
+        };
+        for c in &d2.curves {
+            let color = egui::Color32::from_rgb(c.color[0], c.color[1], c.color[2]);
+            let width = ((c.width_mm * k) as f32).clamp(0.5, 3.0);
+            let stroke = egui::Stroke::new(width.max(1.0), color);
+            match &c.analytic {
+                Some(core_interop::Analytic2D::Circle { center, radius }) => {
+                    // 解析圆 → egui 真圆。
+                    painter.circle_stroke(to_px(*center), (*radius * k).max(0.5) as f32, stroke);
+                }
+                Some(core_interop::Analytic2D::Arc {
+                    center,
+                    radius,
+                    start_angle_rad,
+                    end_angle_rad,
+                }) => {
+                    // egui 无弧 primitive：按角度采样 64 段折线（屏幕上与真圆不可分）。
+                    const SEGMENTS: usize = 64;
+                    let r = (*radius * k).max(0.5);
+                    let cx = (ox + center[0] * k) as f32;
+                    let cy = (oy - center[1] * k) as f32; // y 翻转 → 角度取负
+                    let span = end_angle_rad - start_angle_rad;
+                    let pts: Vec<egui::Pos2> = (0..=SEGMENTS)
+                        .map(|i| {
+                            let a = start_angle_rad + span * (i as f64 / SEGMENTS as f64);
+                            egui::Pos2::new(
+                                cx + (a.cos() * r) as f32,
+                                cy - (a.sin() * r) as f32,
+                            )
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+                _ => {
+                    // 折线（含解析椭圆的采样兜底点列）。
+                    let pts: Vec<egui::Pos2> = c.points.iter().map(|p| to_px(*p)).collect();
+                    if pts.len() >= 2 {
+                        painter.add(egui::Shape::line(pts, stroke));
+                    }
+                }
+            }
+        }
+        for t in &d2.texts {
+            let at = to_px(t.at);
+            painter.text(
+                at,
+                egui::Align2::LEFT_TOP,
+                t.content.clone(),
+                egui::FontId::proportional(((t.height_mm * k) as f32).max(9.0)),
+                egui::Color32::from_rgb(t.color[0], t.color[1], t.color[2]),
+            );
+        }
     }
 
     // ---- 视口 ----
@@ -1073,6 +1464,11 @@ impl eframe::App for BimApp {
             .resizable(true)
             .default_width(300.0)
             .show(ctx, |ui| self.props_panel(ui));
+        // M11：图纸面板（在 props 左侧；视图列表 + 重新出图 + DXF 导出）。
+        egui::SidePanel::right("views_panel")
+            .resizable(true)
+            .default_width(220.0)
+            .show(ctx, |ui| self.views_panel(ui));
         egui::TopBottomPanel::bottom("logs_panel")
             .resizable(true)
             .default_height(150.0)
@@ -1080,6 +1476,8 @@ impl eframe::App for BimApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport(ui));
+        // M11：浮动图纸预览窗口（顶栏"图纸面板"选中视图后点"预览"打开）。
+        self.drawing_preview_window(ctx);
     }
 }
 

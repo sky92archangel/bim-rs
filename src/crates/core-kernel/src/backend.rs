@@ -329,6 +329,61 @@ pub trait KernelBackend {
     /// 任一坐标非有限数同样拒绝（`finite` 逐点校验，照 `make_line_edge` 口径）。
     fn make_bezier_edge(&mut self, points: &[[f64; 3]]) -> KernelResult<ShapeHandle>;
 
+    /// **整圆边**（G4-M15）：由圆心 `(cx, cy, cz)`（mm）、所在平面法向
+    /// `(nx, ny, nz)` 与半径（mm）定一个整圆边。
+    ///
+    /// 七个标量须为有限数、法向须为**非零向量**、半径须为**有限正数**，否则返回
+    /// [`KernelError::InvalidArgument`](crate::KernelError::InvalidArgument)。
+    #[allow(clippy::too_many_arguments)]
+    fn make_circle_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+    ) -> KernelResult<ShapeHandle>;
+
+    /// **圆弧边**（G4-M15）：圆心 / 法向 / 半径同 [`Self::make_circle_edge`]，
+    /// 另有起终角（rad，数学坐标 ccw 为正）。
+    ///
+    /// 角度语义以内核为准（occt-wasm 内部按 ccw 扫掠），适配层不做预判；
+    /// 「终角 < 起角」的归一由**上层**（core-app `sketch` 模块）在造边前完成。
+    #[allow(clippy::too_many_arguments)]
+    fn make_circle_arc(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> KernelResult<ShapeHandle>;
+
+    /// **整椭圆边**（G4-M15）：由中心 / 法向与长、短半轴（mm）定一个整椭圆边。
+    ///
+    /// 校验同 [`Self::make_circle_edge`]（长短半轴均为有限正数）。
+    /// ⚠ vendor `make_ellipse_edge` **无主轴方向参数**——主轴沿法向局部 +x，
+    /// 任意朝向由上层「造边 + [`Self::rotate`]」组合实现（见 core-app
+    /// `sketch` 模块）。
+    #[allow(clippy::too_many_arguments)]
+    fn make_ellipse_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> KernelResult<ShapeHandle>;
+
     /// **线框**：把一组边按序连成 wire（**变长**，N ≥ 1，边顺序即连接序）。
     ///
     /// `edges` 为**空表**时返回

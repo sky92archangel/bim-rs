@@ -112,6 +112,16 @@ enum ShapeKind {
     /// 口径）。中间控制点不入档——占位只保 extents 近似（起终点）+ 计数存证，
     /// occt 腿才有真样条。
     EdgeSpline,
+    /// **整圆边占位**（G4-M15）：**记录型**——`origin` 记 **AABB 最小角点**
+    /// （圆心 − 半径）、`size` 记 `[2r, 2r, 0]`、`rotation` 记**圆心**存证。
+    /// mock 把圆记在 `z = cz` 平面（法向仅做非零校验，不参与 AABB 计算）；
+    /// 真实几何以 occt 腿为准。
+    EdgeCircle,
+    /// **椭圆边占位**（G4-M15）：**记录型**——`origin` 记 AABB 最小角点
+    /// （中心 − (major, minor)）、`size` 记 `[2·major, 2·minor, 0]`、
+    /// `rotation` 记中心；主轴沿 +x（vendor 无主轴方向参数，见
+    /// `KernelBackend::make_ellipse_edge` 文档）。
+    EdgeEllipse,
     /// **线框占位**（M7a）：extents（成员边记录点的 min/max）折进 `origin` /
     /// `size`，**边数**记在 `rotation[0]`。
     Wire,
@@ -135,6 +145,8 @@ impl ShapeKind {
             Self::EdgeLine => "edge_line",
             Self::EdgeArc => "edge_arc",
             Self::EdgeSpline => "edge_spline",
+            Self::EdgeCircle => "edge_circle",
+            Self::EdgeEllipse => "edge_ellipse",
             Self::Wire => "wire",
             Self::Face => "face",
         }
@@ -155,6 +167,8 @@ impl ShapeKind {
             "edge_line" => Some(Self::EdgeLine),
             "edge_arc" => Some(Self::EdgeArc),
             "edge_spline" => Some(Self::EdgeSpline),
+            "edge_circle" => Some(Self::EdgeCircle),
+            "edge_ellipse" => Some(Self::EdgeEllipse),
             "wire" => Some(Self::Wire),
             "face" => Some(Self::Face),
             _ => None,
@@ -568,6 +582,18 @@ fn member_points(s: &Shape) -> Vec<[f64; 3]> {
         ShapeKind::EdgeArc => vec![s.origin, s.size, s.rotation],
         // 样条边占位：extents 按首末控制点近似（中间控制点不入档，见 EdgeSpline 文档）。
         ShapeKind::EdgeSpline => vec![s.origin, s.size],
+        // 圆 / 椭圆边占位：origin 记 AABB 最小角点、rotation 记圆心——
+        // extents 取 4 个轴向极值点（与 AABB min/max 一致，圆心从 rotation 还原）。
+        ShapeKind::EdgeCircle | ShapeKind::EdgeEllipse => {
+            let (cx, cy, cz) = (s.rotation[0], s.rotation[1], s.rotation[2]);
+            let (rx, ry) = (s.size[0] / 2.0, s.size[1] / 2.0);
+            vec![
+                [cx - rx, cy, cz],
+                [cx + rx, cy, cz],
+                [cx, cy - ry, cz],
+                [cx, cy + ry, cz],
+            ]
+        }
         // Wire / Face 的 extents 已折进 origin/size，取其两角点
         ShapeKind::Wire | ShapeKind::Face => vec![s.origin, s.aabb_max()],
         _ => Vec::new(),
@@ -756,8 +782,19 @@ impl KernelBackend for MockBackend {
         out.origin = min;
         out.size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
         // rotation 是姿态存证（累积旋转向量）。
-        for (dst, add) in out.rotation.iter_mut().zip(rv.iter()) {
-            *dst += *add;
+        // ⚠ **记录点跟着转**（G4-M15 修复）：EdgeArc / EdgeCircle / EdgeEllipse
+        // 的 `rotation` 是**记录点**（弧终点 / 圆心），不是姿态存证——rotate 时
+        // 把它当点真转（Rodrigues），绝不累加旋转向量（否则 make_wire 的 extents
+        // 从 rotation 还原记录点时会被角度污染：旋转后的边进 wire，包围盒凭空漂移）。
+        match out.kind {
+            ShapeKind::EdgeArc | ShapeKind::EdgeCircle | ShapeKind::EdgeEllipse => {
+                out.rotation = rotate_point(out.rotation, pivot, unit, angle);
+            }
+            _ => {
+                for (dst, add) in out.rotation.iter_mut().zip(rv.iter()) {
+                    *dst += *add;
+                }
+            }
         }
         Ok(self.arena.alloc(out))
     }
@@ -792,6 +829,9 @@ impl KernelBackend for MockBackend {
                         | ShapeKind::Shell
                         | ShapeKind::EdgeLine
                         | ShapeKind::EdgeArc
+                        | ShapeKind::EdgeSpline
+                        | ShapeKind::EdgeCircle
+                        | ShapeKind::EdgeEllipse
                         | ShapeKind::Wire
                         | ShapeKind::Face
                 ) {
@@ -827,6 +867,9 @@ impl KernelBackend for MockBackend {
                         | ShapeKind::Shell
                         | ShapeKind::EdgeLine
                         | ShapeKind::EdgeArc
+                        | ShapeKind::EdgeSpline
+                        | ShapeKind::EdgeCircle
+                        | ShapeKind::EdgeEllipse
                         | ShapeKind::Wire
                         | ShapeKind::Face
                 ) {
@@ -1234,6 +1277,116 @@ impl KernelBackend for MockBackend {
         Ok(self.arena.alloc(out))
     }
 
+    /// 占位"整圆边"（G4-M15）：**记录型**——`origin` 记 AABB 最小角点
+    /// （圆心 − 半径）、`size` 记 `[2r, 2r, 0]`、`rotation` 记**圆心**；
+    /// 坐标须有限、法向须非零、半径须有限正数，否则
+    /// [`KernelError::InvalidArgument`] **响亮拒绝**。mock 把圆记在
+    /// `z = cz` 平面（法向仅做非零校验，不参与记账）；真实几何以 occt 腿为准。
+    #[allow(clippy::too_many_arguments)]
+    fn make_circle_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+    ) -> KernelResult<ShapeHandle> {
+        for (name, v) in [("cx", cx), ("cy", cy), ("cz", cz)] {
+            finite_arg("make_circle_edge", name, v)?;
+        }
+        let axis = normalize_axis("make_circle_edge", nx, ny, nz)?;
+        let r = positive("make_circle_edge", "radius", radius)?;
+        let _ = axis; // 法向仅做非零校验：mock 把圆记在 z = cz 平面
+        let mut out = Shape::new(ShapeKind::EdgeCircle, [2.0 * r, 2.0 * r, 0.0], 0.0);
+        out.origin = [cx - r, cy - r, cz];
+        out.rotation = [cx, cy, cz];
+        out.solid_count = 0;
+        Ok(self.arena.alloc(out))
+    }
+
+    /// 占位"圆弧边"（G4-M15）：**记录型，转三点弧**——按起终角算出起点 /
+    /// 中间点 / 终点三坐标（圆在 `z = cz` 平面），记成
+    /// [`ShapeKind::EdgeArc`]（origin / size / rotation = 起 / 中 / 终，
+    /// 同 [`Self::make_arc_edge`] 口径），**零新 kind**；终角 < 起角时
+    /// 终角 +2π 归一（保证中间点落在正向扫掠区间内）。
+    #[allow(clippy::too_many_arguments)]
+    fn make_circle_arc(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> KernelResult<ShapeHandle> {
+        for (name, v) in [
+            ("cx", cx),
+            ("cy", cy),
+            ("cz", cz),
+            ("start_angle", start_angle),
+            ("end_angle", end_angle),
+        ] {
+            finite_arg("make_circle_arc", name, v)?;
+        }
+        let axis = normalize_axis("make_circle_arc", nx, ny, nz)?;
+        let r = positive("make_circle_arc", "radius", radius)?;
+        let _ = axis;
+        // ccw 归一：终角 < 起角 → 终角 + 2π（正向扫掠区间取中间点）
+        let end = if end_angle < start_angle {
+            end_angle + std::f64::consts::TAU
+        } else {
+            end_angle
+        };
+        let mid = (start_angle + end) / 2.0;
+        let pt = |a: f64| [cx + r * a.cos(), cy + r * a.sin(), cz];
+        let mut out = Shape::new(ShapeKind::EdgeArc, pt(mid), 0.0);
+        out.origin = pt(start_angle);
+        out.rotation = pt(end);
+        out.solid_count = 0;
+        Ok(self.arena.alloc(out))
+    }
+
+    /// 占位"椭圆边"（G4-M15）：**记录型**——`origin` 记 AABB 最小角点
+    /// （中心 − (major, minor)）、`size` 记 `[2·major, 2·minor, 0]`、
+    /// `rotation` 记中心；半轴须有限正数且短 ≤ 长，否则
+    /// [`KernelError::InvalidArgument`] **响亮拒绝**。主轴沿 +x
+    /// （vendor 无主轴方向参数，任意朝向由上层造边 + rotate 组合）。
+    #[allow(clippy::too_many_arguments)]
+    fn make_ellipse_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> KernelResult<ShapeHandle> {
+        for (name, v) in [("cx", cx), ("cy", cy), ("cz", cz)] {
+            finite_arg("make_ellipse_edge", name, v)?;
+        }
+        let axis = normalize_axis("make_ellipse_edge", nx, ny, nz)?;
+        let major = positive("make_ellipse_edge", "major_radius", major_radius)?;
+        let minor = positive("make_ellipse_edge", "minor_radius", minor_radius)?;
+        if minor > major {
+            return Err(KernelError::InvalidArgument(format!(
+                "make_ellipse_edge: 短半轴 ({minor}) 不得大于长半轴 ({major})"
+            )));
+        }
+        let _ = axis;
+        let mut out = Shape::new(ShapeKind::EdgeEllipse, [2.0 * major, 2.0 * minor, 0.0], 0.0);
+        out.origin = [cx - major, cy - minor, cz];
+        out.rotation = [cx, cy, cz];
+        out.solid_count = 0;
+        Ok(self.arena.alloc(out))
+    }
+
     /// 占位"线框"：**记录型**——extents（成员边记录点的 min/max）折进
     /// `origin` / `size`，**边数**记在 `rotation[0]`；空表 →
     /// [`KernelError::InvalidArgument`] **响亮拒绝**（与 occt 腿同款，内核层把关）。
@@ -1335,9 +1488,12 @@ impl KernelBackend for MockBackend {
             | ShapeKind::Shell
             | ShapeKind::Face => box_mesh(s.size[0], s.size[1], s.size[2]),
             // 占位：线与线框没有可细分的表面 —— 返回空网格（线无表面，如实记账）。
-            ShapeKind::EdgeLine | ShapeKind::EdgeArc | ShapeKind::EdgeSpline | ShapeKind::Wire => {
-                empty_mesh()
-            }
+            ShapeKind::EdgeLine
+            | ShapeKind::EdgeArc
+            | ShapeKind::EdgeSpline
+            | ShapeKind::EdgeCircle
+            | ShapeKind::EdgeEllipse
+            | ShapeKind::Wire => empty_mesh(),
         };
         // **origin 纳入计算**：网格顶点整体挪到定位点。占位网格本是理想化结果，
         // 但位置必须如实反映——否则平移后的构件会"看起来还在原点"。
@@ -1388,6 +1544,31 @@ impl KernelBackend for MockBackend {
                     DVec2::new(s.size[0], s.size[1]),
                     LineClass::Sharp,
                 );
+            }
+            // 占位：整圆 / 椭圆边投成**精确**圆 / 椭圆曲线（圆心记在 rotation、
+            // 半轴来自 size，主轴沿 +x → rot = 0）——与 Sphere / Cylinder 臂
+            // 同款曲线记录，保留"这是圆"的类型信息，比外接方框更真实。
+            ShapeKind::EdgeCircle => {
+                visible.push(ProjectedCurve {
+                    kind: CurveKind::Circle,
+                    data: CurveGeometry::Circle {
+                        center: DVec2::new(s.rotation[0], s.rotation[1]),
+                        radius: s.size[0] / 2.0,
+                    },
+                    layer_hint: LineClass::Outline,
+                });
+            }
+            ShapeKind::EdgeEllipse => {
+                visible.push(ProjectedCurve {
+                    kind: CurveKind::Ellipse,
+                    data: CurveGeometry::Ellipse {
+                        center: DVec2::new(s.rotation[0], s.rotation[1]),
+                        rx: s.size[0] / 2.0,
+                        ry: s.size[1] / 2.0,
+                        rot: 0.0,
+                    },
+                    layer_hint: LineClass::Outline,
+                });
             }
             ShapeKind::Cylinder | ShapeKind::Cone => {
                 rect_lines(

@@ -49,6 +49,7 @@ use core_sdk::{BuildOp, OpOutput};
 use crate::error::{AppError, AppResult};
 use crate::evolution_align::HistoryRecord;
 use crate::selector::{EdgeSelector, FaceSelector, parse_edge_selectors, parse_face_selectors};
+use crate::sketch::{SketchEntity, normalize_arc_angles};
 use crate::topo_naming::face_hash_names_from_handle;
 
 /// 把持久化的几何记录**装回**成内核句柄。
@@ -472,6 +473,117 @@ impl GeometryService {
             warnings,
             evolutions,
         })
+    }
+
+    /// **草图 wire 构建**（G4-M15）：把草图 2D 图元序列化成内核解析边并连成 wire。
+    ///
+    /// 逐实体造边（z 平面 = 世界 z = 0，法向 (0, 0, 1)）：折线 → 相邻顶点直段
+    /// （[`Kernel::make_line_edge`]）；整圆 → [`Kernel::make_circle_edge`]；
+    /// 圆弧 → 角度归一（[`normalize_arc_angles`]，终角 < 起角 +2π）后
+    /// [`Kernel::make_circle_arc`]；椭圆 → [`Kernel::make_ellipse_edge`]
+    /// （主轴沿 +x），`major_angle` 非零时再「造边 + `rotate`」组合
+    /// （vendor 无主轴方向参数，见 [`crate::sketch::SketchEntity::Ellipse`]）。
+    ///
+    /// **回滚纪律**（照 [`Self::execute`]）：任一图元失败即释放全部已建边，
+    /// 再原样抛错——绝不留半成品；`make_wire` 失败同样回滚。成功时中间边
+    /// 句柄全部释放（句柄可丢，文本为真相——设计文档 3.3），只返回 wire。
+    ///
+    /// # Errors
+    /// 空图元表 / 折线顶点不足 2 → [`AppError::RecipeNotExecutable`]；
+    /// 图元非法（非有限坐标、非正半径、零法向、短半轴 > 长半轴）或内核
+    /// 构造失败 → [`AppError::Kernel`]。
+    pub fn build_sketch_wire(&mut self, entities: &[SketchEntity]) -> AppResult<ShapeHandle> {
+        if entities.is_empty() {
+            return Err(AppError::RecipeNotExecutable(
+                "草图图元为空：至少需要 1 个图元才能建 wire".to_string(),
+            ));
+        }
+        let edges = self.assemble_sketch_edges(entities)?;
+        let result = self.kernel.make_wire(&edges);
+        self.kernel.release_many(&edges);
+        result.map_err(Into::into)
+    }
+
+    /// 逐实体造草图解析边（[`Self::build_sketch_wire`] 的组装底座）。
+    ///
+    /// 折线 1 个实体可产出多条直段（相邻顶点 windows(2)）；其余图元各产 1 条边。
+    /// **任一图元失败即释放全部已建边**再原样抛错（回滚纪律：谁分配谁回收单点化）。
+    fn assemble_sketch_edges(&mut self, entities: &[SketchEntity]) -> AppResult<Vec<ShapeHandle>> {
+        let mut edges: Vec<ShapeHandle> = Vec::new();
+        for (i, entity) in entities.iter().enumerate() {
+            let built: AppResult<Vec<ShapeHandle>> = match entity {
+                SketchEntity::Polyline(points) => {
+                    if points.len() < 2 {
+                        Err(AppError::RecipeNotExecutable(format!(
+                            "草图第 {i} 个图元（折线）至少需要 2 个顶点，实得 {}",
+                            points.len()
+                        )))
+                    } else {
+                        points
+                            .windows(2)
+                            .map(|w| {
+                                self.kernel
+                                    .make_line_edge(w[0].x, w[0].y, 0.0, w[1].x, w[1].y, 0.0)
+                                    .map_err(Into::into)
+                            })
+                            .collect()
+                    }
+                }
+                SketchEntity::Circle { center, radius } => self
+                    .kernel
+                    .make_circle_edge(center.x, center.y, 0.0, 0.0, 0.0, 1.0, *radius)
+                    .map(|h| vec![h])
+                    .map_err(Into::into),
+                SketchEntity::Arc {
+                    center,
+                    radius,
+                    start_angle,
+                    end_angle,
+                } => {
+                    let (s, e) = normalize_arc_angles(*start_angle, *end_angle);
+                    self.kernel
+                        .make_circle_arc(center.x, center.y, 0.0, 0.0, 0.0, 1.0, *radius, s, e)
+                        .map(|h| vec![h])
+                        .map_err(Into::into)
+                }
+                SketchEntity::Ellipse {
+                    center,
+                    major,
+                    minor,
+                    major_angle,
+                } => {
+                    let edge = self.kernel.make_ellipse_edge(
+                        center.x, center.y, 0.0, 0.0, 0.0, 1.0, *major, *minor,
+                    )?;
+                    if major_angle.abs() > 1e-9 {
+                        // 任意朝向：造边（主轴沿 +x）+ 绕过圆心、沿 z 轴旋转。
+                        // rotate 返回新句柄、输入仍有效（不消费输入）——旧边照旧释放。
+                        let rotated = self.kernel.rotate(
+                            edge,
+                            center.x,
+                            center.y,
+                            0.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            *major_angle,
+                        );
+                        let _ = self.kernel.release(edge);
+                        rotated.map(|h| vec![h]).map_err(Into::into)
+                    } else {
+                        Ok(vec![edge])
+                    }
+                }
+            };
+            match built {
+                Ok(mut list) => edges.append(&mut list),
+                Err(err) => {
+                    self.kernel.release_many(&edges);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(edges)
     }
 
     /// **对既有句柄直接执行单算子**（G3 原生算子门面的执行底座）。
@@ -3389,5 +3501,233 @@ mod tests {
             .expect("原生门面应直通样条边");
         assert_eq!(executed.step_count(), 1);
         assert!(executed.final_handle().is_some());
+    }
+
+    // ===== G4-M15：草图 wire 构建（build_sketch_wire）钉子 ====================
+
+    use glam::DVec2;
+    use std::f64::consts::FRAC_PI_2;
+
+    /// **M15 钉 1（矩形折线 wire）**：4 顶点折线 → 4 条直段 → wire，
+    /// extents 折进包围盒 (0,0,0) ~ (50,40,0)；中间边句柄全部回收
+    /// （live_count 回到 0——句柄可丢，文本为真相）。
+    #[test]
+    fn sketch_rect_polyline_builds_a_wire() {
+        let rect = SketchEntity::Polyline(vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(50.0, 0.0),
+            DVec2::new(50.0, 40.0),
+            DVec2::new(0.0, 40.0),
+            DVec2::new(0.0, 0.0),
+        ]);
+        let mut g = GeometryService::with_mock_kernel();
+        let wire = g.build_sketch_wire(&[rect]).expect("矩形折线应建线成功");
+
+        let bb = g.kernel_mut().bounding_box(wire).unwrap();
+        assert!(
+            bb.min.iter().all(|v| v.abs() < 1e-9),
+            "wire min 应为 (0,0,0)，实得 {bb:?}"
+        );
+        assert!(
+            bb.max
+                .iter()
+                .zip([50.0, 40.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire max 应为 (50,40,0)，实得 {bb:?}"
+        );
+        // 中间边句柄已全部回收（成功路径释放边，只留 wire 一个句柄）。
+        assert_eq!(g.kernel().live_count(), 1, "只留 wire 一个句柄");
+    }
+
+    /// **M15 钉 2（整圆 wire）**：圆图元 → `make_circle_edge`（记录型）→
+    /// wire 包围盒 = 圆心 ± 半径。
+    #[test]
+    fn sketch_circle_wire_bbox_matches_center_and_radius() {
+        let circle = SketchEntity::Circle {
+            center: DVec2::new(100.0, 100.0),
+            radius: 25.0,
+        };
+        let mut g = GeometryService::with_mock_kernel();
+        let wire = g.build_sketch_wire(&[circle]).expect("圆应建线成功");
+
+        let bb = g.kernel_mut().bounding_box(wire).unwrap();
+        assert!(
+            bb.min
+                .iter()
+                .zip([75.0, 75.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire min 应为圆心−半径，实得 {bb:?}"
+        );
+        assert!(
+            bb.max
+                .iter()
+                .zip([125.0, 125.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire max 应为圆心+半径，实得 {bb:?}"
+        );
+    }
+
+    /// **M15 钉 3（圆弧角度归一）**：终角 < 起角（3π/2 → π）经
+    /// `normalize_arc_angles` +2π 后转三点弧——中间点应落在**正向**扫掠区间
+    /// （π/4 方向），包围盒据此判定；不归一的话中间点会在反向 (5π/4)。
+    #[test]
+    fn sketch_arc_normalizes_end_before_start() {
+        // 起角 3π/2（朝 −y），终角 π（朝 −x）：正向扫掠途经 2π/0/π/2 …，
+        // 归一后中间点在 9π/4 = π/4 方向（+x +y 象限）。
+        let arc = SketchEntity::Arc {
+            center: DVec2::new(0.0, 0.0),
+            radius: 50.0,
+            start_angle: 3.0 * FRAC_PI_2,
+            end_angle: std::f64::consts::PI,
+        };
+        let mut g = GeometryService::with_mock_kernel();
+        let wire = g.build_sketch_wire(&[arc]).expect("圆弧应建线成功");
+
+        let bb = g.kernel_mut().bounding_box(wire).unwrap();
+        // 三点：起点 (0,−50)、中间点 50·(cos 9π/4, sin 9π/4) = 50·cos(π/4) ≈ 35.36、
+        // 终点 (−50, 0)。
+        let mid = 50.0 * std::f64::consts::FRAC_1_SQRT_2; // 50·cos(π/4)
+        assert!(
+            bb.max
+                .iter()
+                .zip([mid, mid, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "归一后中间点应在 π/4 方向（+x+y 象限），实得 {bb:?}"
+        );
+        assert!(
+            bb.min
+                .iter()
+                .zip([-50.0, -50.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire min 应为起终点极值，实得 {bb:?}"
+        );
+    }
+
+    /// **M15 钉 4（椭圆双角）**：`major_angle = 0` 直接记录（包围盒 ±a/±b）；
+    /// `major_angle = π/2` 走「造边 + rotate」组合——mock 把 AABB 真转 90°，
+    /// 包围盒尺寸应互换（x 范围 ±b、y 范围 ±a），且**记录点（圆心）跟着转**
+    /// （rotation 特判修复，z 不被角度污染）。
+    #[test]
+    fn sketch_ellipse_major_angle_rotates_the_edge() {
+        let mut g = GeometryService::with_mock_kernel();
+
+        // 主轴沿 +x：轴对齐。
+        let aligned = SketchEntity::Ellipse {
+            center: DVec2::new(0.0, 0.0),
+            major: 80.0,
+            minor: 30.0,
+            major_angle: 0.0,
+        };
+        let w0 = g.build_sketch_wire(&[aligned]).expect("椭圆应建线成功");
+        let bb0 = g.kernel_mut().bounding_box(w0).unwrap();
+        assert!(
+            bb0.min
+                .iter()
+                .zip([-80.0, -30.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9)
+                && bb0
+                    .max
+                    .iter()
+                    .zip([80.0, 30.0, 0.0])
+                    .all(|(a, b)| (a - b).abs() < 1e-9),
+            "轴对齐椭圆包围盒应为 ±80/±30，实得 {bb0:?}"
+        );
+
+        // 主轴转 90°（ccw）：造边（沿 +x）+ rotate 组合 → 包围盒尺寸互换。
+        let rotated = SketchEntity::Ellipse {
+            center: DVec2::new(0.0, 0.0),
+            major: 80.0,
+            minor: 30.0,
+            major_angle: FRAC_PI_2,
+        };
+        let w1 = g.build_sketch_wire(&[rotated]).expect("旋转椭圆应建线成功");
+        let bb1 = g.kernel_mut().bounding_box(w1).unwrap();
+        assert!(
+            bb1.min
+                .iter()
+                .zip([-30.0, -80.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9)
+                && bb1
+                    .max
+                    .iter()
+                    .zip([30.0, 80.0, 0.0])
+                    .all(|(a, b)| (a - b).abs() < 1e-9),
+            "π/2 旋转后包围盒应为 ±30/±80（尺寸互换），实得 {bb1:?}"
+        );
+    }
+
+    /// **M15 钉 5（混合图元边数）**：折线（3 顶点 = 2 段）+ 圆（1 边）+
+    /// 圆弧（1 边）→ wire 的边数 = 4（mock 把边数记在 `rotation[0]`）。
+    #[test]
+    fn sketch_mixed_entities_count_all_edges() {
+        let entities = vec![
+            SketchEntity::Polyline(vec![
+                DVec2::new(0.0, 0.0),
+                DVec2::new(50.0, 0.0),
+                DVec2::new(50.0, 50.0),
+            ]),
+            SketchEntity::Circle {
+                center: DVec2::new(100.0, 25.0),
+                radius: 10.0,
+            },
+            SketchEntity::Arc {
+                center: DVec2::new(0.0, 100.0),
+                radius: 20.0,
+                start_angle: 0.0,
+                end_angle: FRAC_PI_2,
+            },
+        ];
+        let mut g = GeometryService::with_mock_kernel();
+        let wire = g.build_sketch_wire(&entities).expect("混合图元应建线成功");
+
+        let text = g.kernel_mut().export_brep(wire).unwrap();
+        // mock 的 wire 把边数记在 `rotation[0]`。v3 文本 token 布局：
+        // magic(0) version(1) tag(2) size[3](3..6) volume(6) origin[3](7..10)
+        // rotation[3](10..13) solid_count(13) → rotation[0] = tokens[10]。
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let edge_count: f64 = tokens[10].parse().expect("rotation[0] 应为可解析数");
+        assert!(
+            (edge_count - 4.0).abs() < 1e-9,
+            "wire 应含 4 条边，实得 {tokens:?}"
+        );
+    }
+
+    /// **M15 钉 6（非法输入响亮拒绝 + 回滚）**：负半径 → [`AppError::Kernel`]；
+    /// 单点折线 → [`AppError::RecipeNotExecutable`]；空图元表 →
+    /// [`AppError::RecipeNotExecutable`]。三条失败路径都**不留句柄**
+    /// （live_count 回 0——回滚纪律）。
+    #[test]
+    fn sketch_wire_refuses_bad_input_and_rolls_back() {
+        let mut g = GeometryService::with_mock_kernel();
+
+        // 负半径（内核层 InvalidArgument）。
+        let bad = SketchEntity::Circle {
+            center: DVec2::new(0.0, 0.0),
+            radius: -5.0,
+        };
+        let got = g.build_sketch_wire(&[bad]);
+        assert!(
+            matches!(&got, Err(AppError::Kernel(core_kernel::KernelError::InvalidArgument(m)))
+                if m.contains("radius")),
+            "负半径应报 Kernel::InvalidArgument，实得 {got:?}"
+        );
+
+        // 单点折线（组装层 RecipeNotExecutable，先于内核）。
+        let thin = SketchEntity::Polyline(vec![DVec2::new(0.0, 0.0)]);
+        let got = g.build_sketch_wire(&[thin]);
+        assert!(
+            matches!(&got, Err(AppError::RecipeNotExecutable(m)) if m.contains("至少需要 2 个顶点")),
+            "单点折线应响亮拒绝，实得 {got:?}"
+        );
+
+        // 空图元表。
+        let got = g.build_sketch_wire(&[]);
+        assert!(
+            matches!(got, Err(AppError::RecipeNotExecutable(_))),
+            "空表应拒绝"
+        );
+
+        // 三条失败路径都不留句柄（回滚干净）。
+        assert_eq!(g.kernel().live_count(), 0, "失败应回滚全部已建边");
     }
 }

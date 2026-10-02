@@ -48,6 +48,7 @@ use crate::interop_service::InteropService;
 use crate::module_host::ModuleHost;
 use crate::picker_service::KernelPicker;
 use crate::projection_service::{project_shape, reproject_into};
+use crate::sketch::SketchEntity;
 use crate::store;
 use crate::topo_naming::face_hash_names_from_handle;
 use crate::update_service::{UpdateReport, update_after_commit};
@@ -290,6 +291,57 @@ impl CoreSession {
             element,
             shape,
             warnings,
+        })
+    }
+
+    /// **新建草图轮廓**（G4-M15）：把草图 2D 图元建线成 wire，再落成通用元素。
+    ///
+    /// 流程（照 [`Self::build_native`] 的「先内核后语义、失败零半成品」纪律）：
+    /// ① [`GeometryService::build_sketch_wire`] **先造 wire**（任一图元失败
+    /// 回滚边句柄）——失败时**连元素都不建**，绝不留半成品；②
+    /// [`CoreSession::create_generic_element`] 建元素（失败则释放 wire）；
+    /// ③ `snapshot` → `document.edit`（insert_geometry + `geometry_ref`
+    /// 回填）→ 释放 wire（照 [`Self::install_executed`] 尾段；无演化登记
+    /// ——纯 wire 构造不涉及布尔）。
+    ///
+    /// wire **不要求封闭**（N ≥ 1 即可）；封闭检查是特征链路（拉伸 /
+    /// 旋转扫掠，G4-M18）的事。
+    ///
+    /// # Errors
+    /// 图元非法（非有限坐标 / 非正半径 / 零法向 / 短半轴 > 长半轴 /
+    /// 折线顶点不足 2）或内核构造失败时返回错误。
+    pub fn build_sketch_profile(
+        &mut self,
+        name: &str,
+        entities: &[SketchEntity],
+    ) -> AppResult<NativeOutcome> {
+        // ① 先造 wire（任一图元失败回滚，绝不留半成品）
+        let wire = self.geometry.build_sketch_wire(entities)?;
+
+        // ② 后建元素（失败则释放 wire——已建边已在 build_sketch_wire 内回收）
+        let element = match self.create_generic_element(name) {
+            Ok(id) => id,
+            Err(err) => {
+                let _ = self.geometry.kernel_mut().release(wire);
+                return Err(err);
+            }
+        };
+
+        // ③ 落盘 + 装元素 + 释放（照 install_executed 尾段，无演化登记）
+        let shape = ShapeId::new();
+        let record = self.geometry.snapshot(shape, wire)?;
+        self.document.edit(|doc| {
+            doc.insert_geometry(record)?;
+            let e = doc.element_mut(element)?;
+            e.geometry_ref = Some(shape);
+            Ok(())
+        })?;
+        let _ = self.geometry.kernel_mut().release(wire);
+
+        Ok(NativeOutcome {
+            element,
+            shape,
+            warnings: Vec::new(),
         })
     }
 
@@ -1781,5 +1833,65 @@ mod tests {
         // 句柄全部释放
         assert_eq!(s.geometry().kernel().live_count(), 0);
         let _ = shape;
+    }
+
+    // ===== G4-M15：草图轮廓（build_sketch_profile）钉子 ========================
+
+    /// **M15 钉 7（端到端）**：矩形草图 → wire → 通用元素 → 几何落盘 →
+    /// `geometry_ref` 回填；wire 与全部边句柄释放（live_count 回 0——句柄
+    /// 可丢，文本为真相）。
+    #[test]
+    fn sketch_profile_builds_element_and_geometry_end_to_end() {
+        let rect = SketchEntity::Polyline(vec![
+            glam::DVec2::new(0.0, 0.0),
+            glam::DVec2::new(500.0, 0.0),
+            glam::DVec2::new(500.0, 300.0),
+            glam::DVec2::new(0.0, 300.0),
+            glam::DVec2::new(0.0, 0.0),
+        ]);
+        let mut s = CoreSession::new().unwrap();
+        let outcome = s
+            .build_sketch_profile("草图-1", &[rect])
+            .expect("矩形草图应端到端成功");
+
+        // 元素已建、几何引用已回填、几何记录已落（1 条 wire 形态文本）。
+        assert_eq!(s.document().element_count(), 1);
+        let e = s
+            .document()
+            .doc()
+            .element(outcome.element)
+            .expect("元素应存在");
+        assert_eq!(e.geometry_ref, Some(outcome.shape), "geometry_ref 应回填");
+        let record = s
+            .document()
+            .doc()
+            .geometry_record(outcome.shape)
+            .expect("几何记录应存在");
+        assert!(record.text.contains(" wire "), "应为 wire 形态文本");
+
+        // wire 与全部边句柄已释放（句柄可丢，文本为真相）。
+        assert_eq!(s.geometry().kernel().live_count(), 0);
+    }
+
+    /// **M15 钉 8（失败不留半成品）**：合法折线 + 负半径圆 → 造 wire 阶段
+    /// 整体失败（折线已建边被回滚）→ **连元素都不建**（先造 wire 后建元素）：
+    /// 元素数 0、几何记录 0、无句柄残留。
+    #[test]
+    fn sketch_profile_failure_leaves_no_half_built_element() {
+        let entities = vec![
+            SketchEntity::Polyline(vec![
+                glam::DVec2::new(0.0, 0.0),
+                glam::DVec2::new(50.0, 0.0),
+            ]),
+            SketchEntity::Circle {
+                center: glam::DVec2::new(0.0, 0.0),
+                radius: -1.0,
+            },
+        ];
+        let mut s = CoreSession::new().unwrap();
+        let got = s.build_sketch_profile("草图-坏", &entities);
+        assert!(got.is_err(), "负半径应失败");
+        assert_eq!(s.document().element_count(), 0, "失败不留半成品元素");
+        assert_eq!(s.geometry().kernel().live_count(), 0, "失败回滚全部已建边");
     }
 }

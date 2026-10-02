@@ -339,6 +339,57 @@ impl Kernel {
         self.backend.make_bezier_edge(points)
     }
 
+    /// **整圆边**（G4-M15）：由圆心 / 法向 / 半径定一个整圆边。返回新句柄。
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_circle_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+    ) -> KernelResult<ShapeHandle> {
+        self.backend
+            .make_circle_edge(cx, cy, cz, nx, ny, nz, radius)
+    }
+
+    /// **圆弧边**（G4-M15）：由圆心 / 法向 / 半径 / 起终角定一段圆弧边。返回新句柄。
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_circle_arc(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> KernelResult<ShapeHandle> {
+        self.backend
+            .make_circle_arc(cx, cy, cz, nx, ny, nz, radius, start_angle, end_angle)
+    }
+
+    /// **整椭圆边**（G4-M15）：由中心 / 法向 / 长短半轴定一个整椭圆边。返回新句柄。
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_ellipse_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> KernelResult<ShapeHandle> {
+        self.backend
+            .make_ellipse_edge(cx, cy, cz, nx, ny, nz, major_radius, minor_radius)
+    }
+
     /// **线框**：把一组边按序连成 wire（N ≥ 1，空表响亮拒绝）。返回新句柄。
     pub fn make_wire(&mut self, edges: &[ShapeHandle]) -> KernelResult<ShapeHandle> {
         self.backend.make_wire(edges)

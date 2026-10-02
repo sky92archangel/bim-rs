@@ -858,6 +858,112 @@ impl KernelBackend for OcctBackend {
         Ok(self.alloc(h))
     }
 
+    /// **整圆边**（G4-M15）：vendor `make_circle_edge`（`:1736`）直通；
+    /// 坐标 `finite_arg` + 法向**非零** + 半径**有限正数**显式校验；内核
+    /// 进一步把关（如构造失败）**原样透传**。
+    #[allow(clippy::too_many_arguments)]
+    fn make_circle_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+    ) -> KernelResult<ShapeHandle> {
+        for (name, v) in [("cx", cx), ("cy", cy), ("cz", cz)] {
+            finite_arg("make_circle_edge", name, v)?;
+        }
+        if nx * nx + ny * ny + nz * nz == 0.0 {
+            return Err(KernelError::InvalidArgument(
+                "make_circle_edge: 法向不能为零向量（nx=ny=nz=0）".to_string(),
+            ));
+        }
+        positive("make_circle_edge", "radius", radius)?;
+        let h = self
+            .kernel
+            .make_circle_edge(cx, cy, cz, nx, ny, nz, radius)
+            .map_err(op_err("make_circle_edge"))?;
+        Ok(self.alloc(h))
+    }
+
+    /// **圆弧边**（G4-M15）：vendor `make_circle_arc`（`:1757`）直通；
+    /// 坐标与起终角 `finite_arg` + 法向非零 + 半径有限正数显式校验；
+    /// 角度语义以内核为准，适配层不做预判。
+    #[allow(clippy::too_many_arguments)]
+    fn make_circle_arc(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> KernelResult<ShapeHandle> {
+        for (name, v) in [
+            ("cx", cx),
+            ("cy", cy),
+            ("cz", cz),
+            ("start_angle", start_angle),
+            ("end_angle", end_angle),
+        ] {
+            finite_arg("make_circle_arc", name, v)?;
+        }
+        if nx * nx + ny * ny + nz * nz == 0.0 {
+            return Err(KernelError::InvalidArgument(
+                "make_circle_arc: 法向不能为零向量（nx=ny=nz=0）".to_string(),
+            ));
+        }
+        positive("make_circle_arc", "radius", radius)?;
+        let h = self
+            .kernel
+            .make_circle_arc(cx, cy, cz, nx, ny, nz, radius, start_angle, end_angle)
+            .map_err(op_err("make_circle_arc"))?;
+        Ok(self.alloc(h))
+    }
+
+    /// **整椭圆边**（G4-M15）：vendor `make_ellipse_edge`（`:1803`）直通；
+    /// 坐标 `finite_arg` + 法向非零 + 长短半轴有限正数且短 ≤ 长显式校验
+    /// （与 mock 腿同款响亮拒绝）；主轴沿法向局部 +x（vendor 无主轴方向
+    /// 参数），任意朝向由上层造边 + rotate 组合。
+    #[allow(clippy::too_many_arguments)]
+    fn make_ellipse_edge(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> KernelResult<ShapeHandle> {
+        for (name, v) in [("cx", cx), ("cy", cy), ("cz", cz)] {
+            finite_arg("make_ellipse_edge", name, v)?;
+        }
+        if nx * nx + ny * ny + nz * nz == 0.0 {
+            return Err(KernelError::InvalidArgument(
+                "make_ellipse_edge: 法向不能为零向量（nx=ny=nz=0）".to_string(),
+            ));
+        }
+        let major = positive("make_ellipse_edge", "major_radius", major_radius)?;
+        let minor = positive("make_ellipse_edge", "minor_radius", minor_radius)?;
+        if minor > major {
+            return Err(KernelError::InvalidArgument(format!(
+                "make_ellipse_edge: 短半轴 ({minor}) 不得大于长半轴 ({major})"
+            )));
+        }
+        let h = self
+            .kernel
+            .make_ellipse_edge(cx, cy, cz, nx, ny, nz, major, minor)
+            .map_err(op_err("make_ellipse_edge"))?;
+        Ok(self.alloc(h))
+    }
+
     /// **线框**：vendor `make_wire`（`:1625`）直通；`edges` 空表 →
     /// [`KernelError::InvalidArgument`] **响亮拒绝**（照 `loft` 空截面模式）。
     fn make_wire(&mut self, edges: &[ShapeHandle]) -> KernelResult<ShapeHandle> {
@@ -3458,6 +3564,125 @@ mod tests {
             ])
             .expect("第二条贝塞尔边");
         let wire = b.make_wire(&[edge, e2]).expect("两条样条边应可聚合成 wire");
+        assert_eq!(
+            b.sub_shape_count(wire, SubShapeKind::Edge).unwrap(),
+            2,
+            "wire 应恰含 2 条成员边"
+        );
+    }
+
+    /// **G4-M15 occt 钉子：真实圆 / 圆弧 / 椭圆边 + 连通 wire**——
+    /// ① 整圆包围盒 ±50；② 四分之一弧包围盒钉在第一象限 [0,50]×[0,50]
+    /// （钉住起终角语义：ccw 从 +x 扫向 +y）；③ 轴对齐椭圆包围盒 ±80/±30
+    /// （钉住主轴沿 +x 假设——vendor 无主轴方向参数）；④ 直边 + 圆弧的
+    /// **连通** wire（line (0,0)→(50,0) + arc（圆心 (50,50) r=50 起 −π/2 终 0））
+    /// 聚合成功且恰含 2 边（`BRepBuilderAPI_MakeWire` 要求边连通，断开边报错）；
+    /// ⑤ 负半径 / 零法向 / 短半轴 > 长半轴一律 InvalidArgument 响亮拒绝。
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "真实内核用例在 debug 下 wasmtime 编译过慢，请用 --release 运行"
+    )]
+    fn circle_ellipse_arcs_build_real_edges_and_connected_wires() {
+        let Some(mut b) = try_backend() else { return };
+
+        // ⑤ 非法输入：负半径 / 零法向 / 短半轴 > 长半轴 → InvalidArgument
+        //    （适配层显式校验，先于 vendor）。
+        assert!(
+            matches!(
+                b.make_circle_edge(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -5.0),
+                Err(KernelError::InvalidArgument(_))
+            ),
+            "负半径应 InvalidArgument"
+        );
+        assert!(
+            matches!(
+                b.make_circle_edge(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 50.0),
+                Err(KernelError::InvalidArgument(_))
+            ),
+            "零法向应 InvalidArgument"
+        );
+        assert!(
+            matches!(
+                b.make_ellipse_edge(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 30.0, 80.0),
+                Err(KernelError::InvalidArgument(_))
+            ),
+            "短半轴 > 长半轴应 InvalidArgument"
+        );
+
+        // ① 整圆：包围盒 ±50（z 平面 0）。
+        let circle = b
+            .make_circle_edge(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 50.0)
+            .expect("真内核应建出整圆边");
+        let bb = b.bounding_box(circle).unwrap();
+        assert!(
+            (bb.min[0] + 50.0).abs() < 1e-6 && (bb.max[0] - 50.0).abs() < 1e-6,
+            "整圆 x 范围应 ±50，实得 {bb:?}"
+        );
+        assert!(
+            (bb.min[1] + 50.0).abs() < 1e-6 && (bb.max[1] - 50.0).abs() < 1e-6,
+            "整圆 y 范围应 ±50，实得 {bb:?}"
+        );
+        b.release(circle).unwrap();
+
+        // ② 四分之一弧：起 0 终 π/2 → ccw 从 +x 扫向 +y，第一象限 [0,50]²。
+        let quarter = b
+            .make_circle_arc(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                50.0,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            )
+            .expect("真内核应建出四分之一弧");
+        let bb = b.bounding_box(quarter).unwrap();
+        assert!(
+            (bb.min[0] - 0.0).abs() < 1e-6 && (bb.max[0] - 50.0).abs() < 1e-6,
+            "四分之一弧 x 应 [0,50]，实得 {bb:?}"
+        );
+        assert!(
+            (bb.min[1] - 0.0).abs() < 1e-6 && (bb.max[1] - 50.0).abs() < 1e-6,
+            "四分之一弧 y 应 [0,50]（ccw 起终角语义），实得 {bb:?}"
+        );
+        b.release(quarter).unwrap();
+
+        // ③ 轴对齐椭圆：主轴沿 +x（vendor 无主轴方向参数）。
+        let ellipse = b
+            .make_ellipse_edge(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 80.0, 30.0)
+            .expect("真内核应建出椭圆边");
+        let bb = b.bounding_box(ellipse).unwrap();
+        assert!(
+            (bb.min[0] + 80.0).abs() < 1e-6 && (bb.max[0] - 80.0).abs() < 1e-6,
+            "椭圆 x 范围应 ±80（主轴沿 +x），实得 {bb:?}"
+        );
+        assert!(
+            (bb.min[1] + 30.0).abs() < 1e-6 && (bb.max[1] - 30.0).abs() < 1e-6,
+            "椭圆 y 范围应 ±30，实得 {bb:?}"
+        );
+        b.release(ellipse).unwrap();
+
+        // ④ 连通 wire：直边终点 (50,0) = 弧起点（−π/2 方向）→ 2 条成员边。
+        let line = b
+            .make_line_edge(0.0, 0.0, 0.0, 50.0, 0.0, 0.0)
+            .expect("直边");
+        let arc = b
+            .make_circle_arc(
+                50.0,
+                50.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                50.0,
+                -std::f64::consts::FRAC_PI_2,
+                0.0,
+            )
+            .expect("四分之一弧");
+        let wire = b.make_wire(&[line, arc]).expect("连通边应可聚合成 wire");
         assert_eq!(
             b.sub_shape_count(wire, SubShapeKind::Edge).unwrap(),
             2,

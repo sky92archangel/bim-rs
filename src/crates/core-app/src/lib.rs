@@ -67,6 +67,7 @@ pub mod picker_service;
 pub mod projection_service;
 pub mod selector;
 pub mod session;
+pub mod sketch;
 pub mod store;
 pub mod topo_naming;
 pub mod update_service;
@@ -87,6 +88,7 @@ pub use projection_service::{
 };
 pub use selector::{EdgeSelector, FaceSelector};
 pub use session::{CoreSession, SessionSummary};
+pub use sketch::{SketchEntity, normalize_arc_angles};
 pub use store::{
     CONTAINER_MANIFEST, FORMAT_VERSION, open_document, open_from_dir, pack_to_dir, save_document,
 };

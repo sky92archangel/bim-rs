@@ -702,6 +702,75 @@ impl BimApp {
         }
     }
 
+    /// 撤销一步（G6-M1）：文档与图纸一起回滚，网格全量重建 + 失效态清理。
+    ///
+    /// - `undo()` 无可撤销时返回 false（菜单项已 `add_enabled` 置灰，快捷键
+    ///   路径仍可能到达——静默忽略）；
+    /// - 回滚后网格缓存**全量重建**（`dirty = true` 且不设增量集——
+    ///   refresh_meshes 的 clear 分支自动清掉已消失几何的孤儿缓存）；
+    /// - 选中 / 副选 / 拾取 / 参数编辑 / 图纸视图选中里已不存在的 id 清掉
+    ///   （回滚后元素与视图可能消失）；
+    /// - **op_by_element 不清理**：残留条目对重做友好（重做后元素回来，重选
+    ///   即可按原算子编辑）；ElementId 只增不复用，残留无语义风险；
+    /// - 不自动适配视图（撤销是精细操作，自动 fit 会让视口跳变）。
+    fn do_undo(&mut self) {
+        if !self.session.undo() {
+            return;
+        }
+        self.after_history_jump("撤销");
+    }
+
+    /// 重做一步（G6-M1）：语义同 [`Self::do_undo`]，方向相反。
+    fn do_redo(&mut self) {
+        if !self.session.redo() {
+            return;
+        }
+        self.after_history_jump("重做");
+    }
+
+    /// 撤销 / 重做共用的状态清理（历史移动后文档与图纸都变了）。
+    fn after_history_jump(&mut self, action: &str) {
+        self.dirty = true;
+        // —— 清理决策（文档 / 图纸只读借用圈在块内；先决策后改状态）——
+        let (selected_gone, secondary_gone, edit_gone, picked_gone, view_gone) = {
+            let svc = self.session.document();
+            let doc = svc.doc();
+            let drawing = svc.drawing();
+            (
+                self.selected.is_some_and(|id| doc.element(id).is_none()),
+                self.secondary.is_some_and(|id| doc.element(id).is_none()),
+                self.edit
+                    .as_ref()
+                    .is_some_and(|e| doc.element(e.element).is_none()),
+                self.picked
+                    .as_ref()
+                    .is_some_and(|p| doc.element(p.element).is_none()),
+                self.selected_view
+                    .is_some_and(|v| drawing.view(v).is_none()),
+            )
+        };
+        if selected_gone {
+            self.selected = None;
+        }
+        if secondary_gone {
+            self.secondary = None;
+        }
+        if edit_gone {
+            self.edit = None;
+        }
+        if picked_gone {
+            self.picked = None;
+        }
+        if view_gone {
+            self.selected_view = None;
+        }
+        self.log(format!(
+            "✓ 已{action}（可再撤销 {} 步 / 可重做 {} 步）",
+            self.session.undo_depth(),
+            self.session.redo_depth()
+        ));
+    }
+
     /// 把当前文档状态同步到窗口标题栏（有路径显示路径，否则"未命名"）。
     fn sync_title(&mut self, ctx: &egui::Context) {
         let title = match &self.file_path {
@@ -1014,6 +1083,33 @@ impl BimApp {
                 }
             });
             ui.menu_button("编辑", |ui| {
+                // 撤销 / 重做（G6-M1：双侧快照回滚——文档与图纸一起；深度入文案，
+                // 不可用时置灰）。语义见 do_undo / do_redo。
+                let undo_label = if self.session.can_undo() {
+                    format!("撤销（{} 步）", self.session.undo_depth())
+                } else {
+                    "撤销".to_string()
+                };
+                if ui
+                    .add_enabled(self.session.can_undo(), egui::Button::new(undo_label))
+                    .clicked()
+                {
+                    self.do_undo();
+                    ui.close_menu();
+                }
+                let redo_label = if self.session.can_redo() {
+                    format!("重做（{} 步）", self.session.redo_depth())
+                } else {
+                    "重做".to_string()
+                };
+                if ui
+                    .add_enabled(self.session.can_redo(), egui::Button::new(redo_label))
+                    .clicked()
+                {
+                    self.do_redo();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("清空选择").clicked() {
                     self.selected = None;
                     self.picked = None;
@@ -2733,6 +2829,14 @@ impl eframe::App for BimApp {
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
             self.do_open();
+        }
+        // G6-M1：撤销 / 重做快捷键（Ctrl+Z / Ctrl+Y；command 在 Windows=Ctrl）。
+        // key_pressed 含 key-repeat（按住连发，CAD 惯例）；无可撤销时静默忽略。
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+            self.do_undo();
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)) {
+            self.do_redo();
         }
 
         self.refresh_meshes();

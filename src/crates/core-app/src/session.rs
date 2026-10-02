@@ -1342,6 +1342,45 @@ impl CoreSession {
         KernelPicker::new(&mut self.geometry, self.document.doc()).pick(screen, camera, filter)
     }
 
+    // ---------- 撤销 / 重做（G6-M1：转发 DocumentService 的双侧快照历史） ----------
+
+    /// 能否撤销。
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.document.can_undo()
+    }
+
+    /// 能否重做。
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        self.document.can_redo()
+    }
+
+    /// 撤销层数。
+    #[must_use]
+    pub fn undo_depth(&self) -> usize {
+        self.document.undo_depth()
+    }
+
+    /// 重做层数。
+    #[must_use]
+    pub fn redo_depth(&self) -> usize {
+        self.document.redo_depth()
+    }
+
+    /// 撤销一步（**文档与图纸一起回滚**）。返回是否真的撤销了。
+    ///
+    /// 撤销后几何链路仍可用：[`GeometryService::resolve`] 未命中缓存时
+    /// 从文档的几何记录重新装载——重做后记录回来即可重新解析（内核侧零改动）。
+    pub fn undo(&mut self) -> bool {
+        self.document.undo()
+    }
+
+    /// 重做一步（**文档与图纸一起前进**）。返回是否真的重做了。
+    pub fn redo(&mut self) -> bool {
+        self.document.redo()
+    }
+
     // ---------- 持久化 ----------
 
     /// 存盘（= [`store::save_document`] 的 zip 形态）。
@@ -2703,5 +2742,57 @@ mod tests {
             .element(outcome.element)
             .expect("元素应存在");
         assert_eq!(e.geometry_ref, Some(outcome.shape));
+    }
+
+    // ---- G6-M1：撤销 / 重做门面（转发 DocumentService 双侧快照历史） ----
+
+    /// G6 钉 1（门面转发）：撤销 / 重做双栈移动——add ×2 → undo 一步（元素 -1、
+    /// 重做栈 +1）→ redo（元素还原、重做栈清空）；深度 / can_* 状态严格对账。
+    #[test]
+    fn undo_redo_facade_moves_both_stacks() {
+        let mut s = CoreSession::new().unwrap();
+        assert!(!s.can_undo(), "空会话无可撤销");
+        assert!(!s.can_redo(), "空会话无可重做");
+
+        s.create_generic_element("柱-1").unwrap();
+        s.create_generic_element("柱-2").unwrap();
+        assert!(s.can_undo());
+        assert_eq!(s.undo_depth(), 2, "两次便捷加元素 = 两个撤销步");
+
+        assert!(s.undo());
+        assert_eq!(s.document().element_count(), 1, "撤销一步少一个元素");
+        assert_eq!(s.redo_depth(), 1, "撤销步进重做栈");
+
+        assert!(s.redo());
+        assert_eq!(s.document().element_count(), 2, "重做还原");
+        assert!(!s.can_redo(), "重做到底后重做栈清空");
+    }
+
+    /// G6 钉 2（内核侧零改动的实证）：建几何 → 撤销（几何记录消失）→
+    /// 重做（记录回来）→ tessellate 仍成功——`GeometryService::resolve`
+    /// 未命中缓存时从几何记录重新装载，撤销 / 重做后几何链路天然可用。
+    #[test]
+    fn undo_redo_keeps_the_geometry_chain_resolvable() {
+        let mut s = CoreSession::new().unwrap();
+        s.install_module(Box::new(DemoModule)).unwrap();
+        let id = s.create_element("DEMO_BOX", "盒-1").unwrap();
+        let shape = s.build_geometry(id, "test.demo.box").unwrap();
+        assert!(s.tessellate(shape, 0.5, 0.1).is_ok(), "建几何后可网格化");
+
+        assert!(s.undo());
+        assert!(
+            s.document().doc().geometry_record(shape).is_none(),
+            "撤销后几何记录随文档回滚消失"
+        );
+
+        assert!(s.redo());
+        assert!(
+            s.document().doc().geometry_record(shape).is_some(),
+            "重做后几何记录回来"
+        );
+        assert!(
+            s.tessellate(shape, 0.5, 0.1).is_ok(),
+            "重做后几何链路仍可用（resolve 从记录重装或缓存命中）"
+        );
     }
 }

@@ -1,13 +1,13 @@
 //! # 桌面端图形窗口（`feature = "gui"`，egui 0.29 + eframe/wgpu）
 //!
-//! 真实 GUI 的第一版：**视口 / 拾取 / 属性面板** 三件套。
+//! 真实 GUI：**视口 / 拾取 / 属性面板 / 文件链路 / 图纸面板**。
 //!
 //! ```text
-//! ┌─────────┬──────────────────────────────┬──────────┐
-//! │ 构件列表 │          三维视口             │  属性面板 │
-//! │ (左栏)   │ 轨道相机 + 面着色 + 地面网格   │  (右栏)   │
-//! │         │ 左键拖动=旋转 右键=平移 滚轮=缩放│          │
-//! ├─────────┴──────────────────────────────┴──────────┤
+//! ┌─────────┬──────────────────────────────┬──────────┬─────────┐
+//! │ 构件列表 │          三维视口             │  属性面板 │ 图纸面板 │
+//! │ (左栏)   │ 轨道相机 + 面着色 + 地面网格   │  (右栏)   │ (右栏)   │
+//! │         │ 左键拖动=旋转 右键=平移 滚轮=缩放│          │ 视图列表 │
+//! ├─────────┴──────────────────────────────┴──────────┴─────────┤
 //! │ 操作日志（底栏，失败响亮可见，不弹窗不吞错）          │
 //! └───────────────────────────────────────────────────┘
 //! ```
@@ -36,6 +36,7 @@
 //! 失败一律写进底栏日志（错误原文），窗口照常可操作。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use glam::DVec3;
@@ -286,6 +287,29 @@ struct BimApp {
     fit_pending: bool,
     /// 是否真内核（occt feature）：mock 占位内核无真面拓扑，拾取命中后精算必然失败。
     real_kernel: bool,
+    /// 当前文档路径（M9 文件链路：None = 未保存过的新文档）
+    file_path: Option<PathBuf>,
+    /// 上次同步到窗口标题的文字（避免每帧重复 SetWindowText）
+    last_title: Option<String>,
+}
+
+/// 装载全部三个专业模块（new / open 共用；失败逐条写日志，不 panic）。
+fn install_modules(session: &mut CoreSession, logs: &mut Vec<String>) {
+    let modules: [(&'static str, Box<dyn Module>); 3] = [
+        ("example.beam", Box::new(ExampleBeam)),
+        ("hvac.duct", Box::new(HvacDuct)),
+        ("power.tunnel", Box::new(CableTunnel)),
+    ];
+    for (name, module) in modules {
+        if let Err(e) = session.install_module(module) {
+            logs.push(format!("✗ 装载模块 {name} 失败：{e}"));
+        }
+    }
+    logs.push(format!(
+        "✓ 已装载 {} 个模块（内核：{}）",
+        session.modules().module_count(),
+        session.geometry().backend_name()
+    ));
 }
 
 impl BimApp {
@@ -302,21 +326,7 @@ impl BimApp {
         let real_kernel = false;
 
         let mut logs: Vec<String> = Vec::new();
-        let modules: [(&'static str, Box<dyn Module>); 3] = [
-            ("example.beam", Box::new(ExampleBeam)),
-            ("hvac.duct", Box::new(HvacDuct)),
-            ("power.tunnel", Box::new(CableTunnel)),
-        ];
-        for (name, module) in modules {
-            if let Err(e) = session.install_module(module) {
-                logs.push(format!("✗ 装载模块 {name} 失败：{e}"));
-            }
-        }
-        logs.push(format!(
-            "✓ 已装载 {} 个模块（内核：{}）",
-            session.modules().module_count(),
-            session.geometry().backend_name()
-        ));
+        install_modules(&mut session, &mut logs);
 
         // 起手造一根梁，让视口不空。
         match session.create_element(BEAM_CATEGORY, "") {
@@ -337,6 +347,48 @@ impl BimApp {
             dirty: true,
             fit_pending: true,
             real_kernel,
+            file_path: None,
+            last_title: None,
+        })
+    }
+
+    /// 打开一个 `.bimdoc` 并包成 GUI 应用（模块重装；打开后渲染缓存/选中态归零）。
+    ///
+    /// feature 路由与 [`Self::new`] 一致：occt 腿走 [`CoreSession::open_real`]
+    /// （真实内核，重开后 rebuild / 投影走真几何），否则 [`CoreSession::open`]
+    /// （占位内核，重开后拾取不可用——mock 能力边界，与 M8 口径一致）。
+    fn open_document(path: &Path) -> Result<Self, String> {
+        #[cfg(feature = "occt")]
+        let picked_session = CoreSession::open_real(path);
+        #[cfg(not(feature = "occt"))]
+        let picked_session = CoreSession::open(path);
+        let mut session = picked_session.map_err(|e| format!("打开失败：{e}"))?;
+        #[cfg(feature = "occt")]
+        let real_kernel = true;
+        #[cfg(not(feature = "occt"))]
+        let real_kernel = false;
+
+        let mut logs: Vec<String> = Vec::new();
+        install_modules(&mut session, &mut logs);
+        logs.push(format!(
+            "✓ 已打开：{}（{} 个构件 / {} 条几何）",
+            path.display(),
+            session.summary().elements,
+            session.summary().geometry
+        ));
+
+        Ok(Self {
+            session,
+            camera: OrbitCamera::new(),
+            meshes: HashMap::new(),
+            selected: None,
+            picked: None,
+            logs,
+            dirty: true,
+            fit_pending: true,
+            real_kernel,
+            file_path: Some(path.to_path_buf()),
+            last_title: None,
         })
     }
 
@@ -345,6 +397,79 @@ impl BimApp {
         if self.logs.len() > 200 {
             let overflow = self.logs.len() - 200;
             self.logs.drain(0..overflow);
+        }
+    }
+
+    // ---- 文件链路（M9：新建 / 打开 / 保存 / 另存） ----
+
+    /// 新建文档：全新会话 + 重装模块（未确认丢弃提示由日志记录，不做模态弹窗）。
+    fn do_new(&mut self) {
+        match Self::new() {
+            Ok(mut app) => {
+                app.logs.insert(0, "✓ 已新建文档（未保存更改已丢弃）".to_string());
+                *self = app;
+            }
+            Err(e) => self.log(format!("✗ 新建失败：{e}")),
+        }
+    }
+
+    /// 打开文档：rfd 原生对话框选路径 → [`Self::open_document`] 整体替换。
+    fn do_open(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("BIM 文档", &["bimdoc"])
+            .pick_file()
+        else {
+            self.log("· 打开已取消".to_string());
+            return;
+        };
+        match Self::open_document(&path) {
+            Ok(app) => *self = app,
+            Err(e) => self.log(e),
+        }
+    }
+
+    /// 保存（Ctrl+S）：已有路径直接存；从未保存过 → 转另存。
+    fn do_save(&mut self) {
+        let Some(path) = self.file_path.clone() else {
+            self.do_save_as();
+            return;
+        };
+        self.save_to(&path);
+    }
+
+    /// 另存为（rfd 原生对话框 → 保存 → 记住路径）。
+    fn do_save_as(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("BIM 文档", &["bimdoc"])
+            .set_file_name("未命名.bimdoc")
+            .save_file()
+        else {
+            self.log("· 另存已取消".to_string());
+            return;
+        };
+        self.save_to(&path);
+    }
+
+    /// 存盘到指定路径（成功记住路径，失败写日志不 panic）。
+    fn save_to(&mut self, path: &Path) {
+        match self.session.save(path) {
+            Ok(()) => {
+                self.file_path = Some(path.to_path_buf());
+                self.log(format!("✓ 已保存：{}", path.display()));
+            }
+            Err(e) => self.log(format!("✗ 保存失败：{e}")),
+        }
+    }
+
+    /// 把当前文档状态同步到窗口标题栏（有路径显示路径，否则"未命名"）。
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        let title = match &self.file_path {
+            Some(p) => format!("轻量化 BIM 内核平台 —— {}", p.display()),
+            None => "轻量化 BIM 内核平台 —— 未命名".to_string(),
+        };
+        if self.last_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = Some(title);
         }
     }
 
@@ -466,6 +591,20 @@ impl BimApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("轻量化 BIM 内核平台");
+            ui.separator();
+            // —— 文件链路（M9：新建 / 打开 / 保存 / 另存）——
+            if ui.button("新建").clicked() {
+                self.do_new();
+            }
+            if ui.button("打开").clicked() {
+                self.do_open();
+            }
+            if ui.button("保存").clicked() {
+                self.do_save();
+            }
+            if ui.button("另存为").clicked() {
+                self.do_save_as();
+            }
             ui.separator();
             ui.monospace(format!("内核：{}", self.session.geometry().backend_name()));
             ui.separator();
@@ -915,6 +1054,15 @@ fn draw_grid(painter: &egui::Painter, rect: &egui::Rect, camera: &OrbitCamera) {
 
 impl eframe::App for BimApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // M9：标题栏同步 + 文件快捷键（Ctrl+S 保存 / Ctrl+O 打开）。
+        self.sync_title(ctx);
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+            self.do_save();
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.do_open();
+        }
+
         self.refresh_meshes();
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| self.top_bar(ui));
         egui::SidePanel::left("elements_panel")

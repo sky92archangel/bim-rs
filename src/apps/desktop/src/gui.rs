@@ -1667,39 +1667,6 @@ impl eframe::App for BimApp {
 // 入口
 // ---------------------------------------------------------------------------
 
-/// 装载 CJK 字体（egui 默认字体无中文字形；Windows 取微软雅黑等系统字体兜底）。
-fn install_cjk_font(ctx: &egui::Context) {
-    let candidates = [
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
-        "C:/Windows/Fonts/simsun.ttc",
-        "C:/Windows/Fonts/Deng.ttf",
-    ];
-    for path in candidates {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "cjk_fallback".to_string(),
-            egui::FontData::from_owned(bytes),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("cjk_fallback".to_string());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("cjk_fallback".to_string());
-        ctx.set_fonts(fonts);
-        return;
-    }
-    // 一个 CJK 字体都没找到：界面中文会显示为方框，但不影响功能（不 panic）。
-}
-
 /// 启动图形窗口。
 ///
 /// # Errors
@@ -1716,7 +1683,8 @@ pub fn run_gui() -> Result<(), String> {
         "轻量化 BIM 内核平台",
         options,
         Box::new(|cc| {
-            install_cjk_font(&cc.egui_ctx);
+            // G1：主题应用（Phosphor 图标 + CJK 兜底字体 + 深色 CAD visuals，见 theme.rs）。
+            crate::theme::apply(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )

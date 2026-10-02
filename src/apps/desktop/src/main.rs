@@ -36,6 +36,9 @@ use std::process::ExitCode;
 mod gui;
 
 #[cfg(feature = "gui")]
+mod theme;
+
+#[cfg(feature = "gui")]
 fn main() -> ExitCode {
     match gui::run_gui() {
         Ok(()) => ExitCode::SUCCESS,

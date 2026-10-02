@@ -17,7 +17,7 @@ path = "src/main.rs"
 # M8 起点已实现第一版真实窗口（视口/拾取/属性面板，见 src/gui.rs）：
 #   cargo run -p bim-desktop --features gui
 default = []
-gui = ["dep:eframe", "dep:egui", "dep:egui-wgpu", "dep:rfd"]
+gui = ["dep:eframe", "dep:egui", "dep:egui-wgpu", "dep:rfd", "dep:egui-phosphor"]
 # 透传真实内核后端（M1）：`cargo run -p bim-desktop --features occt` 用真内核。
 occt = ["core-kernel/occt", "core-app/occt"]
 
@@ -44,6 +44,8 @@ egui = { workspace = true, optional = true }
 egui-wgpu = { workspace = true, optional = true }
 # M9：原生文件对话框（gui feature 门控）
 rfd = { workspace = true, optional = true }
+# G1：Phosphor 图标字体（gui feature 门控，主题在 src/theme.rs）
+egui-phosphor = { workspace = true, optional = true }
 
 # 仅测试用：e2e_mock.rs 直接开容器检查 drawing.json / views/ 段
 [dev-dependencies]

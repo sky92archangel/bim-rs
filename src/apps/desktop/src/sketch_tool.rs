@@ -1,5 +1,5 @@
-//! 草图工具纯逻辑（G4-M15 骨架 + G4-M16 十工具补全）：工具状态机 + 捕捉 /
-//! 正交 / 倒角纯函数。
+//! 草图工具纯逻辑（G4-M15 骨架 + G4-M16 绘制补全 + G4-M17 编辑 / 标注）：
+//! 工具状态机 + 捕捉 / 正交 / 倒角 / 几何变换纯函数。
 //!
 //! 本模块**不依赖 egui、不门控 feature**（默认腿可单测）——画布渲染与指针
 //! 交互（`egui::Window` / painter / 输入事件）在门控模块 `sketch_editor`，
@@ -23,12 +23,14 @@ use core_app::SketchEntity;
 
 use crate::sketch_geom::{
     arc_midpoint, catmull_rom_to_bezier, chamfer_corner, circle_through_three, fillet_corner,
-    point_segment_distance, segment_intersection,
+    mirror_point, offset_circle, offset_segment, point_segment_distance, rotate_point, scale_point,
+    segment_intersection, split_segment, trim_segment,
 };
 
-/// 草图画图工具（G4-M15 骨架五种 + G4-M16 补全十种）。
+/// 草图画图工具（G4-M15 骨架五种 + G4-M16 补全十种 + G4-M17 编辑/标注十二种）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SketchTool {
+    // —— 绘制类（15）——
     /// 折线：连续点击加点，回车 / 双击结束。
     Polyline,
     /// 矩形：两击（对角点）→ 闭合折线。
@@ -59,29 +61,102 @@ pub enum SketchTool {
     Fillet,
     /// 倒直线角：单击两条线段图元 + 参数行距离。
     Chamfer,
+    // —— 编辑类（8，G4-M17，全部顶点级纯几何、与内核无关）——
+    /// 移动：选图元 → 基点 → 目标点（顶点平移）。
+    Move,
+    /// 复制：选图元 → 基点 → 目标点（克隆 + 平移，可连续多份）。
+    Copy,
+    /// 旋转：选图元 → 基点 → 参考点 → 目标点（顶点绕基点旋转）。
+    Rotate,
+    /// 缩放：选图元 → 基点 → 参考点 → 目标点（顶点绕基点等比缩放）。
+    Scale,
+    /// 镜像：选图元 → 镜像线两点（顶点关于直线反射，弧方向反转）。
+    Mirror,
+    /// 偏移：单击线段 / 圆 → 按参数行距离生成平行线 / 同心圆（原图元不动）。
+    Offset,
+    /// 修剪：单击边界线段 → 单击被剪线段（保留单击侧）。
+    Trim,
+    /// 打断：单击线段内部一点 → 断成两段。
+    Break,
+    // —— 标注类（4，G4-M17，显示型：不进 wire，标注数字）——
+    /// 线性标注：三击（两点 → 放置位置），测轴对齐增量。
+    DimLinear,
+    /// 对齐标注：三击（两点 → 放置位置），测真实距离。
+    DimAlign,
+    /// 半径标注：单击圆 → 单击标注位置（引线 + R 数字）。
+    DimRadius,
+    /// 角度标注：单击两条线段（交点定角顶点，角弧 + 度数）。
+    DimAngle,
 }
 
 /// 正多边形默认边数（编辑器新建状态与草稿默认值）。
 pub const DEFAULT_POLYGON_SIDES: usize = 6;
 
+/// 绘制类工具全集（工具栏第一行）。
+pub const DRAWING_TOOLS: [SketchTool; 15] = [
+    SketchTool::Polyline,
+    SketchTool::Rect,
+    SketchTool::Circle,
+    SketchTool::Ellipse,
+    SketchTool::Arc,
+    SketchTool::PolygonIn,
+    SketchTool::PolygonOut,
+    SketchTool::Arc3,
+    SketchTool::Bezier,
+    SketchTool::Spline,
+    SketchTool::Point,
+    SketchTool::Construction,
+    SketchTool::Ray,
+    SketchTool::Fillet,
+    SketchTool::Chamfer,
+];
+
+/// 编辑 + 标注类工具全集（工具栏第二行）。
+pub const EDITING_TOOLS: [SketchTool; 12] = [
+    SketchTool::Move,
+    SketchTool::Copy,
+    SketchTool::Rotate,
+    SketchTool::Scale,
+    SketchTool::Mirror,
+    SketchTool::Offset,
+    SketchTool::Trim,
+    SketchTool::Break,
+    SketchTool::DimLinear,
+    SketchTool::DimAlign,
+    SketchTool::DimRadius,
+    SketchTool::DimAngle,
+];
+
 impl SketchTool {
-    /// 工具全集（编辑器工具栏的枚举序）。
-    pub const ALL: [SketchTool; 15] = [
-        Self::Polyline,
-        Self::Rect,
-        Self::Circle,
-        Self::Ellipse,
-        Self::Arc,
-        Self::PolygonIn,
-        Self::PolygonOut,
-        Self::Arc3,
-        Self::Bezier,
-        Self::Spline,
-        Self::Point,
-        Self::Construction,
-        Self::Ray,
-        Self::Fillet,
-        Self::Chamfer,
+    /// 工具全集（编辑器工具栏的枚举序 = 绘制 + 编辑标注）。
+    pub const ALL: [SketchTool; 27] = [
+        SketchTool::Polyline,
+        SketchTool::Rect,
+        SketchTool::Circle,
+        SketchTool::Ellipse,
+        SketchTool::Arc,
+        SketchTool::PolygonIn,
+        SketchTool::PolygonOut,
+        SketchTool::Arc3,
+        SketchTool::Bezier,
+        SketchTool::Spline,
+        SketchTool::Point,
+        SketchTool::Construction,
+        SketchTool::Ray,
+        SketchTool::Fillet,
+        SketchTool::Chamfer,
+        SketchTool::Move,
+        SketchTool::Copy,
+        SketchTool::Rotate,
+        SketchTool::Scale,
+        SketchTool::Mirror,
+        SketchTool::Offset,
+        SketchTool::Trim,
+        SketchTool::Break,
+        SketchTool::DimLinear,
+        SketchTool::DimAlign,
+        SketchTool::DimRadius,
+        SketchTool::DimAngle,
     ];
 
     /// 工具名（按钮标签）。
@@ -102,6 +177,18 @@ impl SketchTool {
             Self::Ray => "射线",
             Self::Fillet => "圆角",
             Self::Chamfer => "倒角",
+            Self::Move => "移动",
+            Self::Copy => "复制",
+            Self::Rotate => "旋转",
+            Self::Scale => "缩放",
+            Self::Mirror => "镜像",
+            Self::Offset => "偏移",
+            Self::Trim => "修剪",
+            Self::Break => "打断",
+            Self::DimLinear => "线性标注",
+            Self::DimAlign => "对齐标注",
+            Self::DimRadius => "半径标注",
+            Self::DimAngle => "角度标注",
         }
     }
 }
@@ -117,6 +204,8 @@ impl SketchTool {
 /// - 贝塞尔 / 样条连续点击，回车 / 双击收尾（[`SketchDraft::finish_open`]）；
 /// - 点单击即放置；构造线 / 射线两击（辅助图元，不进 wire）；
 /// - 圆角 / 倒角不走点状态机——单击拾取线段图元（[`SketchDraft::pick_corner`]）；
+/// - 编辑 / 标注类（G4-M17）走 [`SketchDraft::edit_click`]——拾取阶段选图元、
+///   点阶段定基点 / 目标点 / 标注位置；偏移单击即成（编辑器侧直接应用）；
 /// - 半径 / 半轴为零（重合点击）不推进——继续等下一击，绝不产出退化图元。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SketchDraft {
@@ -170,6 +259,56 @@ pub enum SketchDraft {
         first: Option<usize>,
         second: Option<usize>,
     },
+    /// 移动（G4-M17：图元下标 → 基点）。
+    Move {
+        target: Option<usize>,
+        base: Option<DVec2>,
+    },
+    /// 复制（图元下标 → 基点；目标点可连续点击多份）。
+    Copy {
+        target: Option<usize>,
+        base: Option<DVec2>,
+    },
+    /// 旋转（图元下标 → 基点 → 参考点；目标点定转角）。
+    Rotate {
+        target: Option<usize>,
+        base: Option<DVec2>,
+        reference: Option<DVec2>,
+    },
+    /// 缩放（图元下标 → 基点 → 参考点；目标点定比例）。
+    Scale {
+        target: Option<usize>,
+        base: Option<DVec2>,
+        reference: Option<DVec2>,
+    },
+    /// 镜像（图元下标 → 镜像线第一点）。
+    Mirror {
+        target: Option<usize>,
+        first: Option<DVec2>,
+    },
+    /// 偏移（无状态：单击拾取即按参数行距离成新图元）。
+    Offset,
+    /// 修剪（边界线段图元下标）。
+    Trim { boundary: Option<usize> },
+    /// 打断（无状态：单击拾取 + 段内点即断）。
+    Break,
+    /// 线性标注（两点 → 放置位置）。
+    DimLinear {
+        first: Option<DVec2>,
+        second: Option<DVec2>,
+    },
+    /// 对齐标注（两点 → 放置位置）。
+    DimAlign {
+        first: Option<DVec2>,
+        second: Option<DVec2>,
+    },
+    /// 半径标注（拾取圆捕获 (center, radius) → 放置位置）。
+    DimRadius { circle: Option<(DVec2, f64)> },
+    /// 角度标注（拾取两条线段图元下标）。
+    DimAngle {
+        first: Option<usize>,
+        second: Option<usize>,
+    },
 }
 
 /// 一次画布点击的推进结果。
@@ -179,6 +318,24 @@ pub enum ClickOutcome {
     Continued,
     /// 图元完成（已按最终口径构造）。
     Finished(SketchEntity),
+}
+
+/// 一次编辑 / 标注点击的推进结果（G4-M17 编辑类统一入口）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditOutcome {
+    /// 交互推进（拾取 / 基点 / 参考点等已记录，草稿保持）。
+    Continued,
+    /// 单击落空或类型不符（容差内无图元 / 图元类型不支持该阶段）——草稿保持，
+    /// 等下一击。
+    Ignored,
+    /// 应用成功：`replace` = 原地替换（下标, 新图元）；`add` = 追加图元
+    /// （由调用方落地到实体列表）。
+    Applied {
+        replace: Option<(usize, SketchEntity)>,
+        add: Vec<SketchEntity>,
+    },
+    /// 几何校验失败（无交点 / 参数退化等）——调用方记日志并复位草稿。
+    Failed(String),
 }
 
 impl SketchDraft {
@@ -227,6 +384,44 @@ impl SketchDraft {
                 second: None,
             },
             SketchTool::Chamfer => Self::Chamfer {
+                first: None,
+                second: None,
+            },
+            SketchTool::Move => Self::Move {
+                target: None,
+                base: None,
+            },
+            SketchTool::Copy => Self::Copy {
+                target: None,
+                base: None,
+            },
+            SketchTool::Rotate => Self::Rotate {
+                target: None,
+                base: None,
+                reference: None,
+            },
+            SketchTool::Scale => Self::Scale {
+                target: None,
+                base: None,
+                reference: None,
+            },
+            SketchTool::Mirror => Self::Mirror {
+                target: None,
+                first: None,
+            },
+            SketchTool::Offset => Self::Offset,
+            SketchTool::Trim => Self::Trim { boundary: None },
+            SketchTool::Break => Self::Break,
+            SketchTool::DimLinear => Self::DimLinear {
+                first: None,
+                second: None,
+            },
+            SketchTool::DimAlign => Self::DimAlign {
+                first: None,
+                second: None,
+            },
+            SketchTool::DimRadius => Self::DimRadius { circle: None },
+            SketchTool::DimAngle => Self::DimAngle {
                 first: None,
                 second: None,
             },
@@ -313,6 +508,72 @@ impl SketchDraft {
             Self::Chamfer {
                 second: Some(_), ..
             } => "倒角：应用中…",
+            Self::Move { target: None, .. } => "移动：单击选择图元",
+            Self::Move {
+                target: Some(_),
+                base: None,
+            } => "移动：单击基点",
+            Self::Move { .. } => "移动：单击目标点",
+            Self::Copy { target: None, .. } => "复制：单击选择图元",
+            Self::Copy {
+                target: Some(_),
+                base: None,
+            } => "复制：单击基点",
+            Self::Copy { .. } => "复制：单击目标点（可连续复制，Esc 结束）",
+            Self::Rotate { target: None, .. } => "旋转：单击选择图元",
+            Self::Rotate {
+                target: Some(_),
+                base: None,
+                ..
+            } => "旋转：单击基点",
+            Self::Rotate {
+                base: Some(_),
+                reference: None,
+                ..
+            } => "旋转：单击参考点",
+            Self::Rotate { .. } => "旋转：单击目标点（定转角）",
+            Self::Scale { target: None, .. } => "缩放：单击选择图元",
+            Self::Scale {
+                target: Some(_),
+                base: None,
+                ..
+            } => "缩放：单击基点",
+            Self::Scale {
+                base: Some(_),
+                reference: None,
+                ..
+            } => "缩放：单击参考点",
+            Self::Scale { .. } => "缩放：单击目标点（定比例）",
+            Self::Mirror { target: None, .. } => "镜像：单击选择图元",
+            Self::Mirror {
+                target: Some(_),
+                first: None,
+            } => "镜像：单击镜像线第一点",
+            Self::Mirror { .. } => "镜像：单击镜像线第二点",
+            Self::Offset => "偏移：单击线段或圆（距离见参数行，正 = 左侧 / 向外）",
+            Self::Trim { boundary: None } => "修剪：单击边界线段",
+            Self::Trim { boundary: Some(_) } => "修剪：单击被剪线段（保留单击侧）",
+            Self::Break => "打断：单击线段内部一点",
+            Self::DimLinear { first: None, .. } => "线性标注：单击尺寸起点",
+            Self::DimLinear {
+                first: Some(_),
+                second: None,
+            } => "线性标注：单击尺寸终点",
+            Self::DimLinear { .. } => "线性标注：单击尺寸线位置",
+            Self::DimAlign { first: None, .. } => "对齐标注：单击尺寸起点",
+            Self::DimAlign {
+                first: Some(_),
+                second: None,
+            } => "对齐标注：单击尺寸终点",
+            Self::DimAlign { .. } => "对齐标注：单击尺寸线位置",
+            Self::DimRadius { circle: None } => "半径标注：单击圆（捕获圆心半径）",
+            Self::DimRadius { .. } => "半径标注：单击引线位置",
+            Self::DimAngle { first: None, .. } => "角度标注：单击第一条线段",
+            Self::DimAngle {
+                first: Some(_),
+                second: None,
+            } => "角度标注：单击第二条线段",
+            Self::DimAngle { .. } => "角度标注：单击角弧位置",
         }
     }
 
@@ -536,6 +797,20 @@ impl SketchDraft {
             },
             // 圆角 / 倒角：不走点状态机（单击拾取线段图元，见 `pick_corner`）。
             Self::Fillet { .. } | Self::Chamfer { .. } => ClickOutcome::Continued,
+            // 编辑 / 标注类（G4-M17）：不走绘制点状态机（编辑器按 is_editing
+            // 分派到 `edit_click` / 偏移直接应用）。
+            Self::Move { .. }
+            | Self::Copy { .. }
+            | Self::Rotate { .. }
+            | Self::Scale { .. }
+            | Self::Mirror { .. }
+            | Self::Offset
+            | Self::Trim { .. }
+            | Self::Break
+            | Self::DimLinear { .. }
+            | Self::DimAlign { .. }
+            | Self::DimRadius { .. }
+            | Self::DimAngle { .. } => ClickOutcome::Continued,
             Self::None => ClickOutcome::Continued, // 无草稿：点击交给工具选择
         }
     }
@@ -580,8 +855,9 @@ impl SketchDraft {
     }
 
     /// Backspace 撤点：折线 / 贝塞尔 / 样条撤最后一点，三点弧退回中间点，
-    /// 两击类（矩形 / 圆 / 多边形 / 构造线 / 射线）退回第一击，倒角退回
-    /// 上一次选定；撤无可撤返回 false。
+    /// 两击类（矩形 / 圆 / 多边形 / 构造线 / 射线）退回第一击，圆角 / 倒角
+    /// 退回上一次选定，编辑类退回参考点 / 基点 / 图元，标注类退回上一点；
+    /// 撤无可撤返回 false。
     pub fn backtrack(&mut self) -> bool {
         match self {
             Self::Polyline { points } | Self::Bezier { points } | Self::Spline { points } => {
@@ -600,7 +876,46 @@ impl SketchDraft {
                 axis_end.take().is_some() || center.take().is_some()
             }
             Self::Arc { center, start } => start.take().is_some() || center.take().is_some(),
-            Self::Point | Self::None => false, // 单击即完成 / 无草稿：无撤点
+            Self::Move { target, base } | Self::Copy { target, base } => {
+                base.take().is_some() || target.take().is_some()
+            }
+            Self::Rotate {
+                target,
+                base,
+                reference,
+            }
+            | Self::Scale {
+                target,
+                base,
+                reference,
+            } => reference.take().is_some() || base.take().is_some() || target.take().is_some(),
+            Self::Mirror { target, first } => first.take().is_some() || target.take().is_some(),
+            Self::Trim { boundary } => boundary.take().is_some(),
+            Self::DimLinear { first, second } | Self::DimAlign { first, second } => {
+                second.take().is_some() || first.take().is_some()
+            }
+            Self::DimAngle { first, second } => second.take().is_some() || first.take().is_some(),
+            Self::Point | Self::Offset | Self::Break | Self::DimRadius { .. } | Self::None => {
+                false // 单击即完成 / 无状态 / 无草稿：无撤点
+            }
+        }
+    }
+
+    /// 编辑 / 标注草稿当前应高亮的已选图元下标（画布拾取反馈）：
+    /// 圆角 / 倒角高亮第一条线段，Move/Copy/Rotate/Scale/Mirror 高亮 target、
+    /// Trim 高亮 boundary、DimAngle 高亮 first；其余（无下标状态）返回 `None`。
+    #[must_use]
+    pub fn edit_highlight(&self) -> Option<usize> {
+        match self {
+            Self::Fillet { first, .. } | Self::Chamfer { first, .. } => *first,
+            Self::Move { target, .. }
+            | Self::Copy { target, .. }
+            | Self::Rotate { target, .. }
+            | Self::Scale { target, .. }
+            | Self::Mirror { target, .. } => *target,
+            Self::Trim { boundary } => *boundary,
+            Self::DimAngle { first, .. } => *first,
+            _ => None,
         }
     }
 }
@@ -657,6 +972,10 @@ pub fn snap_entities(entities: &[SketchEntity], p: DVec2, tol: f64) -> Option<DV
             SketchEntity::Ellipse { center, .. } | SketchEntity::Arc { center, .. } => {
                 consider(*center);
             }
+            // 标注（显示型）：无锚点，不参与捕捉。
+            SketchEntity::DimLinear { .. }
+            | SketchEntity::DimRadius { .. }
+            | SketchEntity::DimAngle { .. } => {}
         }
     }
     best.map(|(_, q)| q)
@@ -769,6 +1088,363 @@ impl SketchDraft {
                 }
             }
             _ => CornerPick::Ignored,
+        }
+    }
+
+    /// 当前草稿是否为编辑 / 标注类（点击走 [`SketchDraft::edit_click`] 或偏移
+    /// 直接应用，不走绘制状态机 [`SketchDraft::click`]）。
+    #[must_use]
+    pub fn is_editing(&self) -> bool {
+        matches!(
+            self,
+            Self::Move { .. }
+                | Self::Copy { .. }
+                | Self::Rotate { .. }
+                | Self::Scale { .. }
+                | Self::Mirror { .. }
+                | Self::Offset
+                | Self::Trim { .. }
+                | Self::Break
+                | Self::DimLinear { .. }
+                | Self::DimAlign { .. }
+                | Self::DimRadius { .. }
+                | Self::DimAngle { .. }
+        )
+    }
+
+    /// 编辑 / 标注类工具统一点击推进（G4-M17 十一项；偏移无中间状态，在编辑器
+    /// 侧直接应用 [`offset_entity`]，不走本函数）。
+    ///
+    /// 拾取阶段（选图元）用 `picked`（容差内无命中或图元类型不符 →
+    /// [`EditOutcome::Ignored`]，草稿保持等下一击），点阶段（基点 / 目标点 /
+    /// 标注位置）用 `p`；应用阶段从 `entities` 读原图元，返回
+    /// [`EditOutcome::Applied`]（替换 / 追加由调用方落地）。交互完成时草稿
+    /// 复位为 [`SketchDraft::None`]——**复制除外**（同一基点可连续放置多份，
+    /// Esc / 换工具结束）；打断为无状态单击（可连续断多段）。
+    pub fn edit_click(
+        &mut self,
+        p: DVec2,
+        picked: Option<usize>,
+        entities: &[SketchEntity],
+    ) -> EditOutcome {
+        match self {
+            Self::Move { target, base } => match (*target, *base) {
+                (None, _) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) => {
+                        *target = Some(i);
+                        EditOutcome::Continued
+                    }
+                },
+                (Some(_), None) => {
+                    *base = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(i), Some(b)) => {
+                    let Some(e) = entities.get(i) else {
+                        return EditOutcome::Failed("图元下标越界".to_string());
+                    };
+                    let moved = translate_entity(e, p - b);
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: Some((i, moved)),
+                        add: Vec::new(),
+                    }
+                }
+            },
+            Self::Copy { target, base } => match (*target, *base) {
+                (None, _) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) => {
+                        *target = Some(i);
+                        EditOutcome::Continued
+                    }
+                },
+                (Some(_), None) => {
+                    *base = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(i), Some(b)) => {
+                    let Some(e) = entities.get(i) else {
+                        return EditOutcome::Failed("图元下标越界".to_string());
+                    };
+                    // 草稿不复位：同一基点连续放置多份（Esc / 换工具结束）。
+                    EditOutcome::Applied {
+                        replace: None,
+                        add: vec![translate_entity(e, p - b)],
+                    }
+                }
+            },
+            Self::Rotate {
+                target,
+                base,
+                reference,
+            } => match (*target, *base, *reference) {
+                (None, _, _) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) => {
+                        *target = Some(i);
+                        EditOutcome::Continued
+                    }
+                },
+                (Some(_), None, _) => {
+                    *base = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(_), Some(b), None) => {
+                    if (p - b).length() <= f64::EPSILON {
+                        return EditOutcome::Ignored; // 参考点与基点重合：等下一击
+                    }
+                    *reference = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(i), Some(b), Some(r)) => {
+                    let Some(e) = entities.get(i) else {
+                        return EditOutcome::Failed("图元下标越界".to_string());
+                    };
+                    // 转角 = 目标方向角 − 参考方向角（都相对基点）。
+                    let angle = (p - b).y.atan2((p - b).x) - (r - b).y.atan2((r - b).x);
+                    let rotated = rotate_entity(e, b, angle);
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: Some((i, rotated)),
+                        add: Vec::new(),
+                    }
+                }
+            },
+            Self::Scale {
+                target,
+                base,
+                reference,
+            } => match (*target, *base, *reference) {
+                (None, _, _) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) => {
+                        *target = Some(i);
+                        EditOutcome::Continued
+                    }
+                },
+                (Some(_), None, _) => {
+                    *base = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(_), Some(b), None) => {
+                    if (p - b).length() <= f64::EPSILON {
+                        return EditOutcome::Ignored; // 参考点与基点重合：等下一击
+                    }
+                    *reference = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(i), Some(b), Some(r)) => {
+                    let Some(e) = entities.get(i) else {
+                        return EditOutcome::Failed("图元下标越界".to_string());
+                    };
+                    let d_ref = (r - b).length();
+                    if d_ref <= f64::EPSILON || (p - b).length() <= f64::EPSILON {
+                        return EditOutcome::Ignored; // 比例退化：等下一击
+                    }
+                    // 比例 = 目标距 / 参考距（都相对基点）。
+                    let factor = (p - b).length() / d_ref;
+                    let scaled = scale_entity(e, b, factor);
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: Some((i, scaled)),
+                        add: Vec::new(),
+                    }
+                }
+            },
+            Self::Mirror { target, first } => match (*target, *first) {
+                (None, _) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) => {
+                        *target = Some(i);
+                        EditOutcome::Continued
+                    }
+                },
+                (Some(_), None) => {
+                    *first = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(i), Some(f)) => {
+                    let Some(e) = entities.get(i) else {
+                        return EditOutcome::Failed("图元下标越界".to_string());
+                    };
+                    if (p - f).length() <= f64::EPSILON {
+                        return EditOutcome::Ignored; // 镜像线退化：等下一击
+                    }
+                    let mirrored = mirror_entity(e, f, p);
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: Some((i, mirrored)),
+                        add: Vec::new(),
+                    }
+                }
+            },
+            Self::Trim { boundary } => match *boundary {
+                None => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) if single_segment(entities.get(i)).is_some() => {
+                        *boundary = Some(i);
+                        EditOutcome::Continued
+                    }
+                    Some(_) => EditOutcome::Ignored, // 边界必须是单段折线
+                },
+                Some(bi) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) => {
+                        let (Some(b_seg), Some(t_seg)) = (
+                            single_segment(entities.get(bi)),
+                            single_segment(entities.get(i)),
+                        ) else {
+                            return EditOutcome::Ignored;
+                        };
+                        if segment_intersection(b_seg[0], b_seg[1], t_seg[0], t_seg[1]).is_none() {
+                            return EditOutcome::Failed("被剪线段与边界无交点".to_string());
+                        }
+                        let Some((a, b)) = trim_segment(t_seg[0], t_seg[1], b_seg[0], b_seg[1], p)
+                        else {
+                            return EditOutcome::Failed("修剪失败：被剪线段退化".to_string());
+                        };
+                        *self = Self::None;
+                        EditOutcome::Applied {
+                            replace: Some((i, SketchEntity::Polyline(vec![a, b]))),
+                            add: Vec::new(),
+                        }
+                    }
+                },
+            },
+            Self::Break => {
+                let Some(i) = picked else {
+                    return EditOutcome::Ignored;
+                };
+                let Some(seg) = single_segment(entities.get(i)) else {
+                    return EditOutcome::Ignored; // 打断只作用于单段折线
+                };
+                // 打断点取单击点在线段上的投影（端点 / 段外投影到端点 → None）。
+                let Some(([a, mid], [_, b])) = split_segment(seg[0], seg[1], p) else {
+                    return EditOutcome::Failed("打断点须落在线段内部".to_string());
+                };
+                EditOutcome::Applied {
+                    replace: Some((i, SketchEntity::Polyline(vec![a, mid]))),
+                    add: vec![SketchEntity::Polyline(vec![mid, b])],
+                }
+            }
+            Self::DimLinear { first, second } => match (*first, *second) {
+                (None, _) => {
+                    *first = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(f), None) => {
+                    if (p - f).length() <= f64::EPSILON {
+                        return EditOutcome::Ignored; // 零长度尺寸：等下一击
+                    }
+                    *second = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(f), Some(s)) => {
+                    let entity = SketchEntity::DimLinear {
+                        from: f,
+                        to: s,
+                        pos: p,
+                        linear: true,
+                    };
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: None,
+                        add: vec![entity],
+                    }
+                }
+            },
+            Self::DimAlign { first, second } => match (*first, *second) {
+                (None, _) => {
+                    *first = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(f), None) => {
+                    if (p - f).length() <= f64::EPSILON {
+                        return EditOutcome::Ignored; // 零长度尺寸：等下一击
+                    }
+                    *second = Some(p);
+                    EditOutcome::Continued
+                }
+                (Some(f), Some(s)) => {
+                    let entity = SketchEntity::DimLinear {
+                        from: f,
+                        to: s,
+                        pos: p,
+                        linear: false,
+                    };
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: None,
+                        add: vec![entity],
+                    }
+                }
+            },
+            Self::DimRadius { circle } => match *circle {
+                None => match picked.and_then(|i| entities.get(i)) {
+                    Some(SketchEntity::Circle { center, radius }) => {
+                        *circle = Some((*center, *radius));
+                        EditOutcome::Continued
+                    }
+                    _ => EditOutcome::Ignored, // 半径标注只挂在圆上
+                },
+                Some((c, r)) => {
+                    let entity = SketchEntity::DimRadius {
+                        center: c,
+                        radius: r,
+                        pos: p,
+                    };
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: None,
+                        add: vec![entity],
+                    }
+                }
+            },
+            Self::DimAngle { first, second } => match (*first, *second) {
+                (None, _) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) if single_segment(entities.get(i)).is_some() => {
+                        *first = Some(i);
+                        EditOutcome::Continued
+                    }
+                    Some(_) => EditOutcome::Ignored, // 角度标注只挂线段
+                },
+                (Some(f), None) => match picked {
+                    None => EditOutcome::Ignored,
+                    Some(i) if i != f && single_segment(entities.get(i)).is_some() => {
+                        *second = Some(i);
+                        EditOutcome::Continued
+                    }
+                    _ => EditOutcome::Ignored, // 同一图元 / 非线段
+                },
+                (Some(f), Some(s)) => {
+                    let (Some(seg1), Some(seg2)) = (
+                        single_segment(entities.get(f)),
+                        single_segment(entities.get(s)),
+                    ) else {
+                        return EditOutcome::Failed("线段图元已失效".to_string());
+                    };
+                    // 角顶点 = 两线段交点；两臂取距交点较远的端点（方向点）。
+                    let Some(v) = segment_intersection(seg1[0], seg1[1], seg2[0], seg2[1]) else {
+                        return EditOutcome::Failed("两线段平行或共线，无角顶点".to_string());
+                    };
+                    let entity = SketchEntity::DimAngle {
+                        vertex: v,
+                        arm1: far_end(seg1, v),
+                        arm2: far_end(seg2, v),
+                        pos: p,
+                    };
+                    *self = Self::None;
+                    EditOutcome::Applied {
+                        replace: None,
+                        add: vec![entity],
+                    }
+                }
+            },
+            // 绘制类草稿不经本函数（编辑器按 is_editing 分派）。
+            _ => EditOutcome::Ignored,
         }
     }
 }
@@ -899,6 +1575,184 @@ fn apply_corner(
         entities.insert(i + k, e);
     }
     Ok(())
+}
+
+/// 单段折线提取（修剪 / 打断 / 角度标注只作用于线段图元；多段折线 / 曲线 /
+/// 辅助图元返回 `None`）。
+fn single_segment(e: Option<&SketchEntity>) -> Option<[DVec2; 2]> {
+    match e? {
+        SketchEntity::Polyline(points) if points.len() == 2 => Some([points[0], points[1]]),
+        _ => None,
+    }
+}
+
+/// 图元几何变换（G4-M17 编辑类底座）：所有顶点 / 位置点经 `f` 映射。
+///
+/// - 折线 / 贝塞尔 / 点 / 构造线：全点映射；
+/// - 圆：圆心映射，半径用探针点（圆心 + (r, 0)）映射还原——平移 / 旋转 /
+///   镜像半径不变，均匀缩放按比例；
+/// - 椭圆：长轴端点探针映射还原新主轴方向与缩放系数（major / minor 同乘 k）；
+/// - 弧：起终点探针映射还原新半径与起终角，`flip_handedness`（镜像）时
+///   起终点互换后 ccw 归一——镜像翻手性，几何弧不变、扫向反转；
+/// - 标注：位置点全映射（显示型，数值由渲染层按映射后几何重算）。
+#[must_use]
+pub fn transform_entity(
+    e: &SketchEntity,
+    f: &dyn Fn(DVec2) -> DVec2,
+    flip_handedness: bool,
+) -> SketchEntity {
+    match e {
+        SketchEntity::Polyline(points) => {
+            SketchEntity::Polyline(points.iter().map(|&v| f(v)).collect())
+        }
+        SketchEntity::Bezier(segments) => SketchEntity::Bezier(
+            segments
+                .iter()
+                .map(|seg| seg.iter().map(|&v| f(v)).collect())
+                .collect(),
+        ),
+        SketchEntity::Point(p) => SketchEntity::Point(f(*p)),
+        SketchEntity::AuxLine { from, to, ray } => SketchEntity::AuxLine {
+            from: f(*from),
+            to: f(*to),
+            ray: *ray,
+        },
+        SketchEntity::Circle { center, radius } => {
+            let probe = *center + DVec2::new(*radius, 0.0);
+            SketchEntity::Circle {
+                center: f(*center),
+                radius: (f(probe) - f(*center)).length(),
+            }
+        }
+        SketchEntity::Ellipse {
+            center,
+            major,
+            minor,
+            major_angle,
+        } => {
+            let d = DVec2::new(major * major_angle.cos(), major * major_angle.sin());
+            let new_center = f(*center);
+            let new_d = f(*center + d) - new_center;
+            // 探针距离 |new_d| = 变换比例 × major = 新长半轴；短半轴同比例。
+            let k = new_d.length();
+            let ratio = if *major > f64::EPSILON {
+                k / *major
+            } else {
+                0.0
+            };
+            SketchEntity::Ellipse {
+                center: new_center,
+                major: k,
+                minor: minor * ratio,
+                major_angle: new_d.y.atan2(new_d.x),
+            }
+        }
+        SketchEntity::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+        } => {
+            let new_center = f(*center);
+            let sp = DVec2::new(radius * start_angle.cos(), radius * start_angle.sin());
+            let ep = DVec2::new(radius * end_angle.cos(), radius * end_angle.sin());
+            let new_sp = f(*center + sp) - new_center;
+            let new_ep = f(*center + ep) - new_center;
+            let (mut sa, mut ea) = (new_sp.y.atan2(new_sp.x), new_ep.y.atan2(new_ep.x));
+            if flip_handedness {
+                std::mem::swap(&mut sa, &mut ea); // 镜像翻手性：起终点互换
+            }
+            let (sa, ea) = core_app::normalize_arc_angles(sa, ea);
+            SketchEntity::Arc {
+                center: new_center,
+                radius: new_sp.length(),
+                start_angle: sa,
+                end_angle: ea,
+            }
+        }
+        SketchEntity::DimLinear {
+            from,
+            to,
+            pos,
+            linear,
+        } => SketchEntity::DimLinear {
+            from: f(*from),
+            to: f(*to),
+            pos: f(*pos),
+            linear: *linear,
+        },
+        SketchEntity::DimRadius {
+            center,
+            radius,
+            pos,
+        } => {
+            let probe = *center + DVec2::new(*radius, 0.0);
+            SketchEntity::DimRadius {
+                center: f(*center),
+                radius: (f(probe) - f(*center)).length(),
+                pos: f(*pos),
+            }
+        }
+        SketchEntity::DimAngle {
+            vertex,
+            arm1,
+            arm2,
+            pos,
+        } => SketchEntity::DimAngle {
+            vertex: f(*vertex),
+            arm1: f(*arm1),
+            arm2: f(*arm2),
+            pos: f(*pos),
+        },
+    }
+}
+
+/// 平移图元（移动 / 复制共用）。
+#[must_use]
+pub fn translate_entity(e: &SketchEntity, d: DVec2) -> SketchEntity {
+    transform_entity(e, &|p| p + d, false)
+}
+
+/// 图元绕 pivot 旋转 angle_rad（ccw 为正）。
+#[must_use]
+pub fn rotate_entity(e: &SketchEntity, pivot: DVec2, angle_rad: f64) -> SketchEntity {
+    transform_entity(e, &|p| rotate_point(p, pivot, angle_rad), false)
+}
+
+/// 图元绕 pivot 均匀缩放 factor 倍（负比例 = 点反射，手性保持）。
+#[must_use]
+pub fn scale_entity(e: &SketchEntity, pivot: DVec2, factor: f64) -> SketchEntity {
+    transform_entity(e, &|p| scale_point(p, pivot, factor), false)
+}
+
+/// 图元关于直线（line_a → line_b）镜像（翻手性：弧起终点互换）。
+#[must_use]
+pub fn mirror_entity(e: &SketchEntity, line_a: DVec2, line_b: DVec2) -> SketchEntity {
+    transform_entity(e, &|p| mirror_point(p, line_a, line_b), true)
+}
+
+/// 偏移图元（G4-M17）：单段折线平行偏移（正 = a→b 左侧）/ 圆同心偏移
+/// （正 = 向外）；其余图元 / 线段退化 / 向内偏移超出半径返回 `Err`
+/// （原图元不动，调用方按 fillet 同款生成新图元）。
+pub fn offset_entity(e: &SketchEntity, distance: f64) -> Result<SketchEntity, String> {
+    match e {
+        SketchEntity::Polyline(points) if points.len() == 2 => {
+            let Some((a, b)) = offset_segment(points[0], points[1], distance) else {
+                return Err("偏移失败：线段退化".to_string());
+            };
+            Ok(SketchEntity::Polyline(vec![a, b]))
+        }
+        SketchEntity::Circle { center, radius } => {
+            let Some((c, r)) = offset_circle(*center, *radius, distance) else {
+                return Err("偏移失败：半径不足（向内偏移超出半径）".to_string());
+            };
+            Ok(SketchEntity::Circle {
+                center: c,
+                radius: r,
+            })
+        }
+        _ => Err("偏移只支持单段折线或圆".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1086,14 +1940,26 @@ mod tests {
         assert!(!d.abort(), "二次取消无事发生");
     }
 
-    /// 工具全集与提示文案完整（编辑器工具栏枚举序）。
+    /// 工具全集与提示文案完整（编辑器工具栏枚举序 = 绘制 15 + 编辑标注 12）。
     #[test]
     fn tool_set_and_hints_are_complete() {
-        assert_eq!(SketchTool::ALL.len(), 15);
+        assert_eq!(SketchTool::ALL.len(), 27);
+        assert_eq!(DRAWING_TOOLS.len(), 15);
+        assert_eq!(EDITING_TOOLS.len(), 12);
         assert!(!SketchTool::ALL.is_empty());
         for tool in SketchTool::ALL {
             assert!(!tool.label().is_empty());
             assert!(!SketchDraft::new(tool).hint().is_empty());
+            assert!(
+                !SketchDraft::new(tool).is_editing() || EDITING_TOOLS.contains(&tool),
+                "is_editing 与编辑行一致"
+            );
+        }
+        for tool in EDITING_TOOLS {
+            assert!(
+                SketchDraft::new(tool).is_editing(),
+                "编辑行工具应为编辑草稿"
+            );
         }
     }
 
@@ -1520,5 +2386,553 @@ mod tests {
         // 非倒角草稿：忽略。
         let mut d = SketchDraft::new(SketchTool::Polyline);
         assert_eq!(d.pick_corner(Some(0)), CornerPick::Ignored);
+    }
+
+    // —— G4-M17 编辑 / 标注类（edit_click + 变换 / 偏移）——
+
+    /// 移动：三击（拾取 → 基点 → 目标点）→ 顶点平移，草稿复位。
+    #[test]
+    fn edit_move_translates_and_resets() {
+        let entities = vec![SketchEntity::Polyline(vec![
+            DVec2::ZERO,
+            DVec2::new(10.0, 0.0),
+        ])];
+        let mut draft = SketchDraft::new(SketchTool::Move);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, Some(0), &entities),
+            EditOutcome::Continued
+        );
+        assert_eq!(
+            draft.edit_click(DVec2::new(10.0, 0.0), None, &entities),
+            EditOutcome::Continued
+        );
+        match draft.edit_click(DVec2::new(15.0, 5.0), None, &entities) {
+            EditOutcome::Applied {
+                replace: Some((0, SketchEntity::Polyline(pts))),
+                add,
+            } => {
+                assert!(add.is_empty());
+                assert_eq!(pts.len(), 2);
+                assert_v(pts[0], [5.0, 5.0]);
+                assert_v(pts[1], [15.0, 5.0]);
+            }
+            other => panic!("应为替换后的平移折线，实得 {other:?}"),
+        }
+        // 交互完成草稿复位（编辑器据以重启同工具）。
+        assert_eq!(draft, SketchDraft::None);
+        // 拾取落空 → Ignored。
+        let mut draft = SketchDraft::new(SketchTool::Move);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, None, &entities),
+            EditOutcome::Ignored
+        );
+    }
+
+    /// 复制：三击后草稿不复位（同一基点连续放置多份）。
+    #[test]
+    fn edit_copy_places_repeated_copies() {
+        let entities = vec![SketchEntity::Polyline(vec![
+            DVec2::ZERO,
+            DVec2::new(10.0, 0.0),
+        ])];
+        let mut draft = SketchDraft::new(SketchTool::Copy);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        draft.edit_click(DVec2::ZERO, None, &entities); // 基点 = 原点
+        // 第一份：目标点 (15, 0) → 副本 [(15,0),(25,0)]（基点平移到目标点）。
+        match draft.edit_click(DVec2::new(15.0, 0.0), None, &entities) {
+            EditOutcome::Applied { replace, add } => {
+                assert!(replace.is_none(), "复制是追加不是替换");
+                assert_eq!(add.len(), 1);
+                match &add[0] {
+                    SketchEntity::Polyline(pts) => {
+                        assert_v(pts[0], [15.0, 0.0]);
+                        assert_v(pts[1], [25.0, 0.0]);
+                    }
+                    other => panic!("应为折线副本，实得 {other:?}"),
+                }
+            }
+            other => panic!("应为 Applied，实得 {other:?}"),
+        }
+        // 草稿不复位：同一基点直接放第二份。
+        assert!(matches!(
+            draft,
+            SketchDraft::Copy {
+                target: Some(0),
+                base: Some(_),
+            }
+        ));
+        match draft.edit_click(DVec2::new(15.0, 10.0), None, &entities) {
+            EditOutcome::Applied { add, .. } => match &add[0] {
+                SketchEntity::Polyline(pts) => {
+                    assert_v(pts[0], [15.0, 10.0]);
+                    assert_v(pts[1], [25.0, 10.0]);
+                }
+                other => panic!("第二份应为折线副本，实得 {other:?}"),
+            },
+            other => panic!("第二份应为 Applied，实得 {other:?}"),
+        }
+    }
+
+    /// 旋转：四击（拾取 → 基点 → 参考点 → 目标点）→ 绕基点旋转参考差角。
+    #[test]
+    fn edit_rotate_by_reference_angle() {
+        let entities = vec![SketchEntity::Polyline(vec![
+            DVec2::new(10.0, 0.0),
+            DVec2::new(20.0, 0.0),
+        ])];
+        let mut draft = SketchDraft::new(SketchTool::Rotate);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        draft.edit_click(DVec2::ZERO, None, &entities); // 基点 = 原点
+        draft.edit_click(DVec2::new(10.0, 0.0), None, &entities); // 参考点
+        // 目标点 (0,10)：转角 = atan2(10,0) − 0 = 90°。
+        match draft.edit_click(DVec2::new(0.0, 10.0), None, &entities) {
+            EditOutcome::Applied {
+                replace: Some((0, SketchEntity::Polyline(pts))),
+                ..
+            } => {
+                assert_v(pts[0], [0.0, 10.0]);
+                assert_v(pts[1], [0.0, 20.0]);
+            }
+            other => panic!("应为替换后的旋转折线，实得 {other:?}"),
+        }
+        // 参考点与基点重合 → Ignored（草稿保持等下一击）。
+        let mut draft = SketchDraft::new(SketchTool::Rotate);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        draft.edit_click(DVec2::ZERO, None, &entities);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, None, &entities),
+            EditOutcome::Ignored
+        );
+    }
+
+    /// 缩放：四击 → 绕基点等比缩放（圆半径同乘）。
+    #[test]
+    fn edit_scale_doubles_geometry() {
+        let entities = vec![SketchEntity::Circle {
+            center: DVec2::new(10.0, 0.0),
+            radius: 5.0,
+        }];
+        let mut draft = SketchDraft::new(SketchTool::Scale);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        draft.edit_click(DVec2::ZERO, None, &entities); // 基点 = 原点
+        draft.edit_click(DVec2::new(10.0, 0.0), None, &entities); // 参考距 10
+        match draft.edit_click(DVec2::new(20.0, 0.0), None, &entities) {
+            EditOutcome::Applied {
+                replace: Some((0, SketchEntity::Circle { center, radius, .. })),
+                ..
+            } => {
+                assert_v(center, [20.0, 0.0]);
+                assert!((radius - 10.0).abs() < 1e-9, "半径应同乘 2×");
+            }
+            other => panic!("应为替换后的缩放圆，实得 {other:?}"),
+        }
+    }
+
+    /// 镜像：三击 → 顶点关于直线反射，弧起终点互换（翻手性）后 ccw 归一。
+    #[test]
+    fn edit_mirror_flips_arc_handedness() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let entities = vec![SketchEntity::Arc {
+            center: DVec2::ZERO,
+            radius: 10.0,
+            start_angle: 0.0,
+            end_angle: FRAC_PI_2,
+        }];
+        let mut draft = SketchDraft::new(SketchTool::Mirror);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        draft.edit_click(DVec2::ZERO, None, &entities); // 镜像线第一点
+        // 镜像线 = y 轴（第二点 (0,10)）：起角 0 → π、终角 π/2 不变，
+        // 翻手性互换后 ccw 归一 → (π/2, π)。
+        match draft.edit_click(DVec2::new(0.0, 10.0), None, &entities) {
+            EditOutcome::Applied {
+                replace:
+                    Some((
+                        0,
+                        SketchEntity::Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            end_angle,
+                        },
+                    )),
+                add,
+            } => {
+                assert!(add.is_empty());
+                assert_v(center, [0.0, 0.0]);
+                assert!((radius - 10.0).abs() < 1e-9);
+                assert!((start_angle - FRAC_PI_2).abs() < 1e-9, "起终点应互换");
+                assert!((end_angle - PI).abs() < 1e-9);
+            }
+            other => panic!("应为替换后的反向弧，实得 {other:?}"),
+        }
+        assert_eq!(draft, SketchDraft::None);
+        // 镜像线退化（两点重合）→ Ignored。
+        let mut draft = SketchDraft::new(SketchTool::Mirror);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        draft.edit_click(DVec2::ZERO, None, &entities);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, None, &entities),
+            EditOutcome::Ignored
+        );
+    }
+
+    /// 椭圆变换探针：旋转随主轴角度、缩放同乘长短轴（探针点还原）。
+    #[test]
+    fn transform_ellipse_probe_keeps_shape() {
+        use std::f64::consts::FRAC_PI_2;
+        let e = SketchEntity::Ellipse {
+            center: DVec2::new(10.0, 0.0),
+            major: 10.0,
+            minor: 4.0,
+            major_angle: 0.0,
+        };
+        // 旋转 90°：主轴角度随转，长短轴不变。
+        match rotate_entity(&e, DVec2::ZERO, FRAC_PI_2) {
+            SketchEntity::Ellipse {
+                center,
+                major,
+                minor,
+                major_angle,
+            } => {
+                assert_v(center, [0.0, 10.0]);
+                assert!((major - 10.0).abs() < 1e-9);
+                assert!((minor - 4.0).abs() < 1e-9);
+                assert!((major_angle - FRAC_PI_2).abs() < 1e-9);
+            }
+            other => panic!("应为旋转后椭圆，实得 {other:?}"),
+        }
+        // 缩放 2×：长短轴同乘，角度不变。
+        match scale_entity(&e, DVec2::ZERO, 2.0) {
+            SketchEntity::Ellipse {
+                center,
+                major,
+                minor,
+                major_angle,
+            } => {
+                assert_v(center, [20.0, 0.0]);
+                assert!((major - 20.0).abs() < 1e-9);
+                assert!((minor - 8.0).abs() < 1e-9);
+                assert!(major_angle.abs() < 1e-9);
+            }
+            other => panic!("应为缩放后椭圆，实得 {other:?}"),
+        }
+    }
+
+    /// 偏移三态：线段左侧 / 圆向内 / 半径不足与不支持图元拒绝。
+    #[test]
+    fn edit_offset_segment_and_circle() {
+        // 线段：正 = a→b 左侧（y+）。
+        let seg = SketchEntity::Polyline(vec![DVec2::ZERO, DVec2::new(10.0, 0.0)]);
+        match offset_entity(&seg, 5.0) {
+            Ok(SketchEntity::Polyline(pts)) => {
+                assert_v(pts[0], [0.0, 5.0]);
+                assert_v(pts[1], [10.0, 5.0]);
+            }
+            other => panic!("应为左偏线段，实得 {other:?}"),
+        }
+        // 圆：负 = 向内偏。
+        let circle = SketchEntity::Circle {
+            center: DVec2::ZERO,
+            radius: 10.0,
+        };
+        match offset_entity(&circle, -3.0) {
+            Ok(SketchEntity::Circle { center, radius }) => {
+                assert_v(center, [0.0, 0.0]);
+                assert!((radius - 7.0).abs() < 1e-9);
+            }
+            other => panic!("应为同心内偏圆，实得 {other:?}"),
+        }
+        // 圆：向内偏超出半径 → Err。
+        assert!(offset_entity(&circle, -12.0).is_err());
+        // 曲线 / 多段折线 → Err。
+        let curve = SketchEntity::Bezier(vec![vec![DVec2::ZERO, DVec2::new(10.0, 0.0)]]);
+        assert!(offset_entity(&curve, 1.0).is_err());
+        let multi = SketchEntity::Polyline(vec![
+            DVec2::ZERO,
+            DVec2::new(10.0, 0.0),
+            DVec2::new(10.0, 10.0),
+        ]);
+        assert!(offset_entity(&multi, 1.0).is_err());
+    }
+
+    /// 修剪：两击 → 保留单击侧（左 / 右两态）。
+    #[test]
+    fn edit_trim_keeps_clicked_side() {
+        let entities = vec![
+            SketchEntity::Polyline(vec![DVec2::new(5.0, -10.0), DVec2::new(5.0, 10.0)]),
+            SketchEntity::Polyline(vec![DVec2::ZERO, DVec2::new(10.0, 0.0)]),
+        ];
+        // 保留左段：被剪线段单击 (2,0)。
+        let mut draft = SketchDraft::new(SketchTool::Trim);
+        assert_eq!(
+            draft.edit_click(DVec2::new(5.0, 0.0), Some(0), &entities),
+            EditOutcome::Continued
+        );
+        match draft.edit_click(DVec2::new(2.0, 0.0), Some(1), &entities) {
+            EditOutcome::Applied {
+                replace: Some((1, SketchEntity::Polyline(pts))),
+                add,
+            } => {
+                assert!(add.is_empty());
+                assert_eq!(pts.len(), 2);
+                assert_v(pts[0], [0.0, 0.0]);
+                assert_v(pts[1], [5.0, 0.0]);
+            }
+            other => panic!("应为左段修剪结果，实得 {other:?}"),
+        }
+        assert_eq!(draft, SketchDraft::None);
+        // 保留右段：单击 (8,0)。
+        let mut draft = SketchDraft::new(SketchTool::Trim);
+        draft.edit_click(DVec2::new(5.0, 0.0), Some(0), &entities);
+        match draft.edit_click(DVec2::new(8.0, 0.0), Some(1), &entities) {
+            EditOutcome::Applied {
+                replace: Some((1, SketchEntity::Polyline(pts))),
+                ..
+            } => {
+                assert_v(pts[0], [5.0, 0.0]);
+                assert_v(pts[1], [10.0, 0.0]);
+            }
+            other => panic!("应为右段修剪结果，实得 {other:?}"),
+        }
+        // 无交点 → Failed。
+        let parallel = vec![
+            SketchEntity::Polyline(vec![DVec2::new(5.0, -10.0), DVec2::new(5.0, 10.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(20.0, 0.0), DVec2::new(30.0, 0.0)]),
+        ];
+        let mut draft = SketchDraft::new(SketchTool::Trim);
+        draft.edit_click(DVec2::new(5.0, 0.0), Some(0), &parallel);
+        assert!(matches!(
+            draft.edit_click(DVec2::new(25.0, 0.0), Some(1), &parallel),
+            EditOutcome::Failed(_)
+        ));
+    }
+
+    /// 打断：段内点断两段（replace + add）；端点 Failed；落空 Ignored。
+    #[test]
+    fn edit_break_splits_at_inner_point() {
+        let entities = vec![SketchEntity::Polyline(vec![
+            DVec2::ZERO,
+            DVec2::new(10.0, 0.0),
+        ])];
+        let mut draft = SketchDraft::new(SketchTool::Break);
+        match draft.edit_click(DVec2::new(4.0, 0.0), Some(0), &entities) {
+            EditOutcome::Applied {
+                replace: Some((0, SketchEntity::Polyline(first))),
+                add,
+            } => {
+                assert_eq!(add.len(), 1);
+                assert_v(first[0], [0.0, 0.0]);
+                assert_v(first[1], [4.0, 0.0]);
+                match &add[0] {
+                    SketchEntity::Polyline(second) => {
+                        assert_v(second[0], [4.0, 0.0]);
+                        assert_v(second[1], [10.0, 0.0]);
+                    }
+                    other => panic!("第二段应为折线，实得 {other:?}"),
+                }
+            }
+            other => panic!("应为打断两段结果，实得 {other:?}"),
+        }
+        // 端点（含段外投影到端点）→ Failed。
+        let mut draft = SketchDraft::new(SketchTool::Break);
+        assert!(matches!(
+            draft.edit_click(DVec2::ZERO, Some(0), &entities),
+            EditOutcome::Failed(_)
+        ));
+        // 落空拾取 / 非单段折线 → Ignored。
+        assert_eq!(
+            draft.edit_click(DVec2::new(4.0, 0.0), None, &entities),
+            EditOutcome::Ignored
+        );
+    }
+
+    /// 线性 / 对齐标注：三击 → DimLinear（linear 真 / 假）；重合点击 Ignored。
+    #[test]
+    fn edit_dim_linear_and_align() {
+        let entities: Vec<SketchEntity> = Vec::new();
+        // 线性标注（linear = true）。
+        let mut draft = SketchDraft::new(SketchTool::DimLinear);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, None, &entities),
+            EditOutcome::Continued
+        );
+        assert_eq!(
+            draft.edit_click(DVec2::new(10.0, 0.0), None, &entities),
+            EditOutcome::Continued
+        );
+        match draft.edit_click(DVec2::new(5.0, 8.0), None, &entities) {
+            EditOutcome::Applied { replace, add } => {
+                assert!(replace.is_none());
+                assert_eq!(add.len(), 1);
+                match &add[0] {
+                    SketchEntity::DimLinear {
+                        from,
+                        to,
+                        pos,
+                        linear,
+                    } => {
+                        assert_v(*from, [0.0, 0.0]);
+                        assert_v(*to, [10.0, 0.0]);
+                        assert_v(*pos, [5.0, 8.0]);
+                        assert!(*linear, "线性标注 linear = true");
+                    }
+                    other => panic!("应为线性标注，实得 {other:?}"),
+                }
+            }
+            other => panic!("应为 Applied，实得 {other:?}"),
+        }
+        assert_eq!(draft, SketchDraft::None);
+        // 对齐标注（linear = false）。
+        let mut draft = SketchDraft::new(SketchTool::DimAlign);
+        draft.edit_click(DVec2::ZERO, None, &entities);
+        draft.edit_click(DVec2::new(10.0, 0.0), None, &entities);
+        match draft.edit_click(DVec2::new(5.0, 8.0), None, &entities) {
+            EditOutcome::Applied { add, .. } => match &add[0] {
+                SketchEntity::DimLinear { linear, .. } => assert!(!*linear),
+                other => panic!("应为对齐标注，实得 {other:?}"),
+            },
+            other => panic!("对齐标注应为 Applied，实得 {other:?}"),
+        }
+        // 零长度尺寸（重合点击）→ Ignored。
+        let mut draft = SketchDraft::new(SketchTool::DimLinear);
+        draft.edit_click(DVec2::ZERO, None, &entities);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, None, &entities),
+            EditOutcome::Ignored
+        );
+    }
+
+    /// 半径标注：拾圆捕获 (center, radius) → 位置定标注点；非圆 Ignored。
+    #[test]
+    fn edit_dim_radius_captures_circle() {
+        let entities = vec![SketchEntity::Circle {
+            center: DVec2::ZERO,
+            radius: 7.0,
+        }];
+        let mut draft = SketchDraft::new(SketchTool::DimRadius);
+        assert_eq!(
+            draft.edit_click(DVec2::new(7.0, 0.0), Some(0), &entities),
+            EditOutcome::Continued
+        );
+        assert!(matches!(
+            draft,
+            SketchDraft::DimRadius {
+                circle: Some((_, r)),
+            } if (r - 7.0).abs() < 1e-9
+        ));
+        match draft.edit_click(DVec2::new(10.0, 5.0), None, &entities) {
+            EditOutcome::Applied { replace, add } => {
+                assert!(replace.is_none());
+                match &add[0] {
+                    SketchEntity::DimRadius {
+                        center,
+                        radius,
+                        pos,
+                    } => {
+                        assert_v(*center, [0.0, 0.0]);
+                        assert!((radius - 7.0).abs() < 1e-9);
+                        assert_v(*pos, [10.0, 5.0]);
+                    }
+                    other => panic!("应为半径标注，实得 {other:?}"),
+                }
+            }
+            other => panic!("应为 Applied，实得 {other:?}"),
+        }
+        // 非圆拾取 → Ignored（草稿保持等下一击）。
+        let lines = vec![SketchEntity::Polyline(vec![
+            DVec2::ZERO,
+            DVec2::new(10.0, 0.0),
+        ])];
+        let mut draft = SketchDraft::new(SketchTool::DimRadius);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, Some(0), &lines),
+            EditOutcome::Ignored
+        );
+    }
+
+    /// 角度标注：两线段交点定角顶点、远端定臂方向 → 位置定角弧；平行 Failed。
+    #[test]
+    fn edit_dim_angle_needs_intersection() {
+        let entities = vec![
+            SketchEntity::Polyline(vec![DVec2::ZERO, DVec2::new(20.0, 0.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(5.0, -5.0), DVec2::new(5.0, 10.0)]),
+        ];
+        let mut draft = SketchDraft::new(SketchTool::DimAngle);
+        assert_eq!(
+            draft.edit_click(DVec2::new(10.0, 0.0), Some(0), &entities),
+            EditOutcome::Continued
+        );
+        assert_eq!(
+            draft.edit_click(DVec2::new(5.0, 5.0), Some(1), &entities),
+            EditOutcome::Continued
+        );
+        match draft.edit_click(DVec2::new(12.0, 4.0), None, &entities) {
+            EditOutcome::Applied { replace, add } => {
+                assert!(replace.is_none());
+                assert_eq!(add.len(), 1);
+                match &add[0] {
+                    SketchEntity::DimAngle {
+                        vertex,
+                        arm1,
+                        arm2,
+                        pos,
+                    } => {
+                        assert_v(*vertex, [5.0, 0.0]);
+                        assert_v(*arm1, [20.0, 0.0]);
+                        assert_v(*arm2, [5.0, 10.0]);
+                        assert_v(*pos, [12.0, 4.0]);
+                    }
+                    other => panic!("应为角度标注，实得 {other:?}"),
+                }
+            }
+            other => panic!("应为 Applied，实得 {other:?}"),
+        }
+        // 平行线段 → Failed。
+        let parallel = vec![
+            SketchEntity::Polyline(vec![DVec2::ZERO, DVec2::new(10.0, 0.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(0.0, 5.0), DVec2::new(10.0, 5.0)]),
+        ];
+        let mut draft = SketchDraft::new(SketchTool::DimAngle);
+        draft.edit_click(DVec2::ZERO, Some(0), &parallel);
+        draft.edit_click(DVec2::new(5.0, 5.0), Some(1), &parallel);
+        assert!(matches!(
+            draft.edit_click(DVec2::new(5.0, 2.0), None, &parallel),
+            EditOutcome::Failed(_)
+        ));
+    }
+
+    /// 高亮跟踪：编辑草稿按阶段返回已选图元下标（画布拾取反馈复用）。
+    #[test]
+    fn edit_highlight_tracks_pick_stage() {
+        let entities = vec![
+            SketchEntity::Polyline(vec![DVec2::ZERO, DVec2::new(10.0, 0.0)]),
+            SketchEntity::Circle {
+                center: DVec2::ZERO,
+                radius: 5.0,
+            },
+        ];
+        // Move：未拾取 → None；拾取后 → 下标。
+        let mut draft = SketchDraft::new(SketchTool::Move);
+        assert_eq!(draft.edit_highlight(), None);
+        draft.edit_click(DVec2::ZERO, Some(0), &entities);
+        assert_eq!(draft.edit_highlight(), Some(0));
+        // Trim：边界必须是单段折线——拾取圆 → Ignored、不高亮。
+        let mut draft = SketchDraft::new(SketchTool::Trim);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, Some(1), &entities),
+            EditOutcome::Ignored
+        );
+        assert_eq!(draft.edit_highlight(), None);
+        // DimAngle：第一条线段拾取后高亮。
+        let mut draft = SketchDraft::new(SketchTool::DimAngle);
+        assert_eq!(
+            draft.edit_click(DVec2::ZERO, Some(0), &entities),
+            EditOutcome::Continued
+        );
+        assert_eq!(draft.edit_highlight(), Some(0));
+        // 圆角草稿：高亮第一条线段（画布侧统一走 edit_highlight）。
+        let mut draft = SketchDraft::new(SketchTool::Fillet);
+        draft.pick_corner(Some(0));
+        assert_eq!(draft.edit_highlight(), Some(0));
     }
 }

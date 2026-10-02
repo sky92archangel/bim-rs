@@ -567,8 +567,12 @@ impl GeometryService {
                             .collect()
                     }
                 }
-                // 辅助图元：不进 wire（组装跳过，0 条边）。
-                SketchEntity::Point(_) | SketchEntity::AuxLine { .. } => Ok(vec![]),
+                // 辅助图元与显示型标注：不进 wire（组装跳过，0 条边）。
+                SketchEntity::Point(_)
+                | SketchEntity::AuxLine { .. }
+                | SketchEntity::DimLinear { .. }
+                | SketchEntity::DimRadius { .. }
+                | SketchEntity::DimAngle { .. } => Ok(vec![]),
                 SketchEntity::Circle { center, radius } => self
                     .kernel
                     .make_circle_edge(center.x, center.y, 0.0, 0.0, 0.0, 1.0, *radius)

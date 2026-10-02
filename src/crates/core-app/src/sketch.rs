@@ -82,6 +82,43 @@ pub enum SketchEntity {
         /// true = 射线（from 起点 → to 方向），false = 构造线（无限延长）
         ray: bool,
     },
+    /// 显示型线性 / 对齐标注（G4-M17）：**不进 wire、不进封闭检查**。
+    ///
+    /// - `linear = true`：线性——测 `from`→`to` 的轴对齐增量（|dx| ≥ |dy| 取 dx
+    ///   否则 dy），尺寸线过 `pos` 轴对齐；
+    /// - `linear = false`：对齐——测真实距离，尺寸线平行 `from`→`to` 且过 `pos`。
+    DimLinear {
+        /// 测量起点
+        from: DVec2,
+        /// 测量终点
+        to: DVec2,
+        /// 标注放置位置（尺寸线经过）
+        pos: DVec2,
+        /// true = 线性（轴对齐增量），false = 对齐（真实距离）
+        linear: bool,
+    },
+    /// 显示型半径标注（G4-M17）：**不进 wire**；`center`/`radius` 完成时从圆
+    /// 图元捕获（此后独立于圆——圆被删/改标注不随动，P0 显示型口径）。
+    DimRadius {
+        /// 被标圆圆心
+        center: DVec2,
+        /// 被标圆半径
+        radius: f64,
+        /// 标注放置位置（引线终点 + 文字位）
+        pos: DVec2,
+    },
+    /// 显示型角度标注（G4-M17）：**不进 wire**；`vertex` 为两线段交点，
+    /// `arm1`/`arm2` 是两臂方向点（交点两侧保留端），角弧半径由 `pos` 定。
+    DimAngle {
+        /// 角顶点（两线段交点）
+        vertex: DVec2,
+        /// 第一臂方向点
+        arm1: DVec2,
+        /// 第二臂方向点
+        arm2: DVec2,
+        /// 标注放置位置（角弧经过 + 文字位）
+        pos: DVec2,
+    },
 }
 
 /// 圆弧角度归一：终角 < 起角 → 终角 + 2π（ccw 正向扫掠区间）。

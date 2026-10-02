@@ -24,10 +24,14 @@ use glam::DVec2;
 
 use core_app::{CoreSession, SketchEntity};
 
-use crate::sketch_geom::{bezier_sample_polyline, catmull_rom_to_bezier, circle_through_three};
+use crate::sketch_geom::{
+    bezier_sample_polyline, catmull_rom_to_bezier, circle_through_three, segment_intersection,
+};
 use crate::sketch_tool::{
-    ClickOutcome, CornerPick, DEFAULT_POLYGON_SIDES, SketchDraft, SketchTool, apply_chamfer,
-    apply_fillet, orthogonalize, pick_corner_segment, polygon_vertices, snap_entities, snap_grid,
+    ClickOutcome, CornerPick, DEFAULT_POLYGON_SIDES, DRAWING_TOOLS, EDITING_TOOLS, EditOutcome,
+    SketchDraft, SketchTool, apply_chamfer, apply_fillet, mirror_entity, offset_entity,
+    orthogonalize, pick_corner_segment, polygon_vertices, rotate_entity, scale_entity,
+    snap_entities, snap_grid, translate_entity,
 };
 
 /// 网格捕捉步长（mm）。
@@ -41,6 +45,10 @@ const SNAP_TOL_PX: f64 = 8.0;
 /// 滚轮缩放的上下限（px/mm）。
 const SCALE_MIN: f64 = 0.05;
 const SCALE_MAX: f64 = 50.0;
+/// 尺寸标注底色（显示型标注与几何图元的区分色）。
+const DIM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x50, 0xb8, 0xd8);
+/// 标注数字字号（px）。
+const DIM_FONT_SIZE: f32 = 12.0;
 
 /// 草图编辑器状态（BimApp 字段：`Some` = 编辑器开着）。
 pub struct SketchEditorState {
@@ -70,6 +78,8 @@ pub struct SketchEditorState {
     pub fillet_radius: f64,
     /// 倒角距离（mm，倒角工具参数行）
     pub chamfer_distance: f64,
+    /// 偏移距离（mm，偏移工具参数行；正 = 左侧 / 向外）
+    pub offset_distance: f64,
 }
 
 impl SketchEditorState {
@@ -90,6 +100,7 @@ impl SketchEditorState {
             polygon_sides: DEFAULT_POLYGON_SIDES,
             fillet_radius: 10.0,
             chamfer_distance: 10.0,
+            offset_distance: 10.0,
         }
     }
 
@@ -162,9 +173,22 @@ pub fn run_editor(
         .default_width(860.0)
         .default_height(620.0)
         .show(ctx, |ui| {
-            // —— 工具行（15 工具，换行显示）——
+            // —— 工具行一（绘制类 15，换行显示）——
             ui.horizontal_wrapped(|ui| {
-                for tool in SketchTool::ALL {
+                for tool in DRAWING_TOOLS {
+                    if ui
+                        .selectable_label(st.tool == tool, tool.label())
+                        .clicked()
+                    {
+                        st.tool = tool;
+                        st.draft = st.fresh_draft();
+                        st.selected = None;
+                    }
+                }
+            });
+            // —— 工具行二（编辑 + 标注类 12，换行显示）——
+            ui.horizontal_wrapped(|ui| {
+                for tool in EDITING_TOOLS {
                     if ui
                         .selectable_label(st.tool == tool, tool.label())
                         .clicked()
@@ -233,6 +257,15 @@ pub fn run_editor(
                         ui.add(
                             egui::DragValue::new(&mut st.chamfer_distance)
                                 .range(0.01..=100000.0)
+                                .speed(1.0),
+                        );
+                    }
+                    SketchTool::Offset => {
+                        ui.separator();
+                        ui.label("偏移距离");
+                        ui.add(
+                            egui::DragValue::new(&mut st.offset_distance)
+                                .range(-100000.0..=100000.0)
                                 .speed(1.0),
                         );
                     }
@@ -317,6 +350,47 @@ fn apply_event(st: &mut SketchEditorState, logs: &mut Vec<String>, ev: CanvasEve
                         Err(e) => logs.push(format!("✗ {label} 失败：{e}")),
                     }
                     st.draft = st.fresh_draft();
+                }
+            } else if st.draft.is_editing() {
+                let tol = SNAP_TOL_PX / st.view_scale;
+                let picked = pick_entity_at(&st.entities, p, tol);
+                if matches!(st.draft, SketchDraft::Offset) {
+                    // 偏移：单击拾取即按参数行距离成新图元（原图元不动）。
+                    if let Some(i) = picked {
+                        let label = st.tool.label();
+                        match offset_entity(&st.entities[i], st.offset_distance) {
+                            Ok(e) => {
+                                st.push_entity(e);
+                                logs.push(format!("✓ {label} 完成"));
+                            }
+                            Err(e) => logs.push(format!("✗ {label} 失败：{e}")),
+                        }
+                    }
+                } else {
+                    // 其余编辑 / 标注：统一点击推进（拾取阶段用通用拾取）。
+                    match st.draft.edit_click(p, picked, &st.entities) {
+                        EditOutcome::Applied { replace, add } => {
+                            if let Some((i, e)) = replace
+                                && i < st.entities.len()
+                            {
+                                st.entities[i] = e;
+                                st.undo.clear(); // 新动作使 redo 失效
+                                st.selected = None;
+                            }
+                            for e in add {
+                                st.push_entity(e);
+                            }
+                            // 交互完成草稿已复位为 None：重启同工具继续。
+                            if matches!(st.draft, SketchDraft::None) {
+                                st.draft = st.fresh_draft();
+                            }
+                        }
+                        EditOutcome::Failed(msg) => {
+                            logs.push(format!("✗ {} 失败：{msg}", st.tool.label()));
+                            st.draft = st.fresh_draft();
+                        }
+                        EditOutcome::Continued | EditOutcome::Ignored => {}
+                    }
                 }
             } else {
                 match st.draft.click(p) {
@@ -411,14 +485,20 @@ fn draw_canvas(st: &mut SketchEditorState, ui: &mut egui::Ui) -> CanvasEvent {
     // —— 网格 ——
     draw_grid_lines(&painter, &rect, st, &to_px);
 
-    // —— 已提交实体（选中高亮 + 圆角/倒角拾取高亮）——
-    let corner_pick = match &st.draft {
-        SketchDraft::Fillet { first, .. } | SketchDraft::Chamfer { first, .. } => *first,
-        _ => None,
-    };
+    // —— 已提交实体（选中高亮 + 编辑 / 标注拾取高亮）——
+    let edit_pick = st.draft.edit_highlight();
     for (i, e) in st.entities.iter().enumerate() {
-        let color = if st.selected == Some(i) || corner_pick == Some(i) {
+        let highlighted = st.selected == Some(i) || edit_pick == Some(i);
+        let color = if highlighted {
             egui::Color32::from_rgb(0xff, 0xd0, 0x40)
+        } else if matches!(
+            e,
+            SketchEntity::DimLinear { .. }
+                | SketchEntity::DimRadius { .. }
+                | SketchEntity::DimAngle { .. }
+        ) {
+            // 标注（显示型）：专属青蓝底色，与几何图元区分。
+            DIM_COLOR
         } else {
             egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)
         };
@@ -442,7 +522,7 @@ fn draw_canvas(st: &mut SketchEditorState, ui: &mut egui::Ui) -> CanvasEvent {
     }
 
     // —— 进行中预览 ——
-    draw_preview(&painter, &st.draft, mm, &to_px, scale);
+    draw_preview(&painter, &st.draft, &st.entities, mm, &to_px, scale);
 
     // —— 事件收集（Ctrl+单击 = 选中附近图元，不画）——
     let cmd = ui.input(|i| i.modifiers.command);
@@ -606,23 +686,196 @@ fn draw_entity(
                 egui::Shape::dashed_line(&[to_px(*from), to_px(*to)], stroke, 6.0_f32, 4.0_f32);
             painter.extend(shapes);
         }
+        SketchEntity::DimLinear {
+            from,
+            to,
+            pos,
+            linear,
+        } => {
+            draw_dim_linear(painter, to_px, *from, *to, *pos, *linear, color);
+        }
+        SketchEntity::DimRadius {
+            center,
+            radius,
+            pos,
+        } => {
+            draw_dim_radius(painter, to_px, *center, *radius, *pos, color);
+        }
+        SketchEntity::DimAngle {
+            vertex,
+            arm1,
+            arm2,
+            pos,
+        } => {
+            draw_dim_angle(painter, to_px, *vertex, *arm1, *arm2, *pos, color);
+        }
     }
 }
 
-/// 进行中预览（按工具阶段画锚点与橡皮筋）。
+/// 线性 / 对齐标注渲染（G4-M17 显示型）：尺寸线（线性为轴对齐过 pos、对齐
+/// 为平行 from→to 过 pos）+ 两端延长线 + 两端 45° tick + 距离数字。
+fn draw_dim_linear(
+    painter: &egui::Painter,
+    to_px: &dyn Fn(DVec2) -> egui::Pos2,
+    from: DVec2,
+    to: DVec2,
+    pos: DVec2,
+    linear: bool,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    let value = if linear {
+        // 轴对齐增量：|dx| ≥ |dy| 取 dx，否则 dy。
+        if (to.x - from.x).abs() >= (to.y - from.y).abs() {
+            to.x - from.x
+        } else {
+            to.y - from.y
+        }
+    } else {
+        (to - from).length()
+    };
+    let (p1, p2) = if linear {
+        if (to.x - from.x).abs() >= (to.y - from.y).abs() {
+            (DVec2::new(from.x, pos.y), DVec2::new(to.x, pos.y))
+        } else {
+            (DVec2::new(pos.x, from.y), DVec2::new(pos.x, to.y))
+        }
+    } else {
+        // 对齐：尺寸线平行 from→to、过 pos——两端点沿法向平移到尺寸线。
+        let d = to - from;
+        let len2 = d.length_squared();
+        if len2 <= f64::EPSILON {
+            (from, to)
+        } else {
+            let n = DVec2::new(-d.y, d.x) / len2.sqrt();
+            let off = n.dot(pos - from);
+            let shift = |q: DVec2| q + n * off;
+            (shift(from), shift(to))
+        }
+    };
+    // 延长线（几何点 → 尺寸线端点）。
+    painter.line_segment([to_px(from), to_px(p1)], stroke);
+    painter.line_segment([to_px(to), to_px(p2)], stroke);
+    // 尺寸线。
+    painter.line_segment([to_px(p1), to_px(p2)], stroke);
+    // 两端 45° tick（尺寸方向与左法向的角平分方向，屏面 4px）。
+    let qa = to_px(p1);
+    let qb = to_px(p2);
+    let d = qb - qa;
+    let len = d.length();
+    let dir = if len > 1e-6 { d / len } else { egui::Vec2::X };
+    let bisector = dir + egui::Vec2::new(-dir.y, dir.x);
+    let bis_len = bisector.length();
+    let bis = if bis_len > 1e-6 {
+        bisector / bis_len
+    } else {
+        egui::Vec2::new(1.0, 1.0)
+    };
+    for q in [qa, qb] {
+        let dv = bis * 4.0_f32;
+        painter.line_segment([q - dv, q + dv], stroke);
+    }
+    // 距离数字（尺寸线中点上方）。
+    let text = format!("{:.1}", value.abs());
+    let mid = qa + (qb - qa) * 0.5;
+    painter.text(
+        mid,
+        egui::Align2::CENTER_BOTTOM,
+        &text,
+        egui::FontId::proportional(DIM_FONT_SIZE),
+        color,
+    );
+}
+
+/// 半径标注渲染：引线（标注位置 → 圆周）+ R 数字。
+fn draw_dim_radius(
+    painter: &egui::Painter,
+    to_px: &dyn Fn(DVec2) -> egui::Pos2,
+    center: DVec2,
+    radius: f64,
+    pos: DVec2,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    // 引线：沿 pos−center 方向从标注位置指向圆周。
+    let dir = (pos - center).normalize_or_zero();
+    let rim = center + dir * radius;
+    painter.line_segment([to_px(pos), to_px(rim)], stroke);
+    // 数字：R + 半径（标注位置处）。
+    let text = format!("R{:.1}", radius);
+    painter.text(
+        to_px(pos),
+        egui::Align2::LEFT_CENTER,
+        &text,
+        egui::FontId::proportional(DIM_FONT_SIZE),
+        color,
+    );
+}
+
+/// 角度标注渲染：角弧（取含标注位置一侧）+ 度数数字。
+fn draw_dim_angle(
+    painter: &egui::Painter,
+    to_px: &dyn Fn(DVec2) -> egui::Pos2,
+    vertex: DVec2,
+    arm1: DVec2,
+    arm2: DVec2,
+    pos: DVec2,
+    color: egui::Color32,
+) {
+    const SEGMENTS: usize = 48;
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    // 角弧半径由标注位置定。
+    let r = (pos - vertex).length();
+    if r <= f64::EPSILON {
+        return;
+    }
+    let a1 = (arm1.y - vertex.y).atan2(arm1.x - vertex.x);
+    let a2 = (arm2.y - vertex.y).atan2(arm2.x - vertex.x);
+    let a_pos = (pos.y - vertex.y).atan2(pos.x - vertex.x);
+    // 角弧取含 pos 一侧：ccw 扫掠（a1→a2）中点与 pos 方向夹角 ≤ π 则取 ccw，
+    // 否则取 cw（从 a2 扫回 a1，扫角 = 2π − ccw 扫角）。
+    let span_ccw = (a2 - a1).rem_euclid(std::f64::consts::TAU);
+    let mid_off = (a_pos - (a1 + span_ccw * 0.5)).rem_euclid(std::f64::consts::TAU);
+    let (from_a, span) = if mid_off <= std::f64::consts::PI {
+        (a1, span_ccw)
+    } else {
+        (a2, std::f64::consts::TAU - span_ccw)
+    };
+    if span <= f64::EPSILON {
+        return;
+    }
+    let pts: Vec<egui::Pos2> = (0..=SEGMENTS)
+        .map(|i| {
+            let t = from_a + span * (i as f64) / (SEGMENTS as f64);
+            to_px(DVec2::new(vertex.x + r * t.cos(), vertex.y + r * t.sin()))
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, stroke));
+    // 度数（标注位置处）。
+    let text = format!("{:.1}°", span.to_degrees());
+    painter.text(
+        to_px(pos),
+        egui::Align2::CENTER_CENTER,
+        &text,
+        egui::FontId::proportional(DIM_FONT_SIZE),
+        color,
+    );
+}
+
+/// 进行中预览（按工具阶段画锚点与橡皮筋；编辑类画变换幽灵，标注画实时数值）。
 fn draw_preview(
     painter: &egui::Painter,
     draft: &SketchDraft,
+    entities: &[SketchEntity],
     cursor: DVec2,
     to_px: &dyn Fn(DVec2) -> egui::Pos2,
     scale: f64,
 ) {
-    let stroke = egui::Stroke::new(
-        ((scale * 0.6) as f32).clamp(1.0, 2.0),
-        egui::Color32::from_rgb(0x60, 0xa0, 0xff),
-    );
+    let preview_color = egui::Color32::from_rgb(0x60, 0xa0, 0xff);
+    let stroke = egui::Stroke::new(((scale * 0.6) as f32).clamp(1.0, 2.0), preview_color);
+    let gray = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x55, 0x60, 0x70));
     let dot = |p: DVec2| {
-        painter.circle_filled(to_px(p), 3.0, egui::Color32::from_rgb(0x60, 0xa0, 0xff));
+        painter.circle_filled(to_px(p), 3.0, preview_color);
     };
     match draft {
         SketchDraft::None => {}
@@ -789,8 +1042,131 @@ fn draw_preview(
                 painter.line_segment([to_px(*s), to_px(cursor)], stroke);
             }
         }
-        // 圆角 / 倒角：选图元高亮在画布实体层做（corner_pick），无橡皮筋预览。
+        // 圆角 / 倒角：选图元高亮在画布实体层做（edit_highlight），无橡皮筋预览。
         SketchDraft::Fillet { .. } | SketchDraft::Chamfer { .. } => {}
+        // —— 编辑 / 标注类预览（G4-M17）——
+        SketchDraft::Move { target, base } | SketchDraft::Copy { target, base } => {
+            if let (Some(i), Some(b)) = (*target, *base)
+                && let Some(e) = entities.get(i)
+            {
+                // 橡皮筋（基点 → 光标）+ 平移幽灵。
+                painter.line_segment([to_px(b), to_px(cursor)], stroke);
+                let ghost = translate_entity(e, cursor - b);
+                draw_entity(painter, &ghost, to_px, scale, preview_color);
+            }
+        }
+        SketchDraft::Rotate {
+            target,
+            base,
+            reference,
+        }
+        | SketchDraft::Scale {
+            target,
+            base,
+            reference,
+        } => {
+            if let (Some(i), Some(b)) = (*target, *base)
+                && let Some(e) = entities.get(i)
+            {
+                match *reference {
+                    None => {
+                        painter.line_segment([to_px(b), to_px(cursor)], stroke);
+                    }
+                    Some(r) => {
+                        // 参考线（灰）+ 当前角 / 比例橡皮筋 + 变换幽灵。
+                        painter.line_segment([to_px(b), to_px(r)], gray);
+                        painter.line_segment([to_px(b), to_px(cursor)], stroke);
+                        let is_rotate = matches!(draft, SketchDraft::Rotate { .. });
+                        let ghost = if is_rotate {
+                            let angle = (cursor - b).y.atan2((cursor - b).x)
+                                - (r - b).y.atan2((r - b).x);
+                            rotate_entity(e, b, angle)
+                        } else {
+                            let d_ref = (r - b).length();
+                            if d_ref <= f64::EPSILON || (cursor - b).length() <= f64::EPSILON {
+                                e.clone()
+                            } else {
+                                scale_entity(e, b, (cursor - b).length() / d_ref)
+                            }
+                        };
+                        draw_entity(painter, &ghost, to_px, scale, preview_color);
+                    }
+                }
+            }
+        }
+        SketchDraft::Mirror { target, first } => {
+            if let (Some(i), Some(f)) = (*target, *first)
+                && let Some(e) = entities.get(i)
+            {
+                // 镜像线（虚线）+ 镜像幽灵。
+                let shapes =
+                    egui::Shape::dashed_line(&[to_px(f), to_px(cursor)], stroke, 6.0_f32, 4.0_f32);
+                painter.extend(shapes);
+                let ghost = mirror_entity(e, f, cursor);
+                draw_entity(painter, &ghost, to_px, scale, preview_color);
+            }
+        }
+        // 偏移 / 打断：无状态单击即成，无预览（偏移高亮在实体层）。
+        SketchDraft::Offset | SketchDraft::Break => {}
+        // 修剪：边界高亮在实体层做。
+        SketchDraft::Trim { .. } => {}
+        SketchDraft::DimLinear { first, second } => match (*first, *second) {
+            (Some(f), None) => {
+                dot(f);
+                // 实时尺寸预览（to = pos = 光标）。
+                draw_dim_linear(painter, to_px, f, cursor, cursor, true, preview_color);
+            }
+            (Some(f), Some(s)) => {
+                dot(f);
+                dot(s);
+                painter.line_segment([to_px(s), to_px(cursor)], stroke);
+                // 尺寸线跟随光标放置。
+                draw_dim_linear(painter, to_px, f, s, cursor, true, preview_color);
+            }
+            _ => {}
+        },
+        SketchDraft::DimAlign { first, second } => match (*first, *second) {
+            (Some(f), None) => {
+                dot(f);
+                draw_dim_linear(painter, to_px, f, cursor, cursor, false, preview_color);
+            }
+            (Some(f), Some(s)) => {
+                dot(f);
+                dot(s);
+                painter.line_segment([to_px(s), to_px(cursor)], stroke);
+                draw_dim_linear(painter, to_px, f, s, cursor, false, preview_color);
+            }
+            _ => {}
+        },
+        SketchDraft::DimRadius { circle } => {
+            if let Some((c, r)) = *circle {
+                dot(c);
+                // 引线 + R 数字跟随光标。
+                draw_dim_radius(painter, to_px, c, r, cursor, preview_color);
+            }
+        }
+        SketchDraft::DimAngle { first, second } => {
+            if let (Some(i1), Some(i2)) = (*first, *second)
+                && let (Some(SketchEntity::Polyline(a)), Some(SketchEntity::Polyline(b))) =
+                    (entities.get(i1), entities.get(i2))
+                && a.len() == 2
+                && b.len() == 2
+                && let Some(v) = segment_intersection(a[0], a[1], b[0], b[1])
+            {
+                // 交点 + 两臂（远端）+ 光标定半径的实时角弧。
+                let arm1 = if v.distance(a[0]) >= v.distance(a[1]) {
+                    a[0]
+                } else {
+                    a[1]
+                };
+                let arm2 = if v.distance(b[0]) >= v.distance(b[1]) {
+                    b[0]
+                } else {
+                    b[1]
+                };
+                draw_dim_angle(painter, to_px, v, arm1, arm2, cursor, preview_color);
+            }
+        }
     }
 }
 
@@ -806,7 +1182,24 @@ fn anchor_of(draft: &SketchDraft) -> Option<DVec2> {
         SketchDraft::Arc3 { start, mid } => mid.or(*start),
         SketchDraft::Bezier { points } | SketchDraft::Spline { points } => points.last().copied(),
         SketchDraft::Construction { first } | SketchDraft::Ray { start: first } => *first,
-        SketchDraft::Point
+        // 编辑类：正交参照取最近放置的点（基点 / 参考点 / 镜像线点 / 标注点）。
+        SketchDraft::Move { base, .. } | SketchDraft::Copy { base, .. } => *base,
+        SketchDraft::Rotate {
+            base, reference, ..
+        }
+        | SketchDraft::Scale {
+            base, reference, ..
+        } => reference.or(*base),
+        SketchDraft::Mirror { first, .. } => *first,
+        SketchDraft::DimLinear { first, second } | SketchDraft::DimAlign { first, second } => {
+            second.or(*first)
+        }
+        SketchDraft::Offset
+        | SketchDraft::Trim { .. }
+        | SketchDraft::Break
+        | SketchDraft::DimRadius { .. }
+        | SketchDraft::DimAngle { .. }
+        | SketchDraft::Point
         | SketchDraft::Fillet { .. }
         | SketchDraft::Chamfer { .. }
         | SketchDraft::None => None,
@@ -851,6 +1244,10 @@ fn pick_entity_at(entities: &[SketchEntity], p: DVec2, tol: f64) -> Option<usize
             }
             SketchEntity::Point(v) => (*v - p).length(),
             SketchEntity::AuxLine { from, to, .. } => point_seg_distance(p, *from, *to),
+            // 标注（显示型）：按标注位置点（数字处）拾取。
+            SketchEntity::DimLinear { pos, .. }
+            | SketchEntity::DimRadius { pos, .. }
+            | SketchEntity::DimAngle { pos, .. } => (p - *pos).length(),
         };
         if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, i));

@@ -38,6 +38,9 @@ mod gui;
 #[cfg(feature = "gui")]
 mod theme;
 
+/// 草图纯几何算法库（G4-M14）：纯算法零依赖 GUI 状态，不门控 feature（默认腿可单测）。
+mod sketch_geom;
+
 #[cfg(feature = "gui")]
 fn main() -> ExitCode {
     match gui::run_gui() {

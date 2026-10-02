@@ -499,6 +499,27 @@ fn draw_entity(
                 .collect();
             painter.add(egui::Shape::line(pts, stroke));
         }
+        SketchEntity::Bezier(segments) => {
+            // G4-M16 P0：控制多边形折线显示（每段一条）；提交 2 换 de Casteljau
+            // 精确采样（bezier_sample）。
+            for seg in segments {
+                let pts: Vec<egui::Pos2> = seg.iter().map(|p| to_px(*p)).collect();
+                if pts.len() >= 2 {
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+        }
+        SketchEntity::Point(p) => {
+            // 辅助顶点：小实心圆点（不进 wire，只在画布可见）。
+            painter.circle_filled(to_px(*p), 3.0_f32, color);
+        }
+        SketchEntity::AuxLine { from, to, .. } => {
+            // 构造线 / 射线：虚线显示（epaint 的 dashed_line——egui crate 无此
+            // API，经 egui::Shape re-export 调用）。
+            let shapes =
+                egui::Shape::dashed_line(&[to_px(*from), to_px(*to)], stroke, 6.0_f32, 4.0_f32);
+            painter.extend(shapes);
+        }
     }
 }
 
@@ -634,6 +655,16 @@ fn pick_entity_at(entities: &[SketchEntity], p: DVec2, tol: f64) -> Option<usize
             SketchEntity::Ellipse { center, .. } | SketchEntity::Arc { center, .. } => {
                 (p - *center).length()
             }
+            SketchEntity::Bezier(segments) => {
+                // 控制点全量取最近（含段端点——端点即锚点，拾取价值最高）。
+                segments
+                    .iter()
+                    .flat_map(|seg| seg.iter())
+                    .map(|v| (*v - p).length())
+                    .fold(f64::INFINITY, f64::min)
+            }
+            SketchEntity::Point(v) => (*v - p).length(),
+            SketchEntity::AuxLine { from, to, .. } => point_seg_distance(p, *from, *to),
         };
         if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, i));

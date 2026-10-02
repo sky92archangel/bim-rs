@@ -488,10 +488,14 @@ impl GeometryService {
     /// 再原样抛错——绝不留半成品；`make_wire` 失败同样回滚。成功时中间边
     /// 句柄全部释放（句柄可丢，文本为真相——设计文档 3.3），只返回 wire。
     ///
+    /// 辅助图元（点 / 构造线 / 射线）**不进 wire**——组装时跳过；跳过后
+    /// 无任何有效边（全辅助草图）→ [`AppError::RecipeNotExecutable`]。
+    ///
     /// # Errors
-    /// 空图元表 / 折线顶点不足 2 → [`AppError::RecipeNotExecutable`]；
-    /// 图元非法（非有限坐标、非正半径、零法向、短半轴 > 长半轴）或内核
-    /// 构造失败 → [`AppError::Kernel`]。
+    /// 空图元表 / 折线顶点不足 2 / 全辅助无有效边 →
+    /// [`AppError::RecipeNotExecutable`]；
+    /// 图元非法（非有限坐标、非正半径、零法向、短半轴 > 长半轴、贝塞尔段
+    /// 控制点不足 2）或内核构造失败 → [`AppError::Kernel`]。
     pub fn build_sketch_wire(&mut self, entities: &[SketchEntity]) -> AppResult<ShapeHandle> {
         if entities.is_empty() {
             return Err(AppError::RecipeNotExecutable(
@@ -499,6 +503,13 @@ impl GeometryService {
             ));
         }
         let edges = self.assemble_sketch_edges(entities)?;
+        if edges.is_empty() {
+            return Err(AppError::RecipeNotExecutable(
+                "草图中无进 wire 的图元：点 / 构造线 / 射线是辅助图元（不进 wire），\
+                 至少需要 1 个几何图元"
+                    .to_string(),
+            ));
+        }
         let result = self.kernel.make_wire(&edges);
         self.kernel.release_many(&edges);
         result.map_err(Into::into)
@@ -506,7 +517,9 @@ impl GeometryService {
 
     /// 逐实体造草图解析边（[`Self::build_sketch_wire`] 的组装底座）。
     ///
-    /// 折线 1 个实体可产出多条直段（相邻顶点 windows(2)）；其余图元各产 1 条边。
+    /// 折线 1 个实体可产出多条直段（相邻顶点 windows(2)）；贝塞尔每段产 1 条边
+    /// （每段控制点序列 ≥ 2，一条 `make_bezier_edge` 直通）；其余图元各产 1 条边。
+    /// **辅助图元（点 / 构造线 / 射线）产 0 条边**——不进 wire。
     /// **任一图元失败即释放全部已建边**再原样抛错（回滚纪律：谁分配谁回收单点化）。
     fn assemble_sketch_edges(&mut self, entities: &[SketchEntity]) -> AppResult<Vec<ShapeHandle>> {
         let mut edges: Vec<ShapeHandle> = Vec::new();
@@ -529,6 +542,33 @@ impl GeometryService {
                             .collect()
                     }
                 }
+                SketchEntity::Bezier(segments) => {
+                    if segments.is_empty() {
+                        Err(AppError::RecipeNotExecutable(format!(
+                            "草图第 {i} 个图元（贝塞尔）至少需要 1 段，实得 0 段"
+                        )))
+                    } else {
+                        segments
+                            .iter()
+                            .enumerate()
+                            .map(|(j, seg)| {
+                                if seg.len() < 2 {
+                                    Err(AppError::RecipeNotExecutable(format!(
+                                        "草图第 {i} 个图元的第 {j} 段贝塞尔至少需要 \
+                                         2 个控制点，实得 {}",
+                                        seg.len()
+                                    )))
+                                } else {
+                                    let flat: Vec<[f64; 3]> =
+                                        seg.iter().map(|p| [p.x, p.y, 0.0]).collect();
+                                    self.kernel.make_bezier_edge(&flat).map_err(Into::into)
+                                }
+                            })
+                            .collect()
+                    }
+                }
+                // 辅助图元：不进 wire（组装跳过，0 条边）。
+                SketchEntity::Point(_) | SketchEntity::AuxLine { .. } => Ok(vec![]),
                 SketchEntity::Circle { center, radius } => self
                     .kernel
                     .make_circle_edge(center.x, center.y, 0.0, 0.0, 0.0, 1.0, *radius)
@@ -3729,5 +3769,125 @@ mod tests {
 
         // 三条失败路径都不留句柄（回滚干净）。
         assert_eq!(g.kernel().live_count(), 0, "失败应回滚全部已建边");
+    }
+
+    /// **M16 钉 1（贝塞尔分段直通）**：每段控制点序列各产一条
+    /// `make_bezier_edge`（mock 腿 EdgeSpline 记录首末控制点）——两段
+    /// （3 点 n 阶 + 4 点三次）合成 wire 后 bbox 覆盖两段端点、边数 = 2。
+    #[test]
+    fn sketch_bezier_builds_edges_per_segment() {
+        let bezier = SketchEntity::Bezier(vec![
+            vec![
+                DVec2::new(-50.0, 0.0),
+                DVec2::new(0.0, 0.0),
+                DVec2::new(50.0, 0.0),
+            ],
+            vec![
+                DVec2::new(50.0, 0.0),
+                DVec2::new(50.0, 50.0),
+                DVec2::new(0.0, 50.0),
+                DVec2::new(-50.0, 50.0),
+            ],
+        ]);
+        let mut g = GeometryService::with_mock_kernel();
+        let wire = g.build_sketch_wire(&[bezier]).expect("贝塞尔应建线成功");
+
+        let bb = g.kernel_mut().bounding_box(wire).unwrap();
+        assert!(
+            bb.min
+                .iter()
+                .zip([-50.0, 0.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire min 应为两段端点包络，实得 {bb:?}"
+        );
+        assert!(
+            bb.max
+                .iter()
+                .zip([50.0, 50.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-9),
+            "wire max 应为两段端点包络，实得 {bb:?}"
+        );
+        let text = g.kernel_mut().export_brep(wire).unwrap();
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let edge_count: f64 = tokens[10].parse().expect("rotation[0] 应为可解析数");
+        assert!(
+            (edge_count - 2.0).abs() < 1e-9,
+            "两段贝塞尔应产 2 条边，实得 {tokens:?}"
+        );
+    }
+
+    /// **M16 钉 2（辅助图元不进 wire）**：点 / 构造线 / 射线组装时跳过
+    /// （0 条边）——wire 只含折线的直段，边数与 bbox 不受辅助图元影响。
+    #[test]
+    fn sketch_aux_entities_are_skipped_in_wire() {
+        let entities = vec![
+            SketchEntity::Polyline(vec![DVec2::new(0.0, 0.0), DVec2::new(100.0, 0.0)]),
+            SketchEntity::Point(DVec2::new(200.0, 200.0)),
+            SketchEntity::AuxLine {
+                from: DVec2::new(0.0, 0.0),
+                to: DVec2::new(100.0, 100.0),
+                ray: false,
+            },
+        ];
+        let mut g = GeometryService::with_mock_kernel();
+        let wire = g.build_sketch_wire(&entities).expect("混合图元应建线成功");
+
+        let bb = g.kernel_mut().bounding_box(wire).unwrap();
+        let min_ok = bb
+            .min
+            .iter()
+            .zip([0.0, 0.0, 0.0])
+            .all(|(a, b)| (a - b).abs() < 1e-9);
+        let max_ok = bb
+            .max
+            .iter()
+            .zip([100.0, 0.0, 0.0])
+            .all(|(a, b)| (a - b).abs() < 1e-9);
+        assert!(
+            min_ok && max_ok,
+            "wire bbox 应只含折线直段（辅助图元不影响），实得 {bb:?}"
+        );
+        let text = g.kernel_mut().export_brep(wire).unwrap();
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let edge_count: f64 = tokens[10].parse().expect("rotation[0] 应为可解析数");
+        assert!(
+            (edge_count - 1.0).abs() < 1e-9,
+            "辅助图元应跳过：wire 只含折线 1 条直段，实得 {tokens:?}"
+        );
+    }
+
+    /// **M16 钉 3（全辅助草图响亮拒绝）**：只有点 / 构造线 / 射线时组装出
+    /// 0 条边——`build_sketch_wire` 前置检查拒绝（绝不把空 wire 交内核）。
+    #[test]
+    fn sketch_aux_only_wire_is_rejected() {
+        let entities = vec![
+            SketchEntity::Point(DVec2::new(10.0, 10.0)),
+            SketchEntity::AuxLine {
+                from: DVec2::ZERO,
+                to: DVec2::new(50.0, 0.0),
+                ray: true,
+            },
+        ];
+        let mut g = GeometryService::with_mock_kernel();
+        let got = g.build_sketch_wire(&entities);
+        assert!(
+            matches!(&got, Err(AppError::RecipeNotExecutable(m)) if m.contains("辅助")),
+            "全辅助草图应响亮拒绝，实得 {got:?}"
+        );
+        assert_eq!(g.kernel().live_count(), 0, "拒绝路径不留句柄");
+    }
+
+    /// **M16 钉 4（贝塞尔段控制点不足 2 响亮拒绝）**：单控制点段不是合法
+    /// 贝塞尔边——组装层拒绝并回滚（内核层 N≥2 校验的前置兜底）。
+    #[test]
+    fn sketch_bezier_rejects_segment_with_fewer_than_two_controls() {
+        let bezier = SketchEntity::Bezier(vec![vec![DVec2::new(0.0, 0.0)]]);
+        let mut g = GeometryService::with_mock_kernel();
+        let got = g.build_sketch_wire(&[bezier]);
+        assert!(
+            matches!(&got, Err(AppError::RecipeNotExecutable(m)) if m.contains("2 个控制点")),
+            "不足 2 控制点的贝塞尔段应响亮拒绝，实得 {got:?}"
+        );
+        assert_eq!(g.kernel().live_count(), 0, "拒绝路径不留句柄");
     }
 }

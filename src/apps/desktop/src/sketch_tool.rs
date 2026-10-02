@@ -319,6 +319,19 @@ pub fn snap_entities(entities: &[SketchEntity], p: DVec2, tol: f64) -> Option<DV
                     consider((w[0] + w[1]) / 2.0);
                 }
             }
+            SketchEntity::Bezier(segments) => {
+                // 控制点全量（含段端点——端点即锚点，吸附价值最高）。
+                for seg in segments {
+                    for p in seg {
+                        consider(*p);
+                    }
+                }
+            }
+            SketchEntity::Point(p) => consider(*p),
+            SketchEntity::AuxLine { from, to, .. } => {
+                consider(*from);
+                consider(*to);
+            }
             SketchEntity::Circle { center, radius } => {
                 consider(*center);
                 consider(*center + DVec2::new(*radius, 0.0));

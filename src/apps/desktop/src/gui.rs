@@ -394,6 +394,8 @@ struct BimApp {
     op_form: Option<OpForm>,
     /// 副选构件（G3：布尔 / 扫掠类第二输入；元素列表 / 视口 Ctrl+单击设置）
     secondary: Option<ElementId>,
+    /// 草图编辑器状态（G4-M15：Some = 草图浮窗开着；三入口共用一个编辑器）
+    sketch: Option<crate::sketch_editor::SketchEditorState>,
 }
 
 /// 原生算子参数表单状态（G3：确认时换算成 PropertyMap → build/modify/combine_native）。
@@ -556,6 +558,7 @@ impl BimApp {
             show_logs: true,
             op_form: None,
             secondary: None,
+            sketch: None,
         })
     }
 
@@ -609,6 +612,7 @@ impl BimApp {
             show_logs: true,
             op_form: None,
             secondary: None,
+            sketch: None,
         })
     }
 
@@ -1110,6 +1114,25 @@ impl BimApp {
                 }
             }
             ui.separator();
+            // —— 草图三入口（G4-M15：拉伸 / 旋转扫掠 / 放样共用一个编辑器；
+            //    M18 接特征链路后按入口预填特征参数）——
+            for (name, icon) in [
+                ("拉伸草图", ph::FRAME_CORNERS),
+                ("旋转扫掠草图", ph::PATH),
+                ("放样草图", ph::SHAPES),
+            ] {
+                if ui
+                    .button(format!("{icon} {name}"))
+                    .on_hover_text(format!("打开草图编辑器（{name}）"))
+                    .clicked()
+                {
+                    // 窗口已开时不重置（避免误点丢草稿）。
+                    if self.sketch.is_none() {
+                        self.sketch = Some(crate::sketch_editor::SketchEditorState::new(name));
+                    }
+                }
+            }
+            ui.separator();
             // —— 性能基线（M12：日志可见，不写死阈值）——
             if ui
                 .button(format!("{} 基线", ph::TIMER))
@@ -1405,6 +1428,30 @@ impl BimApp {
         // M12 增量重建：只网格化新建的形状。
         self.dirty_shapes = Some([shape].into_iter().collect());
         self.fit_pending = true;
+    }
+
+    /// 草图编辑器浮窗（G4-M15）：take 状态机跑一帧，按结果放回 / 收尾 / 丢弃。
+    ///
+    /// take + match 模式避开借用冲突：`run_editor` 持 `&mut session` /
+    /// `&mut logs`（disjoint 字段借用），期间 `self.sketch` 已被 take 出来，
+    /// 三者互不重叠；结束后按 [`EditorFrame`] 归还或丢弃状态。
+    fn sketch_editor_window(&mut self, ctx: &egui::Context) {
+        let Some(mut st) = self.sketch.take() else {
+            return;
+        };
+        let frame =
+            crate::sketch_editor::run_editor(&mut st, &mut self.session, &mut self.logs, ctx);
+        match frame {
+            crate::sketch_editor::EditorFrame::KeepOpen => self.sketch = Some(st),
+            // 提交成功：run_editor 已写日志并关窗——这里只做渲染收尾。
+            crate::sketch_editor::EditorFrame::Committed(element, shape) => {
+                self.after_geometry_change(element, shape);
+            }
+            // × 关闭且未提交：草稿丢弃，日志响亮可见。
+            crate::sketch_editor::EditorFrame::Closed => {
+                self.log("草图编辑器已关闭（未提交，草稿丢弃）");
+            }
+        }
     }
 
     /// 左栏（G2 五区布局）：自制页签（元素 / 类型）+ 页面切换。
@@ -2282,6 +2329,8 @@ impl eframe::App for BimApp {
         self.drawing_preview_window(ctx);
         // G3：原生算子参数表单浮窗（工具栏构建七组的算子项点击后打开）。
         self.op_form_window(ctx);
+        // G4-M15：草图编辑器浮窗（工具栏三入口点击后打开）。
+        self.sketch_editor_window(ctx);
     }
 }
 

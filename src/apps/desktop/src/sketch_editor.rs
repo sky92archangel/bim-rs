@@ -1,0 +1,654 @@
+//! 草图编辑器（G4-M15）：egui 浮窗画布 + 工具 + 段内编辑。
+//!
+//! 渲染与交互（egui 依赖）在本模块（`#[cfg(feature = "gui")]` 门控）；
+//! 工具状态机与捕捉 / 正交纯逻辑在**不门控**的 `sketch_tool`（默认腿可单测）。
+//!
+//! ## 坐标系
+//!
+//! 草图纸面 mm、数学坐标（y 向上、角度 ccw 为正）；画布 px、y 向下——线性
+//! 变换 y 取负。视图状态（`view_scale` / `view_center`）支撑滚轮缩放（视点
+//! 定标在光标处）与中键 / 右键平移；网格捕捉默认开（步长 10 mm），对象捕捉
+//! （端点 / 中点 / 中心）优先，Shift 临时正交。
+//!
+//! ## 交互约定
+//!
+//! - 单击推进工具状态机（`sketch_tool::SketchDraft::click`）；Ctrl+单击改为
+//!   选中附近图元（不画）；
+//! - 回车 / 双击结束折线，Backspace 撤折线点，Esc 取消进行中，Del 删除选中；
+//! - Ctrl+Z 撤销上一个图元，Ctrl+Y 重做（新动作使重做失效）；
+//! - 「完成」→ [`core_app::CoreSession::build_sketch_profile`]（造 wire +
+//!   建通用元素，失败零半成品）→ 调用方做渲染收尾（选中新构件 + 网格化 + 适配）。
+
+use glam::DVec2;
+
+use core_app::{CoreSession, SketchEntity};
+
+use crate::sketch_tool::{
+    ClickOutcome, SketchDraft, SketchTool, orthogonalize, snap_entities, snap_grid,
+};
+
+/// 网格捕捉步长（mm）。
+const GRID_STEP_MM: f64 = 10.0;
+/// 主网格（加粗）每格数。
+const GRID_MAJOR_EVERY: i64 = 10;
+/// 初始 mm→px 比例（px/mm）。
+const INITIAL_SCALE: f64 = 2.0;
+/// 对象捕捉阈值（px）——换算成 mm 用（mm tol = px tol / scale）。
+const SNAP_TOL_PX: f64 = 8.0;
+/// 滚轮缩放的上下限（px/mm）。
+const SCALE_MIN: f64 = 0.05;
+const SCALE_MAX: f64 = 50.0;
+
+/// 草图编辑器状态（BimApp 字段：`Some` = 编辑器开着）。
+pub struct SketchEditorState {
+    /// 编辑器开关（浮窗 × 或提交后关闭）
+    pub open: bool,
+    /// 当前工具
+    pub tool: SketchTool,
+    /// 进行中的图元
+    pub draft: SketchDraft,
+    /// 已提交图元（顺序即建边序）
+    pub entities: Vec<SketchEntity>,
+    /// 撤销栈（Ctrl+Z 弹回）
+    pub undo: Vec<SketchEntity>,
+    /// 选中图元（Del 删除）
+    pub selected: Option<usize>,
+    /// 草图名（完成时建元素用）
+    pub name: String,
+    /// 网格捕捉开关（默认开；对象捕捉恒开，本开关只控制网格捕捉）
+    pub snap_enabled: bool,
+    /// 视图缩放（px/mm）
+    pub view_scale: f64,
+    /// 视图中心（mm，画布中心对应的草图纸面坐标）
+    pub view_center: DVec2,
+}
+
+impl SketchEditorState {
+    /// 新建一个编辑器状态（预填草图名）。
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            open: true,
+            tool: SketchTool::Polyline,
+            draft: SketchDraft::new(SketchTool::Polyline),
+            entities: Vec::new(),
+            undo: Vec::new(),
+            selected: None,
+            name: name.into(),
+            snap_enabled: true,
+            view_scale: INITIAL_SCALE,
+            view_center: DVec2::new(0.0, 0.0),
+        }
+    }
+
+    /// 段内撤销：弹出最后一个已提交图元进撤销栈。
+    fn undo_one(&mut self) {
+        if let Some(e) = self.entities.pop() {
+            self.undo.push(e);
+            self.selected = None;
+        }
+    }
+
+    /// 段内重做：从撤销栈恢复最后一个图元。
+    fn redo_one(&mut self) {
+        if let Some(e) = self.undo.pop() {
+            self.entities.push(e);
+            self.selected = None;
+        }
+    }
+
+    /// 删除选中图元（Del）。
+    fn delete_selected(&mut self) {
+        if let Some(i) = self.selected.take()
+            && i < self.entities.len()
+        {
+            self.entities.remove(i);
+        }
+    }
+
+    /// 提交一个完成图元（清除重做栈——新动作使 redo 失效，与编辑器惯例一致）。
+    fn push_entity(&mut self, entity: SketchEntity) {
+        self.entities.push(entity);
+        self.undo.clear();
+        self.selected = None;
+    }
+}
+
+/// 编辑器一帧的执行结果（调用方据 [`EditorFrame::Committed`] 做渲染收尾）。
+pub enum EditorFrame {
+    /// 继续编辑（窗口保持打开）
+    KeepOpen,
+    /// 草图已提交并关闭（返回 (元素 id, 形状 id)）
+    Committed(core_model::ElementId, core_model::ShapeId),
+    /// 用户关闭且未提交（窗口丢弃）
+    Closed,
+}
+
+/// 草图编辑器浮窗（BimApp::update 每帧调用）。
+///
+/// 状态（`st`）、文档会话（`session`）与日志（`logs`）全部经参数显式传入
+/// （不经 BimApp——渲染模块不持全量应用状态，字段可见性单点化在调用方）。
+#[must_use]
+pub fn run_editor(
+    st: &mut SketchEditorState,
+    session: &mut CoreSession,
+    logs: &mut Vec<String>,
+    ctx: &egui::Context,
+) -> EditorFrame {
+    use egui_phosphor::regular as ph;
+
+    let mut outcome = EditorFrame::KeepOpen;
+    let mut open = st.open;
+    egui::Window::new("草图编辑器")
+        .open(&mut open)
+        .default_width(860.0)
+        .default_height(620.0)
+        .show(ctx, |ui| {
+            // —— 工具栏（工具选择 + 捕捉开关 + 段内操作 + 完成）——
+            ui.horizontal(|ui| {
+                for tool in SketchTool::ALL {
+                    if ui
+                        .selectable_label(st.tool == tool, tool.label())
+                        .clicked()
+                    {
+                        st.tool = tool;
+                        st.draft = SketchDraft::new(tool);
+                        st.selected = None;
+                    }
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(st.snap_enabled, format!("{} 捕捉", ph::CROSSHAIR))
+                    .on_hover_text("网格 / 对象捕捉开关（对象捕捉恒开，此处控制网格步长吸附）")
+                    .clicked()
+                {
+                    st.snap_enabled = !st.snap_enabled;
+                }
+                ui.separator();
+                if ui
+                    .button(format!("{} 撤销", ph::ARROW_COUNTER_CLOCKWISE))
+                    .clicked()
+                {
+                    st.undo_one();
+                }
+                if ui.button(format!("{} 重做", ph::ARROW_CLOCKWISE)).clicked() {
+                    st.redo_one();
+                }
+                if ui.button(format!("{} 删除", ph::TRASH)).clicked() {
+                    st.delete_selected();
+                }
+                if ui.button(format!("{} 清空", ph::BROOM)).clicked() {
+                    st.entities.clear();
+                    st.undo.clear();
+                    st.draft = SketchDraft::new(st.tool);
+                    st.selected = None;
+                }
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.name)
+                        .desired_width(110.0)
+                        .hint_text("草图名"),
+                );
+                if ui
+                    .button(format!("{} 完成", ph::CHECK))
+                    .on_hover_text("建线成 wire 并落成通用草图元素")
+                    .clicked()
+                {
+                    if st.entities.is_empty() {
+                        logs.push("✗ 草图为空：至少画 1 个图元再完成".to_string());
+                    } else {
+                        match session.build_sketch_profile(&st.name, &st.entities) {
+                            Ok(o) => {
+                                logs.push(format!("✓ 草图「{}」已落成元素（{o:?}）", st.name));
+                                outcome = EditorFrame::Committed(o.element, o.shape);
+                            }
+                            Err(e) => logs.push(format!("✗ 草图构建失败：{e}")),
+                        }
+                    }
+                }
+            });
+            ui.separator();
+
+            // —— 画布（事件 → 状态机推进）——
+            let ev = draw_canvas(st, ui);
+            apply_event(st, ev);
+
+            // —— 状态栏（步骤提示 + 图元数 + 光标坐标）——
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(st.draft.hint());
+                ui.separator();
+                ui.label(format!(
+                    "{} 图元 / {} 可重做 · Esc 取消 · Backspace 撤点 · Del 删除 · Ctrl+Z/Y 撤销/重做 · Ctrl+单击选中",
+                    st.entities.len(),
+                    st.undo.len()
+                ));
+            });
+        });
+    st.open = open;
+    if matches!(outcome, EditorFrame::Committed(..)) {
+        // 提交成功：窗口随之一并关闭（egui 的 .open(&mut) 借用横跨闭包，
+        // 闭包内写不进去——这里统一收口）。
+        st.open = false;
+    }
+    if !st.open && matches!(outcome, EditorFrame::KeepOpen) {
+        // × 关闭且未提交：丢弃窗口（调用方把字段置 None）。
+        return EditorFrame::Closed;
+    }
+    outcome
+}
+
+/// 把画布事件推进到工具状态机（渲染层与纯逻辑层的唯一衔接点）。
+fn apply_event(st: &mut SketchEditorState, ev: CanvasEvent) {
+    match ev {
+        CanvasEvent::None => {}
+        CanvasEvent::Click(p) => match st.draft.click(p) {
+            ClickOutcome::Finished(entity) => {
+                st.push_entity(entity);
+                st.draft = SketchDraft::new(st.tool);
+            }
+            ClickOutcome::Continued => {}
+        },
+        CanvasEvent::DoubleClick => {
+            if let Some(entity) = st.draft.finish_polyline() {
+                st.push_entity(entity);
+                st.draft = SketchDraft::new(st.tool);
+            }
+        }
+        CanvasEvent::Escape => {
+            st.draft.abort();
+        }
+        CanvasEvent::Backspace => {
+            st.draft.backtrack();
+        }
+        CanvasEvent::Delete => st.delete_selected(),
+        CanvasEvent::Undo => st.undo_one(),
+        CanvasEvent::Redo => st.redo_one(),
+    }
+}
+
+/// 一帧画布事件（mm 坐标已按捕捉 / 正交处理）。
+enum CanvasEvent {
+    None,
+    /// 单击（mm，已捕捉 / 正交）
+    Click(DVec2),
+    /// 双击（结束折线；egui 的 double_clicked 蕴含 clicked——载荷无独立用途）
+    DoubleClick,
+    Escape,
+    Backspace,
+    Delete,
+    Undo,
+    Redo,
+}
+
+/// 画一帧草图画布：网格 → 已提交实体 → 进行中预览；收集交互事件。
+///
+/// 坐标换算：mm → px 等比缩放 + y 翻转；滚轮缩放（视点定标在光标处）、
+/// 中键 / 右键拖动平移。
+fn draw_canvas(st: &mut SketchEditorState, ui: &mut egui::Ui) -> CanvasEvent {
+    let (rect, response) =
+        ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+    let painter = ui.painter().with_clip_rect(rect);
+
+    // —— 视图变换（mm ↔ px；y 翻转；只读 view_center / view_scale）——
+    let scale = st.view_scale;
+    let center_mm = st.view_center;
+    let center = rect.center();
+    let to_px = |p: DVec2| {
+        egui::Pos2::new(
+            (center.x as f64 + (p.x - center_mm.x) * scale) as f32,
+            (center.y as f64 - (p.y - center_mm.y) * scale) as f32,
+        )
+    };
+    let to_mm = |q: egui::Pos2| {
+        DVec2::new(
+            center_mm.x + (q.x as f64 - center.x as f64) / scale,
+            center_mm.y - (q.y as f64 - center.y as f64) / scale,
+        )
+    };
+
+    // —— 平移（中键 / 右键拖动）——
+    if response.dragged_by(egui::PointerButton::Middle)
+        || response.dragged_by(egui::PointerButton::Secondary)
+    {
+        let d = response.drag_delta();
+        st.view_center.x -= d.x as f64 / scale;
+        st.view_center.y += d.y as f64 / scale; // y 翻转：拖右＝纸面左移
+    }
+    // —— 缩放（滚轮，视点定标在光标处）——
+    let raw_mm = to_mm(response.hover_pos().unwrap_or(center));
+    if response.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 {
+            let anchor = raw_mm;
+            st.view_scale =
+                (st.view_scale * (f64::from(scroll) * 0.002).exp()).clamp(SCALE_MIN, SCALE_MAX);
+            // 缩放后把锚点拉回光标处（视点定标：光标下的纸面点不漂移）。
+            let new_mm = to_mm(response.hover_pos().unwrap_or(center));
+            st.view_center += anchor - new_mm;
+        }
+    }
+
+    // —— 网格 ——
+    draw_grid_lines(&painter, &rect, st, &to_px);
+
+    // —— 已提交实体（选中高亮）——
+    for (i, e) in st.entities.iter().enumerate() {
+        let color = if st.selected == Some(i) {
+            egui::Color32::from_rgb(0xff, 0xd0, 0x40)
+        } else {
+            egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)
+        };
+        draw_entity(&painter, e, &to_px, scale, color);
+    }
+
+    // —— 光标 mm 坐标（捕捉 / 正交处理后的画布输入）——
+    let shift = ui.input(|i| i.modifiers.shift);
+    let mut mm = raw_mm;
+    if st.snap_enabled {
+        // 对象捕捉优先（端点 / 中点 / 中心），退回网格捕捉。
+        let tol = SNAP_TOL_PX / scale;
+        mm = snap_entities(&st.entities, raw_mm, tol)
+            .unwrap_or_else(|| snap_grid(raw_mm, GRID_STEP_MM));
+    }
+    if shift {
+        // 正交（Shift 临时）：相对上一个锚点锁 0/90°。
+        if let Some(prev) = anchor_of(&st.draft).or_else(|| last_point_of(&st.entities)) {
+            mm = orthogonalize(prev, mm);
+        }
+    }
+
+    // —— 进行中预览 ——
+    draw_preview(&painter, &st.draft, mm, &to_px, scale);
+
+    // —— 事件收集（Ctrl+单击 = 选中附近图元，不画）——
+    let cmd = ui.input(|i| i.modifiers.command);
+    // 双击先于单击判（egui 0.29：double_clicked 蕴含 clicked——若先查单击，
+    // 双击的第二击会被当"单击加点"，折线双击结束时多放一个点）。
+    let mut ev = if response.double_clicked() {
+        CanvasEvent::DoubleClick
+    } else if response.clicked() {
+        if cmd {
+            st.selected = pick_entity_at(&st.entities, mm, SNAP_TOL_PX / scale);
+            CanvasEvent::None
+        } else {
+            CanvasEvent::Click(mm)
+        }
+    } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        CanvasEvent::Escape
+    } else if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
+        CanvasEvent::Backspace
+    } else if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+        CanvasEvent::Delete
+    } else if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+        CanvasEvent::Undo
+    } else if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)) {
+        CanvasEvent::Redo
+    } else {
+        CanvasEvent::None
+    };
+    // 键盘事件只认画布获得焦点时的悬停（避免全局热键抢走文档快捷键）。
+    if !matches!(ev, CanvasEvent::Click(_) | CanvasEvent::DoubleClick) && !response.hovered() {
+        ev = CanvasEvent::None;
+    }
+    ev
+}
+
+/// 画布网格：细格（GRID_STEP_MM）+ 主格（GRID_MAJOR_EVERY 倍）+ 原点轴。
+fn draw_grid_lines(
+    painter: &egui::Painter,
+    rect: &egui::Rect,
+    st: &SketchEditorState,
+    to_px: &dyn Fn(DVec2) -> egui::Pos2,
+) {
+    let fine = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x38, 0x3d, 0x47));
+    let major = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x4c, 0x53, 0x60));
+    let scale = st.view_scale;
+    let half_w = rect.width() as f64 / 2.0 / scale;
+    let half_h = rect.height() as f64 / 2.0 / scale;
+    let (x0, x1) = (st.view_center.x - half_w, st.view_center.x + half_w);
+    let (y0, y1) = (st.view_center.y - half_h, st.view_center.y + half_h);
+    let step = GRID_STEP_MM;
+    let major_step = GRID_MAJOR_EVERY as f64 * step;
+    let mut x = (x0 / step).floor() * step;
+    while x <= x1 {
+        let stroke = if (x / major_step).round() * major_step == x {
+            major
+        } else {
+            fine
+        };
+        painter.line_segment([to_px(DVec2::new(x, y0)), to_px(DVec2::new(x, y1))], stroke);
+        x += step;
+    }
+    let mut y = (y0 / step).floor() * step;
+    while y <= y1 {
+        let stroke = if (y / major_step).round() * major_step == y {
+            major
+        } else {
+            fine
+        };
+        painter.line_segment([to_px(DVec2::new(x0, y)), to_px(DVec2::new(x1, y))], stroke);
+        y += step;
+    }
+    // 原点轴（X 红 / Y 绿）。
+    painter.line_segment(
+        [to_px(DVec2::new(x0, 0.0)), to_px(DVec2::new(x1, 0.0))],
+        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0xb0, 0x58, 0x58)),
+    );
+    painter.line_segment(
+        [to_px(DVec2::new(0.0, y0)), to_px(DVec2::new(0.0, y1))],
+        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0x58, 0xa8, 0x64)),
+    );
+}
+
+/// 画一个已提交图元（圆走 egui 真圆；弧 / 椭圆采样 64 段——egui 无弧 primitive）。
+fn draw_entity(
+    painter: &egui::Painter,
+    e: &SketchEntity,
+    to_px: &dyn Fn(DVec2) -> egui::Pos2,
+    scale: f64,
+    color: egui::Color32,
+) {
+    const SEGMENTS: usize = 64;
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    match e {
+        SketchEntity::Polyline(points) => {
+            let pts: Vec<egui::Pos2> = points.iter().map(|p| to_px(*p)).collect();
+            if pts.len() >= 2 {
+                painter.add(egui::Shape::line(pts, stroke));
+            }
+        }
+        SketchEntity::Circle { center, radius } => {
+            // 解析圆走 egui 真圆（circle_stroke）——"圆是真圆"沿用 M11 验收线。
+            painter.circle_stroke(to_px(*center), ((*radius * scale).max(0.5)) as f32, stroke);
+        }
+        SketchEntity::Ellipse {
+            center,
+            major,
+            minor,
+            major_angle,
+        } => {
+            let (c, s) = major_angle.sin_cos();
+            let pts: Vec<egui::Pos2> = (0..=SEGMENTS)
+                .map(|i| {
+                    let t = std::f64::consts::TAU * (i as f64) / (SEGMENTS as f64);
+                    let local = DVec2::new(major * t.cos(), minor * t.sin());
+                    // 主轴旋转（ccw）：(x·cosθ − y·sinθ, x·sinθ + y·cosθ)。
+                    to_px(
+                        *center + DVec2::new(local.x * c - local.y * s, local.x * s + local.y * c),
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+        SketchEntity::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+        } => {
+            let (sa, ea) = core_app::normalize_arc_angles(*start_angle, *end_angle);
+            let pts: Vec<egui::Pos2> = (0..=SEGMENTS)
+                .map(|i| {
+                    let t = sa + (ea - sa) * (i as f64) / (SEGMENTS as f64);
+                    to_px(DVec2::new(
+                        center.x + radius * t.cos(),
+                        center.y + radius * t.sin(),
+                    ))
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+    }
+}
+
+/// 进行中预览（按工具阶段画锚点与橡皮筋）。
+fn draw_preview(
+    painter: &egui::Painter,
+    draft: &SketchDraft,
+    cursor: DVec2,
+    to_px: &dyn Fn(DVec2) -> egui::Pos2,
+    scale: f64,
+) {
+    let stroke = egui::Stroke::new(
+        ((scale * 0.6) as f32).clamp(1.0, 2.0),
+        egui::Color32::from_rgb(0x60, 0xa0, 0xff),
+    );
+    let dot = |p: DVec2| {
+        painter.circle_filled(to_px(p), 3.0, egui::Color32::from_rgb(0x60, 0xa0, 0xff));
+    };
+    match draft {
+        SketchDraft::None => {}
+        SketchDraft::Polyline { points } => {
+            for p in points {
+                dot(*p);
+            }
+            if let Some(last) = points.last() {
+                painter.line_segment([to_px(*last), to_px(cursor)], stroke);
+            }
+        }
+        SketchDraft::Rect { first } => {
+            if let Some(f) = first {
+                dot(*f);
+                // 对角预览矩形。
+                let tl = to_px(*f);
+                let br = to_px(cursor);
+                let tr = egui::Pos2::new(br.x, tl.y);
+                let bl = egui::Pos2::new(tl.x, br.y);
+                painter.line_segment([tl, tr], stroke);
+                painter.line_segment([tr, br], stroke);
+                painter.line_segment([br, bl], stroke);
+                painter.line_segment([bl, tl], stroke);
+            }
+        }
+        SketchDraft::Circle { center } => {
+            if let Some(c) = center {
+                dot(*c);
+                painter.line_segment([to_px(*c), to_px(cursor)], stroke);
+                let r = (cursor - *c).length();
+                let pts: Vec<egui::Pos2> = (0..=48)
+                    .map(|i| {
+                        let t = std::f64::consts::TAU * (i as f64) / 48.0;
+                        to_px(DVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(pts, stroke));
+            }
+        }
+        SketchDraft::Ellipse { center, axis_end } => match (*center, *axis_end) {
+            (Some(c), None) => {
+                dot(c);
+                painter.line_segment([to_px(c), to_px(cursor)], stroke);
+            }
+            (Some(c), Some(a)) => {
+                dot(c);
+                dot(a);
+                painter.line_segment([to_px(c), to_px(a)], stroke);
+                painter.line_segment([to_px(a), to_px(cursor)], stroke);
+            }
+            _ => {}
+        },
+        SketchDraft::Arc { center, start } => match (*center, *start) {
+            (Some(c), None) => {
+                dot(c);
+                painter.line_segment([to_px(c), to_px(cursor)], stroke);
+            }
+            (Some(c), Some(s)) => {
+                dot(c);
+                dot(s);
+                painter.line_segment([to_px(c), to_px(s)], stroke);
+                painter.line_segment([to_px(c), to_px(cursor)], stroke);
+                let r = (s - c).length();
+                let sa = (s.y - c.y).atan2(s.x - c.x);
+                let ea = (cursor.y - c.y).atan2(cursor.x - c.x);
+                let (sa, ea) = core_app::normalize_arc_angles(sa, ea);
+                if (ea - sa).abs() > f64::EPSILON {
+                    let pts: Vec<egui::Pos2> = (0..=48)
+                        .map(|i| {
+                            let t = sa + (ea - sa) * (i as f64) / 48.0;
+                            to_px(DVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+/// 画布草稿的当前锚点（正交约束的参照；无锚点 None）。
+fn anchor_of(draft: &SketchDraft) -> Option<DVec2> {
+    match draft {
+        SketchDraft::Polyline { points } => points.last().copied(),
+        SketchDraft::Rect { first } => *first,
+        SketchDraft::Circle { center } => *center,
+        SketchDraft::Ellipse { center, axis_end } => axis_end.or(*center),
+        SketchDraft::Arc { center, start } => start.or(*center),
+        SketchDraft::None => None,
+    }
+}
+
+/// 已提交图元的最后一个点（正交约束的次级参照）。
+fn last_point_of(entities: &[SketchEntity]) -> Option<DVec2> {
+    match entities.last() {
+        Some(SketchEntity::Polyline(points)) => points.last().copied(),
+        Some(SketchEntity::Circle { center, .. })
+        | Some(SketchEntity::Ellipse { center, .. })
+        | Some(SketchEntity::Arc { center, .. }) => Some(*center),
+        _ => None,
+    }
+}
+
+/// 选中拾取：mm 点附近（tol）**最近**的图元下标。
+fn pick_entity_at(entities: &[SketchEntity], p: DVec2, tol: f64) -> Option<usize> {
+    let mut best: Option<(f64, usize)> = None;
+    for (i, e) in entities.iter().enumerate() {
+        let d = match e {
+            SketchEntity::Polyline(points) => points
+                .windows(2)
+                .map(|w| point_seg_distance(p, w[0], w[1]))
+                .chain(points.iter().map(|v| (*v - p).length()))
+                .fold(f64::INFINITY, f64::min),
+            SketchEntity::Circle { center, radius } => ((p - *center).length() - *radius).abs(),
+            SketchEntity::Ellipse { center, .. } | SketchEntity::Arc { center, .. } => {
+                (p - *center).length()
+            }
+        };
+        if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, i));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// 点到线段距离（本地小助手，与 `sketch_geom::point_segment_distance` 同口径）。
+fn point_seg_distance(p: DVec2, a: DVec2, b: DVec2) -> f64 {
+    let ab = b - a;
+    let len2 = ab.dot(ab);
+    if len2 <= f64::EPSILON {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    (a + ab * t - p).length()
+}

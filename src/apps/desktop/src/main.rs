@@ -41,6 +41,13 @@ mod theme;
 /// 草图纯几何算法库（G4-M14）：纯算法零依赖 GUI 状态，不门控 feature（默认腿可单测）。
 mod sketch_geom;
 
+/// 草图工具纯逻辑（G4-M15）：状态机 + 捕捉 / 正交纯函数，不门控 feature（默认腿可单测）。
+mod sketch_tool;
+
+/// 草图编辑器浮窗（G4-M15）：egui 渲染与交互（依赖 gui feature）。
+#[cfg(feature = "gui")]
+mod sketch_editor;
+
 #[cfg(feature = "gui")]
 fn main() -> ExitCode {
     match gui::run_gui() {

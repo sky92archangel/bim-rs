@@ -82,6 +82,7 @@ pub struct CoreSession {
 ///
 /// `warnings` 是执行层的**可观测回退说明**（如后端不支持带历史布尔的回退）——
 /// 调用方（GUI / SDK）必须显示，绝不静默丢弃。
+#[derive(Debug)]
 pub struct NativeOutcome {
     /// 结果元素：build_native 时即目标元素；combine_native 时为**新构件**
     pub element: ElementId,

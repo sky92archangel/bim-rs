@@ -307,6 +307,7 @@ M10 基础（BTreeMap 平铺编辑）升级为**按 FieldDef 完整路由**：
 | 阶段 | 内容 | 验收 | 依赖 |
 |---|---|---|---|
 | **G1 视觉基建** | `theme.rs` 配色板 + egui_phosphor 图标 + set_visuals 深色定制 | 双腿编译过；GUI 实机视觉统一；**零逻辑变化** | M12 ✅ |
+| ↑ **G1 现状** | ✅ **已完成（2026-10-02）** | `apps/desktop/src/theme.rs`（129 行）：配色板 12 常量（BG/PANEL/EXTREME/STROKE/TEXT/WEAK/ACCENT/SELECTED/OK/WARN/ERR/VIEWPORT_BG）+ `apply(ctx)`（set_fonts + set_visuals + style_mut 间距 8px/按钮 padding）+ `theme_visuals()`（panel_fill/window_fill/extreme_bg/selection/控件三态 + 圆角 4px）；`egui-phosphor = "0.7"`（**0.7.x 对应 egui 0.29，CHANGELOG 实证**），`add_to_fonts` 排在 CJK 兜底之前（图标先于中文命中）；CJK 字体装载从 gui.rs 迁入 theme.rs（逻辑不变）；egui 0.29 实测：`Visuals` 无整体 `rounding` 字段，圆角在 `WidgetVisuals.rounding` 每态设置、面板底是 `panel_fill`。未接线的配色常量（BG/WEAK/OK/WARN/ERR/VIEWPORT_BG）带 `#[allow(dead_code)]` 注明 G2 接线。门禁：fmt 0；clippy 双腿 `-D warnings` 全绿；默认腿测试 180+11 全 passed。提交 9e884de | — |
 | **G2 布局重组** | 菜单栏 + 工具栏骨架 + 五区布局 + 状态栏 + 日志折叠 | 现有全部功能（文件/拾取/属性/图纸/预览）在新布局可用 | G1 |
 | **G3 构建链路** | BuildOp `param_defs()`（core-sdk）+ 七组工具栏 + 参数表单 + build_op 传参 | GUI 点 MakeBox 改参数 → 视口出对应长方体；Fuse 先选两个构件；**API 复现用例**（纯 API 建任意算子构件） | G2 |
 | **G4 草图特征建模** | 草图编辑器（画布/捕捉/**11 种图元工具** §5.6.1 + **CAD 绘制/编辑操作 18 项** §5.6.2）+ **拉伸（默认 500mm）/ 旋转扫掠（默认 360° 可区间）/ 放样三方式**（§5.6）+ 封闭性检查 + 确认/回滚 | GUI 草图画矩形 → 拉伸 500mm 生成实体；未封闭草图确认出警告；旋转扫掠 20°~180° 命中预旋转方案；倒圆角/倒直线角修剪正确；移动/镜像/偏移/修剪变换正确；**API 复现用例**（纯 API 组装 wire → 拉伸/旋转/放样，不经 GUI） | G3 |

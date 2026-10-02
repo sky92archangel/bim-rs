@@ -24,6 +24,34 @@
 - **P0（本计划）**：视觉基建、布局重组、几何构建工具栏 + 参数表单、草图特征建模（G4）、类型管理器、实例属性面板升级、元素树。
 - **不做（本期）**：Ribbon、多文档页签、撤销/重做 UI、专业模块深化、出图深化、可停靠面板——**全部移交后续计划（§9，G6+）**。
 
+### 2.1 SDK API 全覆盖原则（用户定版，全局硬约束）
+
+> **软件所有功能均开放 SDK API 可供外部调用**——**GUI 是薄壳**：GUI 能做的每一件事，
+> 必须在 `core-sdk` / `CoreSession` 门面层有对应 API；GUI 只做「交互 → API 调用 → 渲染」，
+> 不藏任何只存在于 UI 层的逻辑。
+
+**API 现状（已 API 化，GUI 全部走门面，`core-app/src/session.rs`）**：
+
+| 能力 | API |
+|---|---|
+| 会话 / 文件 | `new` / `open` / `with_real_kernel` / `open_real` / `save` / `from_parts` |
+| 模块安装 | `install_module` |
+| 构建几何 | `create_element` + `build_geometry`（配方）+ `rebuild_geometry`（关联更新）+ `carve_geometry` |
+| 出图 | `create_view` / `regenerate_view` / `project_shape` |
+| 拾取 / 渲染 | `pick_at` / `tessellate`（+ `tessellate_for_pick` 会话缓存） |
+| 互操作 | `interop().export_view(Format, &View, &DraftingStandard)` |
+| 类型 / 属性 | `Registry::register_schema` / `PropertySchema::validate` |
+| 组合访问器 | `document()` / `geometry()` / `interop()` / `modules()` / `summary()` |
+
+**执行规则（G3-G5 起的硬约束）**：
+1. **API 先行**：每个新功能**先落 API**（core-sdk / core-app，含单测），GUI 再接线——禁止"先写 UI 后补 API"。
+2. **GUI 动作可被纯 API 复现**：每个 GUI 操作必须能用一段不依赖 GUI 的 API 调用序列复现（例：草图矩形拉伸 500mm = wire 组装 API + `Extrude` API；改梁宽 = `rebuild_geometry(element, op_id, params)`）。**G3-G5 每阶段验收新增"API 复现用例"**（集成测试腿）。
+3. **G4 草图的 API 化**：草图转特征链（图元 → wire 组装 / 封闭性检查 / 特征执行）全部落 core-app 层 API，GUI 画布只负责收集图元、调 API。
+
+**外部调用形态分期**：
+- **P0（本期）**：进程内 Rust API（`core-sdk` + `CoreSession`，库形态）全覆盖——上表即契约。
+- **G6+（§9）**：进程外形态按需单独立项——CLI / 脚本引擎 / HTTP 桥；进程内 API 是它们的地基，先立地基。
+
 ## 3. 视觉规格（深色专业 CAD 风）
 
 ### 3.1 配色板（G1 落为 `gui/theme.rs` 常量）
@@ -265,6 +293,7 @@ M10 基础（BTreeMap 平铺编辑）升级为**按 FieldDef 完整路由**：
 | **专业模块深化** | M7 三模块已有（beam / duct / tunnel，49 单测） | G6+——GUI 稳定后回到模块侧：模块配方参数化 UI、更多专业模块 |
 | **Ribbon** | 不做（egui 无原生支持，需自绘模拟） | G6+——仅当五区布局被验证不够用时评估；自绘 Ribbon 工作量大，优先级最低 |
 | **多文档页签** | CoreSession 单文档会话 | G6+——需要多文档同时打开时；涉及会话管理改造（多 CoreSession 或会话池），牵涉面最大放最后 |
+| **外部调用形态** | 进程内 Rust API（§2.1 契约）全覆盖 | G6+——CLI / 脚本引擎（rhai/wasm）/ HTTP 桥按需单独立项；进程内 API 是它们的地基，§2.1 全覆盖原则先立地基 |
 - **确认流程**：收集图元 → 组装 wire（`MakeLineEdge` / `MakeArcEdge` 逐段 + `MakeWire`）→ 封闭性检查（首尾点距离 ≤ 容差，P0 纯几何双腿一致）→ 转特征表单（拉伸高度 / 旋转角度区间 / 路径选择）→ `build_op` 执行 → 失败/取消**回滚回草图编辑，绝不丢草图**。
 
 **内核缺口（诚实注记，G4 前置）**：
@@ -279,9 +308,9 @@ M10 基础（BTreeMap 平铺编辑）升级为**按 FieldDef 完整路由**：
 |---|---|---|---|
 | **G1 视觉基建** | `theme.rs` 配色板 + egui_phosphor 图标 + set_visuals 深色定制 | 双腿编译过；GUI 实机视觉统一；**零逻辑变化** | M12 ✅ |
 | **G2 布局重组** | 菜单栏 + 工具栏骨架 + 五区布局 + 状态栏 + 日志折叠 | 现有全部功能（文件/拾取/属性/图纸/预览）在新布局可用 | G1 |
-| **G3 构建链路** | BuildOp `param_defs()`（core-sdk）+ 七组工具栏 + 参数表单 + build_op 传参 | GUI 点 MakeBox 改参数 → 视口出对应长方体；Fuse 先选两个构件 | G2 |
-| **G4 草图特征建模** | 草图编辑器（画布/捕捉/**11 种图元工具** §5.6.1 + **CAD 绘制/编辑操作 18 项** §5.6.2）+ **拉伸（默认 500mm）/ 旋转扫掠（默认 360° 可区间）/ 放样三方式**（§5.6）+ 封闭性检查 + 确认/回滚 | GUI 草图画矩形 → 拉伸 500mm 生成实体；未封闭草图确认出警告；旋转扫掠 20°~180° 命中预旋转方案；倒圆角/倒直线角修剪正确；移动/镜像/偏移/修剪变换正确 | G3 |
-| **G5 类型系统** | 类型管理器 + 实例属性面板升级 + 元素树 | GUI 新建类型 → 造构件挂该类型 → 属性面板按 schema 表单编辑 → validate 拦截非法值 | G3 |
+| **G3 构建链路** | BuildOp `param_defs()`（core-sdk）+ 七组工具栏 + 参数表单 + build_op 传参 | GUI 点 MakeBox 改参数 → 视口出对应长方体；Fuse 先选两个构件；**API 复现用例**（纯 API 建任意算子构件） | G2 |
+| **G4 草图特征建模** | 草图编辑器（画布/捕捉/**11 种图元工具** §5.6.1 + **CAD 绘制/编辑操作 18 项** §5.6.2）+ **拉伸（默认 500mm）/ 旋转扫掠（默认 360° 可区间）/ 放样三方式**（§5.6）+ 封闭性检查 + 确认/回滚 | GUI 草图画矩形 → 拉伸 500mm 生成实体；未封闭草图确认出警告；旋转扫掠 20°~180° 命中预旋转方案；倒圆角/倒直线角修剪正确；移动/镜像/偏移/修剪变换正确；**API 复现用例**（纯 API 组装 wire → 拉伸/旋转/放样，不经 GUI） | G3 |
+| **G5 类型系统** | 类型管理器 + 实例属性面板升级 + 元素树 | GUI 新建类型 → 造构件挂该类型 → 属性面板按 schema 表单编辑 → validate 拦截非法值；**API 复现用例**（纯 API register_schema → build → rebuild） | G3 |
 
 **每阶段门禁**：`fmt` + clippy 双腿 `-D warnings` + 默认腿测试全绿 + GUI 实机（mock 腿）走查。
 

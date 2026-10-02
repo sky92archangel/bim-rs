@@ -57,7 +57,7 @@
 //! 与本仓铁律一致：**不 panic、不吞错**。装载 / 建几何 / 网格化 / 拾取的
 //! 失败一律写进底栏日志（错误原文），窗口照常可操作。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -70,7 +70,7 @@ use cable_tunnel::{
 use core_app::CoreSession;
 use core_doc::{Camera, PickFilter, PickKind, PickParam, PickResult, Ray, ViewOrientation};
 use core_interop::{Drawing2D, Format};
-use core_model::{ElementId, FieldType, PropertyMap, ShapeId, Value, ViewId};
+use core_model::{ElementId, FieldDef, FieldType, PropertyMap, ShapeId, Value, ViewId};
 use core_sdk::{BuildOp, Module, ParamDef, ParamDefault, ParamKind};
 use example_beam::{
     CATEGORY as BEAM_CATEGORY, ExampleBeam, GEOMETRY_OP_ID as OP_BEAM_RECT,
@@ -401,6 +401,8 @@ struct BimApp {
     sketch: Option<crate::sketch_editor::SketchEditorState>,
     /// 类型编辑器状态（G5-M20：Some = Types 页编辑中——新建 / 编辑 PropertySchema）
     types_edit: Option<TypesEdit>,
+    /// 元素树折叠的品类（G5-M21：默认全展开；集合内 = 折叠）
+    collapsed_groups: BTreeSet<String>,
 }
 
 /// 原生算子参数表单状态（G3：确认时换算成 PropertyMap → build/modify/combine_native）。
@@ -437,6 +439,9 @@ fn form_value_from_default(def: &ParamDef) -> FormValue {
 }
 
 /// 一次参数编辑的暂存（选中构件时快照；"应用并重建"提交）。
+///
+/// G5-M21：快照带**模式定义**（`fields`）——渲染按 FieldDef 完整路由
+/// （unit 后缀 / required 缺失标红 / Enum 下拉 / default 恢复 / doc tooltip）。
 #[derive(Clone)]
 struct ParamEdit {
     /// 编辑中的构件
@@ -445,6 +450,8 @@ struct ParamEdit {
     op_id: String,
     /// 属性模式名（重建参数要带上）
     schema: String,
+    /// 模式定义快照（schema 未注册时为空——字段按 BTreeMap 字典序渲染）
+    fields: Vec<FieldDef>,
     /// 编辑中的参数快照（含未提交修改）
     values: BTreeMap<String, Value>,
 }
@@ -565,6 +572,7 @@ impl BimApp {
             secondary: None,
             sketch: None,
             types_edit: None,
+            collapsed_groups: BTreeSet::new(),
         })
     }
 
@@ -620,6 +628,7 @@ impl BimApp {
             secondary: None,
             sketch: None,
             types_edit: None,
+            collapsed_groups: BTreeSet::new(),
         })
     }
 
@@ -707,8 +716,14 @@ impl BimApp {
 
     // ---- 关联更新（M10：属性可编辑 → rebuild_geometry → stale → regenerate） ----
 
-    /// 提交参数编辑：走 `rebuild_geometry`（M6 关联更新首链在 GUI 生效）——
-    /// 网格重建（dirty）+ 定向重投 + stale 视图标脏；警告逐条入日志，不被吞。
+    /// 提交参数编辑（G5-M21 语义定版）：**validate → set → rebuild**。
+    ///
+    /// ① validate：schema 已注册时先校验新值（非法值红字拦截——不落库不重建；
+    ///    未注册模式照 M10 现状跳过，参数自由）；
+    /// ② set：新值**回写元素 properties**（属性与几何一致——M10 现状不回写，
+    ///    重选构件后编辑快照变回旧值，语义混乱）；
+    /// ③ rebuild：走 `rebuild_geometry`（M6 关联更新首链在 GUI 生效）——
+    ///    网格重建（dirty）+ 定向重投 + stale 视图标脏；警告逐条入日志，不被吞。
     fn apply_rebuild(&mut self) {
         let Some(edit) = self.edit.clone() else {
             return;
@@ -717,6 +732,25 @@ impl BimApp {
         for (k, v) in &edit.values {
             params.set(k.clone(), v.clone());
         }
+        // ① validate（schema 已注册时；未注册模式跳过——参数自由，照 M10 现状）
+        let registered = self
+            .session
+            .list_schemas()
+            .iter()
+            .any(|s| s.type_name == edit.schema);
+        if registered && let Err(e) = self.session.validate_map(&edit.schema, &params) {
+            self.log(format!("✗ 非法值已拦截：{e}（修正后再点\"应用并重建\"）"));
+            return;
+        }
+        // ② set：新值回写元素 properties（属性与几何一致）
+        if let Err(e) = self
+            .session
+            .update_element_properties(edit.element, params.clone())
+        {
+            self.log(format!("✗ 属性回写失败：{e}"));
+            return;
+        }
+        // ③ rebuild（M6 关联更新首链在 GUI 生效）
         match self
             .session
             .rebuild_geometry(edit.element, &edit.op_id, params)
@@ -1588,7 +1622,15 @@ impl BimApp {
         });
     }
 
+    /// 左栏 · 元素树（G5-M21：§5.5——品类分组折叠 + 节点选中联动 + 删除）。
+    ///
+    /// 分组：按品类（BTreeMap 天然按品类名排序）；组头折叠开关 + 计数；
+    /// 节点：显示名（无几何标注）+ 选中 / Ctrl 副选联动（与视口 do_pick 同
+    /// 语义）+ 删除按钮（`delete_element`：元素 + 级联清关系 + 几何记录一并
+    /// 删，自动成为一个撤销步；图纸实体不自动清除——log 如实提示重新生成）。
+    /// ⚠ 可见性眼睛记 P1：`Element` 无 visible 字段（会话态显隐，后续交付）。
     fn elements_panel(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
         // —— 新建构件（模块算子按钮；mock 腿不支持的算子点击后日志响亮报错）——
         ui.label("新建构件：");
         ui.horizontal_wrapped(|ui| {
@@ -1599,46 +1641,102 @@ impl BimApp {
             }
         });
         ui.separator();
-        // 先收集再交互（避免边遍历文档边改状态）。
-        let items: Vec<(ElementId, String, bool)> = self
-            .session
-            .document()
-            .doc()
-            .elements()
-            .iter()
-            .map(|(id, e)| {
-                (
-                    *id,
-                    format!("{} · {}", e.name, e.category.as_str()),
-                    e.geometry_ref.is_some(),
-                )
-            })
-            .collect();
-        if items.is_empty() {
+        // 先收集再交互（避免边遍历文档边改状态）：按品类分组（BTreeMap 天然有序）。
+        let mut groups: BTreeMap<String, Vec<(ElementId, String, bool)>> = BTreeMap::new();
+        for (id, e) in self.session.document().doc().elements() {
+            groups
+                .entry(e.category.as_str().to_string())
+                .or_default()
+                .push((*id, e.name.clone(), e.geometry_ref.is_some()));
+        }
+        if groups.is_empty() {
             ui.label("（无构件，从上方按钮新建）");
             return;
         }
+        let mut delete: Option<(ElementId, String)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (id, label, has_geom) in items {
-                let text = if has_geom {
-                    label.clone()
+            for (category, items) in &groups {
+                // 组头：折叠开关 + 品类名 + 计数
+                let collapsed = self.collapsed_groups.contains(category);
+                let caret = if collapsed {
+                    ph::CARET_RIGHT
                 } else {
-                    format!("{label}（无几何）")
+                    ph::CARET_DOWN
                 };
-                // 副选构件同高亮（G3：布尔 / 扫掠类的第二输入）。
-                let is_sel = self.selected == Some(id) || self.secondary == Some(id);
-                if ui.selectable_label(is_sel, text).clicked() {
-                    // Ctrl+单击 = 设副选；普通单击 = 主选（与视口 do_pick 同语义）。
-                    if ui.input(|i| i.modifiers.ctrl) {
-                        self.secondary = Some(id);
-                        self.log(format!("✓ 已设副选：{label}"));
+                if ui
+                    .selectable_label(false, format!("{caret} {category}（{}）", items.len()))
+                    .clicked()
+                {
+                    if collapsed {
+                        self.collapsed_groups.remove(category);
                     } else {
-                        self.selected = Some(id);
-                        self.picked = None;
+                        self.collapsed_groups.insert(category.clone());
                     }
+                }
+                if collapsed {
+                    continue;
+                }
+                for (id, name, has_geom) in items {
+                    let text = if *has_geom {
+                        name.clone()
+                    } else {
+                        format!("{name}（无几何）")
+                    };
+                    // 副选构件同高亮（G3：布尔 / 扫掠类的第二输入）。
+                    let is_sel = self.selected == Some(*id) || self.secondary == Some(*id);
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(is_sel, text).clicked() {
+                            // Ctrl+单击 = 设副选；普通单击 = 主选（与视口 do_pick 同语义）。
+                            if ui.input(|i| i.modifiers.ctrl) {
+                                self.secondary = Some(*id);
+                                self.log(format!("✓ 已设副选：{name}"));
+                            } else {
+                                self.selected = Some(*id);
+                                self.picked = None;
+                            }
+                        }
+                        // 删除（G5-M21：动作收集，借用结束后执行）
+                        if ui.small_button(ph::TRASH).clicked() {
+                            delete = Some((*id, name.clone()));
+                        }
+                    });
                 }
             }
         });
+        // —— 动作段（文档遍历借用已结束）——
+        if let Some((id, name)) = delete {
+            let shape = self
+                .session
+                .document()
+                .doc()
+                .element(id)
+                .and_then(|e| e.geometry_ref);
+            match self.session.delete_element(id) {
+                Ok(()) => {
+                    if let Some(s) = shape {
+                        self.meshes.remove(&s);
+                    }
+                    // 选中态清理（删的是选中 / 副选 / 编辑中 → 归零）
+                    if self.selected == Some(id) {
+                        self.selected = None;
+                        self.picked = None;
+                    }
+                    if self.secondary == Some(id) {
+                        self.secondary = None;
+                    }
+                    if self.edit.as_ref().map(|e| e.element) == Some(id) {
+                        self.edit = None;
+                    }
+                    self.op_by_element.remove(&id);
+                    self.dirty = true;
+                    self.log(format!(
+                        "✓ 已删除构件「{name}」（元素 + 级联关系 + 几何记录；撤销可整体回滚）"
+                    ));
+                    self.log("· 相关视图的图纸实体未自动清除，请对相关视图做「重新生成」");
+                }
+                Err(e) => self.log(format!("✗ 删除失败：{e}")),
+            }
+        }
     }
 
     /// 左栏 · 类型管理器（G5-M20：§5.3——类型列表 + 新建 / 编辑 PropertySchema）。
@@ -1719,14 +1817,14 @@ impl BimApp {
                                     for ft in &types_editor::FIELD_TYPES {
                                         let is_enum = matches!(ft, FieldType::Enum(_))
                                             && matches!(row.field_type, FieldType::Enum(_));
-                                    if ui
-                                        .selectable_label(
-                                            is_enum || row.field_type == *ft,
-                                            types_editor::type_label(ft),
-                                        )
-                                        .clicked()
-                                        && !is_enum
-                                    {
+                                        if ui
+                                            .selectable_label(
+                                                is_enum || row.field_type == *ft,
+                                                types_editor::type_label(ft),
+                                            )
+                                            .clicked()
+                                            && !is_enum
+                                        {
                                             // 切到枚举清空旧类型；已是枚举时再点不重置选项
                                             row.field_type = ft.clone();
                                         }
@@ -1860,12 +1958,23 @@ impl BimApp {
         ui.separator();
         ui.heading("参数");
         // —— M10：选中变化时重置编辑暂存（快照当前参数 + 该构件的算子）——
+        // G5-M21：一并快照模式定义（fields，渲染路由用；未注册模式为空）。
         if self.edit.as_ref().map(|e| e.element) != Some(id) {
-            self.edit = self.op_by_element.get(&id).map(|op| ParamEdit {
-                element: id,
-                op_id: op.clone(),
-                schema: elem.properties.schema.clone(),
-                values: elem.properties.values.clone(),
+            let schemas = self.session.list_schemas();
+            self.edit = self.op_by_element.get(&id).map(|op| {
+                let schema = elem.properties.schema.clone();
+                let fields = schemas
+                    .iter()
+                    .find(|s| s.type_name == schema)
+                    .map(|s| s.fields.clone())
+                    .unwrap_or_default();
+                ParamEdit {
+                    element: id,
+                    op_id: op.clone(),
+                    schema,
+                    fields,
+                    values: elem.properties.values.clone(),
+                }
             });
         }
         // 渲染收集动作（edit 可变借用只圈在渲染段；动作在借用结束后执行）。
@@ -1890,17 +1999,112 @@ impl BimApp {
             }
             Some(edit) => {
                 ui.label(format!(
-                    "模式：{}（可编辑，改后点\"应用并重建\"）",
+                    "模式：{}（可编辑，改后点\"应用并重建\"；非法值会被已注册模式拦截）",
                     elem.properties.schema
                 ));
+                // G5-M21：FieldDef 完整路由——required 缺失标红 + doc tooltip +
+                // unit 后缀 + Enum 下拉 + default「默认」一键回填；未定义的
+                // 未知字段红字附加（validate 会拦截）。
+                let mut set_default: Option<(String, Value)> = None;
                 egui::Grid::new("params_edit_grid")
                     .striped(true)
                     .show(ui, |ui| {
+                        // ① 已定义字段按 schema 顺序（G5-M21：不再是 BTreeMap 字典序）
+                        for def in &edit.fields {
+                            let missing = !edit.values.contains_key(&def.name);
+                            // 名列：required 缺失标红 + doc tooltip
+                            let name_text = if def.required && missing {
+                                format!("{}（必填）", def.name)
+                            } else {
+                                def.name.clone()
+                            };
+                            let name_label = if def.required && missing {
+                                ui.colored_label(egui::Color32::RED, name_text)
+                            } else {
+                                ui.label(name_text)
+                            };
+                            let mut tip = def.doc.clone();
+                            if def.required && missing {
+                                if !tip.is_empty() {
+                                    tip.push('\n');
+                                }
+                                tip.push_str("必填字段缺失：确认时被校验拦截");
+                            }
+                            if !tip.is_empty() {
+                                name_label.on_hover_text(tip);
+                            }
+                            // 值列：按 FieldDef 路由
+                            match edit.values.get_mut(&def.name) {
+                                Some(v) => {
+                                    match v {
+                                        Value::Float(f) => {
+                                            let mut dv = egui::DragValue::new(f).speed(1.0);
+                                            if let Some(unit) = &def.unit {
+                                                dv = dv.suffix(format!(" {unit}"));
+                                            }
+                                            ui.add(dv);
+                                        }
+                                        Value::Int(i) => {
+                                            ui.add(egui::DragValue::new(i));
+                                        }
+                                        Value::Text(s) => match &def.field_type {
+                                            // Enum 下拉（G5-M21：之前只是文本框）
+                                            FieldType::Enum(options) => {
+                                                egui::ComboBox::from_id_salt(format!(
+                                                    "pe_enum_{}",
+                                                    def.name
+                                                ))
+                                                .selected_text(s.clone())
+                                                .show_ui(ui, |ui| {
+                                                    for opt in options {
+                                                        if ui
+                                                            .selectable_label(
+                                                                *s == *opt,
+                                                                opt.as_str(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            *s = opt.clone();
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            _ => {
+                                                ui.text_edit_singleline(s);
+                                            }
+                                        },
+                                        Value::Bool(b) => {
+                                            ui.checkbox(b, "");
+                                        }
+                                        Value::Ref(r) => {
+                                            ui.label(format!("→ {r}"));
+                                        }
+                                    }
+                                }
+                                None => {
+                                    ui.weak("（缺失）");
+                                }
+                            }
+                            // 恢复默认列（def.default 存在才给按钮）
+                            if let Some(d) = &def.default
+                                && ui.small_button("默认").clicked()
+                            {
+                                set_default = Some((def.name.clone(), d.clone()));
+                            }
+                            ui.end_row();
+                        }
+                        // ② 未知字段红字附加（schema 没有此字段定义——validate 拦截）
                         for (k, v) in edit.values.iter_mut() {
-                            ui.label(k.clone());
+                            if edit.fields.iter().any(|f| &f.name == k) {
+                                continue;
+                            }
+                            ui.colored_label(egui::Color32::RED, k.clone())
+                                .on_hover_text(
+                                    "未知字段：该模式没有此字段定义，确认时会被校验拦截",
+                                );
                             match v {
                                 Value::Float(f) => {
-                                    ui.add(egui::DragValue::new(f).speed(1.0).suffix(" mm"));
+                                    ui.add(egui::DragValue::new(f).speed(1.0));
                                 }
                                 Value::Int(i) => {
                                     ui.add(egui::DragValue::new(i));
@@ -1926,6 +2130,9 @@ impl BimApp {
                         revert_clicked = true;
                     }
                 });
+                if let Some((name, d)) = set_default {
+                    edit.values.insert(name, d);
+                }
             }
         }
         if apply_clicked {

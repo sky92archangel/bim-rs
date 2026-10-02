@@ -252,6 +252,74 @@ impl CoreSession {
         Ok(())
     }
 
+    /// 用已注册模式校验一份属性值（G5-M21：属性面板确认链路的 **set 前拦截**）。
+    ///
+    /// 与 [`CoreSession::validate_element_schema`] 的差异：后者校验元素**当前
+    /// 存储**的属性；本方法校验**编辑中的新值**（尚未落库）——非法值在 set
+    /// 与 rebuild 之前响亮拒绝。
+    ///
+    /// # Errors
+    /// 模式未注册（`UnknownSchema`）/ 属性不满足模式（缺必填 / 类型不匹配 /
+    /// 未知字段）时返回错误。
+    pub fn validate_map(&self, schema_name: &str, map: &PropertyMap) -> AppResult<()> {
+        let schema = self
+            .modules
+            .registry()
+            .schema(schema_name)
+            .ok_or_else(|| SdkError::UnknownSchema(schema_name.to_string()))?;
+        schema.validate(map)?;
+        Ok(())
+    }
+
+    /// **回写元素属性**（G5-M21：属性面板「应用并重建」的 set 步，validate
+    /// 通过后调用）。
+    ///
+    /// 属性编辑语义定版：新值先 `validate_map`（非法值拦截），通过后**回写
+    /// 元素 properties**（属性与几何一致——M10 现状不回写，重选构件后编辑
+    /// 快照变回旧值，语义混乱），再 `rebuild_geometry`。回写自动成为一个
+    /// 撤销步。
+    ///
+    /// # Errors
+    /// 元素不存在时返回错误。
+    pub fn update_element_properties(
+        &mut self,
+        element: ElementId,
+        properties: PropertyMap,
+    ) -> AppResult<()> {
+        self.document.edit(|doc| {
+            doc.element_mut(element)?.properties = properties;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// **删除构件**（G5-M21 元素树）：删元素 + 级联清关系（`remove_element`
+    /// 语义，自动成为一个撤销步）+ 删几何记录（不残留孤儿几何——
+    /// `has_dangling_geometry` 的消除路径）。
+    ///
+    /// ⚠ 已知限制（诚实）：受影响视图的**图纸实体不自动清除**（本门面不做
+    /// 重投——那是 rebuild 链路的 `update_after_commit`）；调用方应提示用户
+    /// 对相关视图做「重新生成」。
+    ///
+    /// # Errors
+    /// 元素不存在时返回错误。
+    pub fn delete_element(&mut self, element: ElementId) -> AppResult<()> {
+        let shape = {
+            let e = self.document.doc().element(element).ok_or(AppError::Model(
+                core_model::ModelError::ElementNotFound(element),
+            ))?;
+            e.geometry_ref
+        };
+        self.document.edit(|doc| {
+            if let Some(s) = shape {
+                doc.remove_geometry(s);
+            }
+            doc.remove_element(element)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     // ---------- 建模用例 ----------
 
     /// **新建构件**：按品类走模块工厂造语义元素，再收进文档。
@@ -1553,6 +1621,69 @@ mod tests {
             Some(10.0),
             "rebuild 不回写元素属性：元素属性保持 dx=10"
         );
+    }
+
+    #[test]
+    fn validate_map_blocks_before_set_and_update_element_properties_roundtrips() {
+        let mut s = CoreSession::new().unwrap();
+        s.upsert_schema(g5_box_schema()).unwrap();
+        let id = s.create_generic_element("盒-回写").unwrap();
+        s.document
+            .edit(|doc| {
+                doc.element_mut(id)?.properties = PropertyMap::new("G5_BOX")
+                    .with("dx", Value::Float(10.0))
+                    .with("dy", Value::Float(20.0))
+                    .with("dz", Value::Float(30.0));
+                Ok(())
+            })
+            .unwrap();
+
+        // validate_map：编辑新值的 set 前拦截（与 validate_element_schema 校验
+        // 元素当前存储属性互补——这里校验尚未落库的新值）。
+        let legal = PropertyMap::new("G5_BOX")
+            .with("dx", Value::Float(50.0))
+            .with("dy", Value::Float(20.0))
+            .with("dz", Value::Float(30.0));
+        s.validate_map("G5_BOX", &legal).unwrap();
+        let bad = PropertyMap::new("G5_BOX").with("dx", Value::Float(50.0));
+        assert!(s.validate_map("G5_BOX", &bad).is_err(), "缺必填被拦截");
+        assert!(s.validate_map("NOT_REGISTERED", &legal).is_err());
+        assert!(matches!(
+            s.validate_map("NOT_REGISTERED", &legal),
+            Err(AppError::Sdk(SdkError::UnknownSchema(_)))
+        ));
+
+        // update_element_properties：validate 通过后回写——元素属性读回新值
+        // （G5-M21 语义定版：属性编辑回写，与几何一致）。
+        s.update_element_properties(id, legal).unwrap();
+        assert_eq!(
+            s.document()
+                .doc()
+                .element(id)
+                .unwrap()
+                .properties
+                .get_float("dx"),
+            Some(50.0),
+            "回写后元素属性是新值（不再是 M10 的旧值快照）"
+        );
+        s.validate_element_schema(id).unwrap();
+    }
+
+    #[test]
+    fn delete_element_removes_element_and_geometry_record() {
+        let mut s = CoreSession::new().unwrap();
+        s.install_module(Box::new(DemoModule)).unwrap();
+        let id = s.create_element("DEMO_BOX", "盒-删").unwrap();
+        let shape = s.build_geometry(id, "test.demo.box").unwrap();
+        assert!(s.document().doc().geometry_record(shape).is_some());
+
+        s.delete_element(id).unwrap();
+        // 元素与几何记录都不残留（has_dangling_geometry 的消除路径）
+        assert!(s.document().doc().element(id).is_none());
+        assert!(s.document().doc().geometry_record(shape).is_none());
+        assert!(!s.document().has_dangling_geometry(id));
+        // 元素不存在 → 明确报错
+        assert!(s.delete_element(id).is_err());
     }
 
     #[test]

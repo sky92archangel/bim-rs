@@ -134,6 +134,86 @@ pub fn normalize_arc_angles(start: f64, end: f64) -> (f64, f64) {
     }
 }
 
+/// 特征链路封闭检查容差（mm，G4-M18）：端点重合判定（§5.6「首尾点距离 ≤ 容差」）。
+///
+/// 比内核的 1e-6 级点重合容差宽松——草图端点来自用户点击 + 捕捉（网格步长
+/// 10 mm、对象捕捉 px 阈值换算），留毫米级余量防「看起来闭合」的缝隙误报。
+pub const SKETCH_CLOSED_TOL_MM: f64 = 0.01;
+
+/// **特征轮廓封闭检查**（G4-M18 §5.6）：判定草图图元是否构成**单一封闭环**。
+///
+/// 特征链路（拉伸 / 旋转扫掠 / 放样扫掠）要求封闭轮廓；通用草图（wire 元素）
+/// 不要求（[`crate::session::CoreSession::build_sketch_profile`]）。判定口径：
+///
+/// - 线状图元（折线 / 贝塞尔 / 圆弧）各贡献**一对端点**（首点 + 末点）；
+/// - 整圆 / 整椭圆自身即环（各计 1 个独立环）；
+/// - 点 / 构造线 / 射线 / 标注是辅助图元——**不参与**（与 wire 组装口径一致）；
+/// - **恰好 1 个**独立环（整圆 / 整椭圆）且无线状图元 → 封闭；
+/// - 无独立环且全部线状端点**两两配对**（每个端点容差内至少与另一端点重合）
+///   → 封闭（多段线 / 多图元拼环均可）；
+/// - 其余（无几何图元 / 多环 / 圆与线混合）→ 未封闭——多环轮廓交由内核
+///   权威拒绝，本检查是**零内核调用**的快速反馈（特征门面第一步，未封闭
+///   即拒绝，绝不浪费内核调用，GUI 据此警告并**留在草图**）。
+#[must_use]
+pub fn is_closed_profile(entities: &[SketchEntity], tolerance: f64) -> bool {
+    let mut endpoints: Vec<DVec2> = Vec::new();
+    let mut loops = 0usize;
+    for entity in entities {
+        match entity {
+            // 整圆 / 整椭圆自身即环。
+            SketchEntity::Circle { .. } | SketchEntity::Ellipse { .. } => loops += 1,
+            SketchEntity::Polyline(points) => {
+                if points.len() >= 2 {
+                    endpoints.push(points[0]);
+                    endpoints.push(points[points.len() - 1]);
+                }
+            }
+            SketchEntity::Bezier(segments) => {
+                if let (Some(first), Some(last)) = (segments.first(), segments.last())
+                    && let (Some(a), Some(b)) = (first.first(), last.last())
+                {
+                    endpoints.push(*a);
+                    endpoints.push(*b);
+                }
+            }
+            SketchEntity::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                let (s, e) = normalize_arc_angles(*start_angle, *end_angle);
+                endpoints.push(DVec2::new(
+                    center.x + radius * s.cos(),
+                    center.y + radius * s.sin(),
+                ));
+                endpoints.push(DVec2::new(
+                    center.x + radius * e.cos(),
+                    center.y + radius * e.sin(),
+                ));
+            }
+            // 辅助 / 标注图元不参与（与 wire 组装口径一致）。
+            _ => {}
+        }
+    }
+    if loops > 1 || (loops > 0 && !endpoints.is_empty()) {
+        // 多环 / 圆与线混合：不是单一封闭环（内核也会拒绝）。
+        return false;
+    }
+    if loops == 1 {
+        return true;
+    }
+    // 线状链：每个端点至少与另一个端点重合（容差内计数含自身 ≥ 2）。
+    !endpoints.is_empty()
+        && endpoints.iter().all(|p| {
+            endpoints
+                .iter()
+                .filter(|q| (*p - **q).length() <= tolerance)
+                .count()
+                >= 2
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +275,115 @@ mod tests {
         let json = serde_json::to_string(&entities).expect("序列化成功");
         let back: Vec<SketchEntity> = serde_json::from_str(&json).expect("反序列化成功");
         assert_eq!(back, entities);
+    }
+
+    // ===== G4-M18：特征轮廓封闭检查钉子 ========================
+
+    use crate::sketch::SKETCH_CLOSED_TOL_MM;
+    use crate::sketch::is_closed_profile;
+
+    /// 4 条独立线段拼矩形：端点两两配对 → 封闭。
+    #[test]
+    fn rectangle_of_segments_is_closed() {
+        let rect = vec![
+            SketchEntity::Polyline(vec![DVec2::new(0.0, 0.0), DVec2::new(100.0, 0.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(100.0, 0.0), DVec2::new(100.0, 50.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(100.0, 50.0), DVec2::new(0.0, 50.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(0.0, 50.0), DVec2::new(0.0, 0.0)]),
+        ];
+        assert!(is_closed_profile(&rect, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 单条封闭折线（首末重合）：封闭。
+    #[test]
+    fn closed_polyline_is_closed() {
+        let tri = vec![SketchEntity::Polyline(vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(50.0, 0.0),
+            DVec2::new(25.0, 40.0),
+            DVec2::new(0.0, 0.0),
+        ])];
+        assert!(is_closed_profile(&tri, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 开放 L 形折线：未封闭。
+    #[test]
+    fn open_polyline_is_not_closed() {
+        let l = vec![SketchEntity::Polyline(vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(100.0, 0.0),
+            DVec2::new(100.0, 50.0),
+        ])];
+        assert!(!is_closed_profile(&l, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 单一整圆：封闭（自身即环）。
+    #[test]
+    fn single_circle_is_closed() {
+        let c = vec![SketchEntity::Circle {
+            center: DVec2::new(50.0, 50.0),
+            radius: 25.0,
+        }];
+        assert!(is_closed_profile(&c, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 弧 + 两段线拼环（弧端点经归一后配对）：封闭。
+    #[test]
+    fn arc_with_lines_closes() {
+        // 半圆弧 (0,0) → (100,0)（圆心 (50,0)，起角 π 归一到 0 + 2π），两段线拼回。
+        let shape = vec![
+            SketchEntity::Arc {
+                center: DVec2::new(50.0, 0.0),
+                radius: 50.0,
+                start_angle: std::f64::consts::PI,
+                end_angle: 0.0,
+            },
+            SketchEntity::Polyline(vec![DVec2::new(100.0, 0.0), DVec2::new(100.0, 60.0)]),
+            SketchEntity::Polyline(vec![DVec2::new(100.0, 60.0), DVec2::new(0.0, 0.0)]),
+        ];
+        assert!(is_closed_profile(&shape, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 圆与线混合（两个环）：未封闭（内核也拒绝多环轮廓）。
+    #[test]
+    fn mixed_circle_and_line_is_not_single_loop() {
+        let mixed = vec![
+            SketchEntity::Circle {
+                center: DVec2::new(50.0, 50.0),
+                radius: 25.0,
+            },
+            SketchEntity::Polyline(vec![DVec2::new(0.0, 0.0), DVec2::new(100.0, 0.0)]),
+        ];
+        assert!(!is_closed_profile(&mixed, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 超容差缝隙：未封闭（容差敏感——毫米级余量只吃「视觉闭合」误差）。
+    #[test]
+    fn gap_beyond_tolerance_is_open() {
+        let gapped = vec![
+            SketchEntity::Polyline(vec![DVec2::new(0.0, 0.0), DVec2::new(100.0, 0.0)]),
+            SketchEntity::Polyline(vec![
+                DVec2::new(100.0 + 0.5, 0.0),
+                DVec2::new(100.0, 50.0),
+                DVec2::new(0.0, 50.0),
+                DVec2::new(0.0, 0.0),
+            ]),
+        ];
+        assert!(!is_closed_profile(&gapped, SKETCH_CLOSED_TOL_MM));
+    }
+
+    /// 空几何（全辅助 / 标注）：未封闭。
+    #[test]
+    fn aux_only_is_not_closed() {
+        let aux = vec![
+            SketchEntity::Point(DVec2::new(0.0, 0.0)),
+            SketchEntity::DimLinear {
+                from: DVec2::new(0.0, 0.0),
+                to: DVec2::new(100.0, 0.0),
+                pos: DVec2::new(50.0, -20.0),
+                linear: true,
+            },
+        ];
+        assert!(!is_closed_profile(&aux, SKETCH_CLOSED_TOL_MM));
     }
 }

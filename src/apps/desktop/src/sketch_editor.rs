@@ -17,12 +17,16 @@
 //! - 回车 / 双击结束开放曲线（折线 / 贝塞尔 / 样条），Backspace 撤点，
 //!   Esc 取消进行中，Del 删除选中；
 //! - Ctrl+Z 撤销上一个图元，Ctrl+Y 重做（新动作使重做失效）；
-//! - 「完成」→ [`core_app::CoreSession::build_sketch_profile`]（造 wire +
-//!   建通用元素，失败零半成品）→ 调用方做渲染收尾（选中新构件 + 网格化 + 适配）。
+//! - 「完成」按**入口**（[`SketchEntry`]）分派（G4-M18 §5.6）：通用草图 →
+//!   [`core_app::CoreSession::build_sketch_profile`]（造 wire + 建通用元素）；
+//!   拉伸 / 旋转扫掠 / 放样扫掠 → 对应特征门面（**封闭检查**——未封闭响亮
+//!   警告并**留在草图**，绝不丢草图）→ 调用方做渲染收尾（选中新构件 +
+//!   网格化 + 适配）。
 
 use glam::DVec2;
 
-use core_app::{CoreSession, SketchEntity};
+use core_app::{CoreSession, RevolveAxis, SketchEntity};
+use core_model::ElementId;
 
 use crate::sketch_geom::{
     bezier_sample_polyline, catmull_rom_to_bezier, circle_through_three, segment_intersection,
@@ -49,6 +53,33 @@ const SCALE_MAX: f64 = 50.0;
 const DIM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x50, 0xb8, 0xd8);
 /// 标注数字字号（px）。
 const DIM_FONT_SIZE: f32 = 12.0;
+
+/// 草图入口（G4-M18 §5.6）：决定「完成」按钮的落盘语义——通用 wire 元素 /
+/// 拉伸 / 旋转扫掠 / 放样扫掠特征。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SketchEntry {
+    /// 通用草图：wire 落通用元素（不要求封闭，G4-M15 现流）。
+    Profile,
+    /// 拉伸：封闭轮廓沿草图平面法向拉伸成体（高度默认 500 mm）。
+    Extrude,
+    /// 旋转扫掠：封闭轮廓绕 XYZ 轴旋转成体（默认 0° → 360°；轴须与草图共面）。
+    Revolve,
+    /// 放样扫掠：封闭截面沿既有路径构件扫掠成体（路径起点切向 = 草图平面法向）。
+    Sweep,
+}
+
+impl SketchEntry {
+    /// 入口显示名（窗口标题 / 完成按钮语义 / 日志前缀）。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "通用草图",
+            Self::Extrude => "拉伸",
+            Self::Revolve => "旋转扫掠",
+            Self::Sweep => "放样扫掠",
+        }
+    }
+}
 
 /// 草图编辑器状态（BimApp 字段：`Some` = 编辑器开着）。
 pub struct SketchEditorState {
@@ -80,12 +111,31 @@ pub struct SketchEditorState {
     pub chamfer_distance: f64,
     /// 偏移距离（mm，偏移工具参数行；正 = 左侧 / 向外）
     pub offset_distance: f64,
+    /// 草图入口（G4-M18）：决定「完成」的落盘语义
+    pub entry: SketchEntry,
+    /// 拉伸高度（mm，拉伸入口参数行；默认 500，§5.6）
+    pub extrude_height: f64,
+    /// 旋转轴（旋转入口参数行；Z 轴与 z = 0 草图平面不共面，门面拒绝——
+    /// 参数行只提供 X / Y）
+    pub revolve_axis: RevolveAxis,
+    /// 旋转起始角（度，旋转入口参数行；默认 0）
+    pub revolve_start_deg: f64,
+    /// 旋转终止角（度，旋转入口参数行；默认 360）
+    pub revolve_end_deg: f64,
+    /// 放样路径（放样入口：路径构件 id + 显示名；打开放样草图前已指定——
+    /// §5.6 ①指定路径 → ②草图）
+    pub sweep_path: Option<(ElementId, String)>,
 }
 
 impl SketchEditorState {
-    /// 新建一个编辑器状态（预填草图名）。
+    /// 按入口新建编辑器状态（G4-M18 四入口：入口 + 特征参数预填；
+    /// 放样入口须已指定路径构件）。
     #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new_with_entry(
+        name: impl Into<String>,
+        entry: SketchEntry,
+        sweep_path: Option<(ElementId, String)>,
+    ) -> Self {
         Self {
             open: true,
             tool: SketchTool::Polyline,
@@ -101,6 +151,12 @@ impl SketchEditorState {
             fillet_radius: 10.0,
             chamfer_distance: 10.0,
             offset_distance: 10.0,
+            entry,
+            extrude_height: 500.0,
+            revolve_axis: RevolveAxis::X,
+            revolve_start_deg: 0.0,
+            revolve_end_deg: 360.0,
+            sweep_path,
         }
     }
 
@@ -168,7 +224,7 @@ pub fn run_editor(
 
     let mut outcome = EditorFrame::KeepOpen;
     let mut open = st.open;
-    egui::Window::new("草图编辑器")
+    egui::Window::new(format!("草图编辑器（{}）", st.entry.label()))
         .open(&mut open)
         .default_width(860.0)
         .default_height(620.0)
@@ -271,26 +327,118 @@ pub fn run_editor(
                     }
                     _ => {}
                 }
+                // —— 特征参数（按入口显示，G4-M18 §5.6）——
+                match st.entry {
+                    SketchEntry::Extrude => {
+                        ui.separator();
+                        ui.label("拉伸高度");
+                        ui.add(
+                            egui::DragValue::new(&mut st.extrude_height)
+                                .range(0.01..=100000.0)
+                                .speed(1.0),
+                        );
+                    }
+                    SketchEntry::Revolve => {
+                        ui.separator();
+                        ui.label("轴");
+                        // Z 轴与 z = 0 草图平面不共面（门面拒绝）——参数行只给 X / Y。
+                        for axis in [RevolveAxis::X, RevolveAxis::Y] {
+                            if ui
+                                .selectable_label(st.revolve_axis == axis, axis.label())
+                                .on_hover_text("旋转轴（须与草图共面：草图在 z = 0 平面）")
+                                .clicked()
+                            {
+                                st.revolve_axis = axis;
+                            }
+                        }
+                        ui.label("起角°");
+                        ui.add(
+                            egui::DragValue::new(&mut st.revolve_start_deg)
+                                .range(-360.0..=360.0)
+                                .speed(1.0),
+                        );
+                        ui.label("终角°");
+                        ui.add(
+                            egui::DragValue::new(&mut st.revolve_end_deg)
+                                .range(-360.0..=720.0)
+                                .speed(1.0),
+                        );
+                    }
+                    SketchEntry::Sweep => {
+                        ui.separator();
+                        match &st.sweep_path {
+                            Some((_, path_name)) => {
+                                ui.label(format!("路径：{path_name}"));
+                            }
+                            None => {
+                                ui.label("⚠ 未指定路径")
+                                    .on_hover_text("打开放样草图前先选中路径构件");
+                            }
+                        }
+                    }
+                    SketchEntry::Profile => {}
+                }
                 ui.separator();
                 ui.add(
                     egui::TextEdit::singleline(&mut st.name)
                         .desired_width(110.0)
                         .hint_text("草图名"),
                 );
+                let done_tip = match st.entry {
+                    SketchEntry::Profile => "建线成 wire 并落成通用草图元素",
+                    SketchEntry::Extrude => "封闭检查 + 沿草图平面法向拉伸成体（失败警告并留在草图）",
+                    SketchEntry::Revolve => "封闭 + 共面检查 + 绕轴旋转成体（失败警告并留在草图）",
+                    SketchEntry::Sweep => "封闭检查 + 沿路径扫掠成体（失败警告并留在草图）",
+                };
                 if ui
                     .button(format!("{} 完成", ph::CHECK))
-                    .on_hover_text("建线成 wire 并落成通用草图元素")
+                    .on_hover_text(done_tip)
                     .clicked()
                 {
                     if st.entities.is_empty() {
                         logs.push("✗ 草图为空：至少画 1 个图元再完成".to_string());
                     } else {
-                        match session.build_sketch_profile(&st.name, &st.entities) {
+                        // 按入口分派（G4-M18 §5.6）：失败一律警告 + **留在草图**
+                        // （绝不丢草图——回滚回草图编辑）。
+                        let result = match st.entry {
+                            SketchEntry::Profile => {
+                                session.build_sketch_profile(&st.name, &st.entities)
+                            }
+                            SketchEntry::Extrude => session.build_sketch_extrude(
+                                &st.name,
+                                &st.entities,
+                                st.extrude_height,
+                            ),
+                            SketchEntry::Revolve => session.build_sketch_revolve(
+                                &st.name,
+                                &st.entities,
+                                st.revolve_axis,
+                                st.revolve_start_deg,
+                                st.revolve_end_deg,
+                            ),
+                            SketchEntry::Sweep => match st.sweep_path {
+                                Some((pid, _)) => {
+                                    session.build_sketch_sweep(&st.name, &st.entities, pid)
+                                }
+                                None => Err(core_app::AppError::RecipeNotExecutable(
+                                    "未指定放样路径：先选中路径构件（样条 / 线状）再打开放样草图"
+                                        .to_string(),
+                                )),
+                            },
+                        };
+                        match result {
                             Ok(o) => {
-                                logs.push(format!("✓ 草图「{}」已落成元素（{o:?}）", st.name));
+                                logs.push(format!(
+                                    "✓ {}「{}」已落成元素（{o:?}）",
+                                    st.entry.label(),
+                                    st.name
+                                ));
                                 outcome = EditorFrame::Committed(o.element, o.shape);
                             }
-                            Err(e) => logs.push(format!("✗ 草图构建失败：{e}")),
+                            Err(e) => logs.push(format!(
+                                "✗ {}失败：{e}（草图保留，可继续编辑）",
+                                st.entry.label()
+                            )),
                         }
                     }
                 }
@@ -1078,8 +1226,8 @@ fn draw_preview(
                         painter.line_segment([to_px(b), to_px(cursor)], stroke);
                         let is_rotate = matches!(draft, SketchDraft::Rotate { .. });
                         let ghost = if is_rotate {
-                            let angle = (cursor - b).y.atan2((cursor - b).x)
-                                - (r - b).y.atan2((r - b).x);
+                            let angle =
+                                (cursor - b).y.atan2((cursor - b).x) - (r - b).y.atan2((r - b).x);
                             rotate_entity(e, b, angle)
                         } else {
                             let d_ref = (r - b).length();

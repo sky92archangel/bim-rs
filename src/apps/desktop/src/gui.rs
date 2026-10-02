@@ -81,6 +81,8 @@ use hvac_duct::{
     GEOMETRY_OP_ID_TRANSITION as OP_DUCT_TRANSITION, HvacDuct,
 };
 
+use crate::sketch_editor::SketchEntry;
+
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
@@ -1114,21 +1116,60 @@ impl BimApp {
                 }
             }
             ui.separator();
-            // —— 草图三入口（G4-M15：拉伸 / 旋转扫掠 / 放样共用一个编辑器；
-            //    M18 接特征链路后按入口预填特征参数）——
-            for (name, icon) in [
-                ("拉伸草图", ph::FRAME_CORNERS),
-                ("旋转扫掠草图", ph::PATH),
-                ("放样草图", ph::SHAPES),
+            // —— 草图四入口（G4-M15 共用编辑器；G4-M18 接特征链路：入口决定
+            //    「完成」落盘语义——通用 wire 元素 / 拉伸 / 旋转扫掠 / 放样扫掠
+            //    特征，§5.6）——
+            for (name, icon, entry) in [
+                ("通用草图", ph::VECTOR_THREE, SketchEntry::Profile),
+                ("拉伸草图", ph::FRAME_CORNERS, SketchEntry::Extrude),
+                ("旋转扫掠草图", ph::PATH, SketchEntry::Revolve),
+                ("放样草图", ph::SHAPES, SketchEntry::Sweep),
             ] {
+                let tip = match entry {
+                    SketchEntry::Extrude => {
+                        "封闭轮廓沿草图平面法向拉伸成体（默认 500mm；未封闭警告并留在草图）"
+                    }
+                    SketchEntry::Revolve => {
+                        "封闭轮廓绕轴旋转成体（默认 0°→360°，可区间；轴须与草图共面）"
+                    }
+                    SketchEntry::Sweep => {
+                        "封闭截面沿路径扫掠成体（先选中路径构件，再打开放样草图）"
+                    }
+                    SketchEntry::Profile => "打开草图编辑器（通用 wire 元素）",
+                };
                 if ui
                     .button(format!("{icon} {name}"))
-                    .on_hover_text(format!("打开草图编辑器（{name}）"))
+                    .on_hover_text(tip)
                     .clicked()
                 {
                     // 窗口已开时不重置（避免误点丢草稿）。
                     if self.sketch.is_none() {
-                        self.sketch = Some(crate::sketch_editor::SketchEditorState::new(name));
+                        // 放样路径先行（§5.6 ①指定路径 → ②草图）：须先选中
+                        // 路径构件（样条 / 线状）。
+                        let sweep_path = if entry == SketchEntry::Sweep {
+                            match self.selected {
+                                Some(id) => {
+                                    let path_name = self
+                                        .session
+                                        .document()
+                                        .doc()
+                                        .element(id)
+                                        .map(|e| e.name.clone())
+                                        .unwrap_or_else(|| "路径".to_string());
+                                    Some((id, path_name))
+                                }
+                                None => {
+                                    self.log("✗ 放样：先选中路径构件（样条 / 线状）再打开放样草图");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        self.sketch =
+                            Some(crate::sketch_editor::SketchEditorState::new_with_entry(
+                                name, entry, sweep_path,
+                            ));
                     }
                 }
             }

@@ -35,7 +35,7 @@ use core_doc::{
     ViewOrientation,
 };
 use core_kernel::{KernelError, MeshData};
-use core_model::{Document, ElementId, PropertyMap, ShapeId, ViewId};
+use core_model::{Document, ElementId, PropertyMap, ShapeId, Value, ViewId};
 use core_sdk::{BuildOp, Module, OpInput, SdkError};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -48,7 +48,7 @@ use crate::interop_service::InteropService;
 use crate::module_host::ModuleHost;
 use crate::picker_service::KernelPicker;
 use crate::projection_service::{project_shape, reproject_into};
-use crate::sketch::SketchEntity;
+use crate::sketch::{SKETCH_CLOSED_TOL_MM, SketchEntity, is_closed_profile};
 use crate::store;
 use crate::topo_naming::face_hash_names_from_handle;
 use crate::update_service::{UpdateReport, update_after_commit};
@@ -90,6 +90,39 @@ pub struct NativeOutcome {
     pub shape: ShapeId,
     /// 执行警告（可观测回退说明）
     pub warnings: Vec<String>,
+}
+
+/// 旋转扫掠轴（G4-M18 §5.6）：XYZ 三轴，过原点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevolveAxis {
+    /// X 轴（方向 (1, 0, 0)）
+    X,
+    /// Y 轴（方向 (0, 1, 0)）
+    Y,
+    /// Z 轴（方向 (0, 0, 1)——垂直于 z = 0 草图平面，共面校验拒绝）
+    Z,
+}
+
+impl RevolveAxis {
+    /// 轴方向（单位向量的分量）。
+    #[must_use]
+    pub fn direction(self) -> [f64; 3] {
+        match self {
+            Self::X => [1.0, 0.0, 0.0],
+            Self::Y => [0.0, 1.0, 0.0],
+            Self::Z => [0.0, 0.0, 1.0],
+        }
+    }
+
+    /// 显示名（GUI 参数行 / 错误信息）。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::X => "X 轴",
+            Self::Y => "Y 轴",
+            Self::Z => "Z 轴",
+        }
+    }
 }
 
 impl CoreSession {
@@ -343,6 +376,264 @@ impl CoreSession {
             element,
             shape,
             warnings: Vec::new(),
+        })
+    }
+
+    /// **草图拉伸特征**（G4-M18 §5.6）：封闭轮廓沿草图平面法向（+Z）拉伸成体。
+    ///
+    /// 流程（照行 297 确认流程——先纯数据检查再内核调用，失败回滚回草图）：
+    /// ① 封闭检查（[`crate::sketch::is_closed_profile`]，容差
+    ///   [`crate::sketch::SKETCH_CLOSED_TOL_MM`]）——未封闭 → 响亮拒绝（GUI 警告 +
+    ///   **留在草图**，绝不丢草图）；② [`GeometryService::build_sketch_wire`]
+    ///   造 wire（失败零半成品）；③ [`GeometryService::execute_native`] 单步
+    ///   `Extrude`（`dz = height_mm` 即草图平面法向，dx / dy = 0）；失败释放
+    ///   wire 后原样抛错；④ 成功 → 建通用元素 +
+    ///   [`Self::install_executed`] 落盘（照 [`Self::combine_native`] ④，
+    ///   install 内统一释放 wire 与结果句柄）。
+    ///
+    /// # Errors
+    /// 轮廓未封闭 / 图元非法 / 高度非有限 / 内核执行失败时返回错误。
+    pub fn build_sketch_extrude(
+        &mut self,
+        name: &str,
+        entities: &[SketchEntity],
+        height_mm: f64,
+    ) -> AppResult<NativeOutcome> {
+        // ① 封闭检查（纯数据，零内核调用）
+        if !is_closed_profile(entities, SKETCH_CLOSED_TOL_MM) {
+            return Err(AppError::RecipeNotExecutable(
+                "轮廓未封闭：拉伸需要单一封闭环（先补线封闭，或改走「通用草图」入口）".to_string(),
+            ));
+        }
+        // ② 造 wire（失败零半成品）
+        let wire = self.geometry.build_sketch_wire(entities)?;
+        // ③ 单步拉伸（dz 即草图平面法向）
+        let args = PropertyMap::new("sketch.extrude")
+            .with("dx", Value::Float(0.0))
+            .with("dy", Value::Float(0.0))
+            .with("dz", Value::Float(height_mm));
+        let executed = match self
+            .geometry
+            .execute_native(BuildOp::Extrude, &args.values, &[wire])
+        {
+            Ok(e) => e,
+            Err(err) => {
+                let _ = self.geometry.kernel_mut().release(wire);
+                return Err(err);
+            }
+        };
+        // ④ 建元素 + 落盘（install_executed 释放结果句柄；输入 wire 是本门面
+        //    **临时**句柄——execute_native 不释放输入（照 combine_native 纪律，
+        //    那里的输入是缓存句柄），此处补释放）
+        let outcome = self.install_sketch_solid(name, &executed);
+        let _ = self.geometry.kernel_mut().release(wire);
+        outcome
+    }
+
+    /// **草图旋转扫掠特征**（G4-M18 §5.6）：封闭轮廓绕 XYZ 轴旋转成体。
+    ///
+    /// 流程：① 封闭检查（同 [`Self::build_sketch_extrude`]）；② **共面校验**
+    /// ——草图在 z = 0 平面，轴必须也在该平面内（X / Y 轴），Z 轴垂直于草图
+    /// 平面、轮廓绕它只会扫出平面环形 → 拒绝；③ 角度区间校验——扫角
+    /// （终角 − 起角）∈ (0°, 360°]；④ 造 wire；⑤ **轮廓预旋转方案**（§5.6
+    /// 行 203：起角非零 → wire 先绕轴转到起始角、再扫终角 − 起角——零内核
+    /// 改动）；⑥ [`GeometryService::execute_native`] 单步 `Revolve`（轴过
+    /// 原点、角度弧度）；⑦ 建元素 + 落盘。
+    ///
+    /// # Errors
+    /// 轮廓未封闭 / 轴与草图不共面 / 角度区间非法 / 图元非法 / 内核执行失败
+    /// 时返回错误。
+    pub fn build_sketch_revolve(
+        &mut self,
+        name: &str,
+        entities: &[SketchEntity],
+        axis: RevolveAxis,
+        start_deg: f64,
+        end_deg: f64,
+    ) -> AppResult<NativeOutcome> {
+        // ① 封闭检查
+        if !is_closed_profile(entities, SKETCH_CLOSED_TOL_MM) {
+            return Err(AppError::RecipeNotExecutable(
+                "轮廓未封闭：旋转扫掠需要单一封闭环（先补线封闭，或改走「通用草图」入口）"
+                    .to_string(),
+            ));
+        }
+        // ② 共面校验（草图在 z = 0 平面 → 轴须在该平面内）
+        if axis == RevolveAxis::Z {
+            return Err(AppError::RecipeNotExecutable(
+                "旋转轴与草图不共面：草图在 z = 0 平面，须选 X / Y 轴（Z 轴垂直于草图平面）"
+                    .to_string(),
+            ));
+        }
+        // ③ 角度区间校验：扫角 = 终角 − 起角 ∈ (0°, 360°]
+        let sweep_deg = end_deg - start_deg;
+        if !(sweep_deg > f64::EPSILON && sweep_deg <= 360.0) {
+            return Err(AppError::RecipeNotExecutable(format!(
+                "旋转角区间非法：扫角（终角 − 起角）须在 (0°, 360°]，实得 {sweep_deg:.1}°"
+            )));
+        }
+        // ④ 造 wire
+        let wire = self.geometry.build_sketch_wire(entities)?;
+        // ⑤ 轮廓预旋转（起角非零 → wire 先转到起始角，rotate 返回新句柄、不消费输入）
+        let profile = if start_deg.abs() > 1e-9 {
+            let [dx, dy, dz] = axis.direction();
+            let rotated = self.geometry.kernel_mut().rotate(
+                wire,
+                0.0,
+                0.0,
+                0.0,
+                dx,
+                dy,
+                dz,
+                start_deg.to_radians(),
+            );
+            let _ = self.geometry.kernel_mut().release(wire);
+            rotated.map_err(AppError::Kernel)?
+        } else {
+            wire
+        };
+        // ⑥ 单步旋转（轴过原点、沿 XYZ；角度弧度）
+        let [adx, ady, adz] = axis.direction();
+        let args = PropertyMap::new("sketch.revolve")
+            .with("px", Value::Float(0.0))
+            .with("py", Value::Float(0.0))
+            .with("pz", Value::Float(0.0))
+            .with("dx", Value::Float(adx))
+            .with("dy", Value::Float(ady))
+            .with("dz", Value::Float(adz))
+            .with("angle_rad", Value::Float(sweep_deg.to_radians()));
+        let executed =
+            match self
+                .geometry
+                .execute_native(BuildOp::Revolve, &args.values, &[profile])
+            {
+                Ok(e) => e,
+                Err(err) => {
+                    let _ = self.geometry.kernel_mut().release(profile);
+                    return Err(err);
+                }
+            };
+        // ⑦ 建元素 + 落盘（结果句柄由 install_executed 释放；profile 是本门面
+        //    **临时**句柄，此处补释放——含预旋转与未预旋转两路）
+        let outcome = self.install_sketch_solid(name, &executed);
+        let _ = self.geometry.kernel_mut().release(profile);
+        outcome
+    }
+
+    /// **草图放样扫掠特征**（G4-M18 §5.6）：封闭截面沿既有路径构件扫掠成体。
+    ///
+    /// 流程：① 封闭检查（同 [`Self::build_sketch_extrude`]）；② 路径构件必须
+    /// 有几何；③ 造截面 wire；④ [`GeometryService::resolve`] 懒重建路径句柄
+    /// （缓存句柄，归 geometry 管理——失败释放截面 wire）；⑤ **路径起点切向
+    /// 尽力校验**（§5.6 行 204 ⑤：tessellate 采样前两点近似切向，z 分量不足
+    /// 0.99 → `warnings` 警告**不阻断**——内核 Sweep 以路径起点切向定位截面，
+    /// 偏差大时扫掠体歪斜，可观测提示；**采样不足时静默跳过**——真实内核对
+    /// wire 无网格化顶点，每次都警告会成噪音）；⑥
+    /// [`GeometryService::execute_native`] 单步 `Sweep`（输入顺序恒为
+    /// `[profile, spine]`）；⑦ 建元素 + 落盘。
+    ///
+    /// # Errors
+    /// 轮廓未封闭 / 路径元素不存在或尚无几何 / 图元非法 / 内核执行失败时返回
+    /// 错误。
+    pub fn build_sketch_sweep(
+        &mut self,
+        name: &str,
+        entities: &[SketchEntity],
+        path_element: ElementId,
+    ) -> AppResult<NativeOutcome> {
+        // ① 封闭检查
+        if !is_closed_profile(entities, SKETCH_CLOSED_TOL_MM) {
+            return Err(AppError::RecipeNotExecutable(
+                "轮廓未封闭：放样扫掠需要单一封闭截面（先补线封闭，或改走「通用草图」入口）"
+                    .to_string(),
+            ));
+        }
+        // ② 路径构件必须有几何
+        let path_shape = {
+            let e = self
+                .document
+                .doc()
+                .element(path_element)
+                .ok_or(AppError::Model(core_model::ModelError::ElementNotFound(
+                    path_element,
+                )))?;
+            e.geometry_ref.ok_or_else(|| {
+                AppError::RecipeNotExecutable(format!(
+                    "路径构件 {path_element} 尚无几何：放样扫掠需要线状路径（样条 / 折线）"
+                ))
+            })?
+        };
+        // ③ 造截面 wire
+        let wire = self.geometry.build_sketch_wire(entities)?;
+        // ④ 路径句柄（缓存句柄归 geometry 管理，不在此释放——照 combine_native）
+        let spine = match self.geometry.resolve(self.document.doc(), path_shape) {
+            Ok(h) => h,
+            Err(err) => {
+                let _ = self.geometry.kernel_mut().release(wire);
+                return Err(err);
+            }
+        };
+        // ⑤ 路径起点切向尽力校验（采样前两点近似切向；与拾取链路同挠度可复用
+        //    缓存）。采样不足（如真实内核对 wire 无网格化顶点）时**静默跳过**
+        //    ——每次放样都警告会成噪音；内核 Sweep 以路径起点切向定位截面，
+        //    偏差大时扫掠体歪斜，交由用户目测修正。可采样但 |tz| < 0.99 →
+        //    可观测警告（§5.6 行 204 ⑤：切向 = 草图平面法向）。
+        let mut warnings: Vec<String> = Vec::new();
+        if let Ok(mesh) = self.geometry.tessellate_for_pick(path_shape, 0.1, 0.5)
+            && mesh.positions.len() >= 2
+        {
+            let [ax, ay, az] = mesh.positions[0];
+            let [bx, by, bz] = mesh.positions[1];
+            let d = [bx - ax, by - ay, bz - az];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if len > 1e-9 {
+                let nz = (d[2] / len).abs();
+                if nz < 0.99 {
+                    warnings.push(format!(
+                        "路径起点切向与草图平面法向偏差较大（|tz| = {nz:.2}）：\
+                         扫掠体可能歪斜（约定切向 = 草图平面法向）"
+                    ));
+                }
+            }
+        }
+        // ⑥ 单步扫掠（输入顺序恒为 [profile, spine]）
+        let args = PropertyMap::new("sketch.sweep").with("transition_mode", Value::Int(0));
+        let executed =
+            match self
+                .geometry
+                .execute_native(BuildOp::Sweep, &args.values, &[wire, spine])
+            {
+                Ok(e) => e,
+                Err(err) => {
+                    let _ = self.geometry.kernel_mut().release(wire);
+                    return Err(err);
+                }
+            };
+        // ⑦ 建元素 + 落盘（切向警告与执行警告合并透传；截面 wire 是本门面
+        //    **临时**句柄，此处补释放——spine 是缓存句柄归 geometry 管理）
+        let outcome = self.install_sketch_solid(name, &executed);
+        let _ = self.geometry.kernel_mut().release(wire);
+        let mut outcome = outcome?;
+        warnings.extend(outcome.warnings);
+        outcome.warnings = warnings;
+        Ok(outcome)
+    }
+
+    /// 特征执行结果落盘（三入口共用段）：建通用元素 →
+    /// [`Self::install_executed`]（snapshot + 落盘 + 统一释放输入与结果句柄）。
+    fn install_sketch_solid(
+        &mut self,
+        name: &str,
+        executed: &crate::geometry_service::ExecutedRecipe,
+    ) -> AppResult<NativeOutcome> {
+        let element = core_model::Element::new(core_model::Category::generic(), name);
+        let new_id = element.id;
+        self.document.add_element(element)?;
+        let (shape, warnings) = self.install_executed(new_id, executed)?;
+        Ok(NativeOutcome {
+            element: new_id,
+            shape,
+            warnings,
         })
     }
 
@@ -1894,5 +2185,234 @@ mod tests {
         assert!(got.is_err(), "负半径应失败");
         assert_eq!(s.document().element_count(), 0, "失败不留半成品元素");
         assert_eq!(s.geometry().kernel().live_count(), 0, "失败回滚全部已建边");
+    }
+
+    // ===== G4-M18：三入口特征链路钉子（API 复现用例，§5.6）====================
+
+    use crate::session::RevolveAxis;
+
+    /// 矩形轮廓（4 条独立线段拼环——多图元拼封闭环的口径）。
+    fn rect_profile() -> Vec<SketchEntity> {
+        vec![
+            SketchEntity::Polyline(vec![
+                glam::DVec2::new(0.0, 0.0),
+                glam::DVec2::new(100.0, 0.0),
+            ]),
+            SketchEntity::Polyline(vec![
+                glam::DVec2::new(100.0, 0.0),
+                glam::DVec2::new(100.0, 50.0),
+            ]),
+            SketchEntity::Polyline(vec![
+                glam::DVec2::new(100.0, 50.0),
+                glam::DVec2::new(0.0, 50.0),
+            ]),
+            SketchEntity::Polyline(vec![
+                glam::DVec2::new(0.0, 50.0),
+                glam::DVec2::new(0.0, 0.0),
+            ]),
+        ]
+    }
+
+    /// 开放 L 形轮廓（未封闭）。
+    fn open_profile() -> Vec<SketchEntity> {
+        vec![SketchEntity::Polyline(vec![
+            glam::DVec2::new(0.0, 0.0),
+            glam::DVec2::new(100.0, 0.0),
+            glam::DVec2::new(100.0, 50.0),
+        ])]
+    }
+
+    /// **M18 钉 1（拉伸 · API 复现用例）**：封闭轮廓 → 拉伸体 → 元素落盘 →
+    /// 全部句柄释放（wire + 结果，live_count 回 0）。
+    #[test]
+    fn sketch_extrude_builds_solid_from_closed_profile() {
+        let mut s = CoreSession::new().unwrap();
+        let outcome = s
+            .build_sketch_extrude("拉伸-1", &rect_profile(), 500.0)
+            .expect("封闭轮廓拉伸应成功");
+
+        assert_eq!(s.document().element_count(), 1);
+        let e = s
+            .document()
+            .doc()
+            .element(outcome.element)
+            .expect("元素应存在");
+        assert_eq!(e.geometry_ref, Some(outcome.shape), "geometry_ref 应回填");
+        let record = s
+            .document()
+            .doc()
+            .geometry_record(outcome.shape)
+            .expect("几何记录应存在");
+        assert!(record.text.contains(" extrude "), "应为拉伸形态文本");
+
+        assert_eq!(
+            s.geometry().kernel().live_count(),
+            0,
+            "wire 与结果句柄全释放"
+        );
+    }
+
+    /// **M18 钉 2（拉伸 · 未封闭拒绝）**：开放 L 形 → 封闭检查拒绝（零内核
+    /// 调用——无元素、无记录、无句柄），GUI 据此警告 + 留在草图。
+    #[test]
+    fn sketch_extrude_rejects_open_profile() {
+        let mut s = CoreSession::new().unwrap();
+        let got = s.build_sketch_extrude("拉伸-坏", &open_profile(), 500.0);
+        assert!(got.is_err(), "未封闭轮廓应拒绝");
+        assert!(
+            got.unwrap_err().to_string().contains("未封闭"),
+            "错误应说明未封闭"
+        );
+        assert_eq!(s.document().element_count(), 0, "拒绝不留元素");
+        assert_eq!(s.geometry().kernel().live_count(), 0, "拒绝不留句柄");
+    }
+
+    /// **M18 钉 3（拉伸 · 非有限高度）**：NaN 高度 → 内核 finite 校验拒绝，
+    /// wire 已回滚（不留半成品）。
+    #[test]
+    fn sketch_extrude_rejects_non_finite_height() {
+        let mut s = CoreSession::new().unwrap();
+        let got = s.build_sketch_extrude("拉伸-坏", &rect_profile(), f64::NAN);
+        assert!(got.is_err(), "NaN 高度应被内核拒绝");
+        assert_eq!(s.document().element_count(), 0, "失败不留元素");
+        assert_eq!(s.geometry().kernel().live_count(), 0, "失败回滚 wire");
+    }
+
+    /// **M18 钉 4（旋转 · API 复现用例）**：360° 全周旋转 → 成功落盘。
+    #[test]
+    fn sketch_revolve_full_turn_builds() {
+        let mut s = CoreSession::new().unwrap();
+        let outcome = s
+            .build_sketch_revolve("旋转-1", &rect_profile(), RevolveAxis::X, 0.0, 360.0)
+            .expect("360° 旋转应成功");
+        let record = s
+            .document()
+            .doc()
+            .geometry_record(outcome.shape)
+            .expect("几何记录应存在");
+        assert!(record.text.contains(" revolve "), "应为旋转形态文本");
+        assert_eq!(s.geometry().kernel().live_count(), 0);
+    }
+
+    /// **M18 钉 5（旋转 · §5.6 预旋转方案）**：20°~180° 区间（起角非零 →
+    /// wire 先转到起始角再扫 160°）→ 成功落盘，零内核改动。
+    #[test]
+    fn sketch_revolve_interval_pre_rotates() {
+        let mut s = CoreSession::new().unwrap();
+        let outcome = s
+            .build_sketch_revolve("旋转-2", &rect_profile(), RevolveAxis::Y, 20.0, 180.0)
+            .expect("区间旋转（预旋转方案）应成功");
+        let record = s
+            .document()
+            .doc()
+            .geometry_record(outcome.shape)
+            .expect("几何记录应存在");
+        assert!(record.text.contains(" revolve "));
+        assert_eq!(
+            s.geometry().kernel().live_count(),
+            0,
+            "预旋转旧 wire 也应释放"
+        );
+    }
+
+    /// **M18 钉 6（旋转 · 共面校验）**：Z 轴垂直于 z = 0 草图平面 → 拒绝
+    /// （轮廓绕它只会扫出平面环形，扫不出体）。
+    #[test]
+    fn sketch_revolve_rejects_z_axis() {
+        let mut s = CoreSession::new().unwrap();
+        let got = s.build_sketch_revolve("旋转-坏", &rect_profile(), RevolveAxis::Z, 0.0, 360.0);
+        assert!(got.is_err(), "Z 轴应被共面校验拒绝");
+        assert!(
+            got.unwrap_err().to_string().contains("不共面"),
+            "错误应说明不共面"
+        );
+        assert_eq!(s.document().element_count(), 0);
+        assert_eq!(s.geometry().kernel().live_count(), 0);
+    }
+
+    /// **M18 钉 7（旋转 · 区间校验）**：扫角 ≤ 0（终角 < 起角 / 相等）或
+    /// > 360° → 拒绝。
+    #[test]
+    fn sketch_revolve_rejects_bad_interval() {
+        let mut s = CoreSession::new().unwrap();
+        assert!(
+            s.build_sketch_revolve("旋转-坏", &rect_profile(), RevolveAxis::X, 180.0, 20.0)
+                .is_err(),
+            "扫角 ≤ 0 应拒绝"
+        );
+        assert!(
+            s.build_sketch_revolve("旋转-坏", &rect_profile(), RevolveAxis::X, 0.0, 0.0)
+                .is_err(),
+            "0 扫角应拒绝"
+        );
+        assert!(
+            s.build_sketch_revolve("旋转-坏", &rect_profile(), RevolveAxis::X, 0.0, 400.0)
+                .is_err(),
+            "扫角 > 360° 应拒绝"
+        );
+        assert_eq!(s.document().element_count(), 0);
+        assert_eq!(s.geometry().kernel().live_count(), 0);
+    }
+
+    /// **M18 钉 8（放样 · mock 腿响亮拒绝）**：mock 内核不实现 sweep →
+    /// 门面 Err 且不留半成品（截面 wire 已回滚）；路径构件 + 截面轮廓全走
+    /// 真实 API 组装（不经 GUI，API 复现口径）。
+    #[test]
+    fn sketch_sweep_rejected_by_mock_loudly() {
+        let mut s = CoreSession::new().unwrap();
+        // 路径先行（§5.6 ①指定路径）：竖直脊线 wire 元素。
+        let path = s
+            .build_sketch_profile(
+                "路径-1",
+                &[SketchEntity::Polyline(vec![
+                    glam::DVec2::new(0.0, 0.0),
+                    glam::DVec2::new(0.0, 300.0),
+                ])],
+            )
+            .expect("路径应建成");
+        let got = s.build_sketch_sweep("扫掠-1", &rect_profile(), path.element);
+        assert!(got.is_err(), "mock 内核应响亮拒绝 sweep");
+        assert!(
+            got.unwrap_err().to_string().contains("sweep"),
+            "错误应指向 sweep"
+        );
+        // 失败回滚：截面 wire 已释放；spine 是 resolve 懒重建的**缓存**句柄
+        // （归 geometry 管理，照 combine_native 纪律不释放——live_count 1 = 缓存）。
+        assert_eq!(
+            s.geometry().kernel().live_count(),
+            1,
+            "wire 已释放，spine 缓存保留"
+        );
+    }
+
+    /// **M18 钉 9（放样 · occt 真腿 API 复现用例）**：封闭截面 + 竖直脊线
+    /// （起点切向 = +Z = 草图平面法向）→ 扫掠体落盘（真实内核能力）。
+    #[cfg(feature = "occt")]
+    #[test]
+    fn sketch_sweep_builds_with_real_kernel() {
+        let mut s = CoreSession::with_real_kernel().expect("真内核会话");
+        let path = s
+            .build_sketch_profile(
+                "路径",
+                &[SketchEntity::Polyline(vec![
+                    glam::DVec2::new(0.0, 0.0),
+                    glam::DVec2::new(0.0, 300.0),
+                ])],
+            )
+            .expect("路径应建成");
+        let outcome = s
+            .build_sketch_sweep("扫掠-1", &rect_profile(), path.element)
+            .expect("真内核扫掠应成功");
+        assert!(
+            outcome.warnings.is_empty(),
+            "切向对齐时不应有警告：{:?}",
+            outcome.warnings
+        );
+        let e = s
+            .document()
+            .doc()
+            .element(outcome.element)
+            .expect("元素应存在");
+        assert_eq!(e.geometry_ref, Some(outcome.shape));
     }
 }

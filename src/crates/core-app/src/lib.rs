@@ -87,8 +87,8 @@ pub use projection_service::{
     curve_to_entity, project_shape, project_view, projectable_shapes, reproject_into, view_def_of,
 };
 pub use selector::{EdgeSelector, FaceSelector};
-pub use session::{CoreSession, SessionSummary};
-pub use sketch::{SketchEntity, normalize_arc_angles};
+pub use session::{CoreSession, RevolveAxis, SessionSummary};
+pub use sketch::{SKETCH_CLOSED_TOL_MM, SketchEntity, is_closed_profile, normalize_arc_angles};
 pub use store::{
     CONTAINER_MANIFEST, FORMAT_VERSION, open_document, open_from_dir, pack_to_dir, save_document,
 };

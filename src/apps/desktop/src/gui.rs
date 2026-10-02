@@ -47,7 +47,7 @@ use cable_tunnel::{
 };
 use core_app::CoreSession;
 use core_doc::{Camera, PickFilter, PickResult, Ray, ViewOrientation};
-use core_interop::{Format, Drawing2D};
+use core_interop::{Drawing2D, Format};
 use core_model::{ElementId, PropertyMap, ShapeId, Value, ViewId};
 use core_sdk::Module;
 use example_beam::{
@@ -270,7 +270,8 @@ fn view_presets() -> Vec<ViewPreset> {
 }
 
 /// 按品类取基色（构件分色，便于区分模块）。
-fn base_color(category: &str) -> [u8; 3] {    match category {
+fn base_color(category: &str) -> [u8; 3] {
+    match category {
         BEAM_CATEGORY => [0x8a, 0x93, 0xa6],   // 混凝土灰蓝
         DUCT_CATEGORY => [0xbd, 0xc3, 0xcc],   // 镀锌钢板银灰
         TUNNEL_CATEGORY => [0xa6, 0xa0, 0x96], // 隧道混凝土灰
@@ -467,7 +468,8 @@ impl BimApp {
     fn do_new(&mut self) {
         match Self::new() {
             Ok(mut app) => {
-                app.logs.insert(0, "✓ 已新建文档（未保存更改已丢弃）".to_string());
+                app.logs
+                    .insert(0, "✓ 已新建文档（未保存更改已丢弃）".to_string());
                 *self = app;
             }
             Err(e) => self.log(format!("✗ 新建失败：{e}")),
@@ -841,29 +843,31 @@ impl BimApp {
                     "模式：{}（可编辑，改后点\"应用并重建\"）",
                     elem.properties.schema
                 ));
-                egui::Grid::new("params_edit_grid").striped(true).show(ui, |ui| {
-                    for (k, v) in edit.values.iter_mut() {
-                        ui.label(k.clone());
-                        match v {
-                            Value::Float(f) => {
-                                ui.add(egui::DragValue::new(f).speed(1.0).suffix(" mm"));
+                egui::Grid::new("params_edit_grid")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (k, v) in edit.values.iter_mut() {
+                            ui.label(k.clone());
+                            match v {
+                                Value::Float(f) => {
+                                    ui.add(egui::DragValue::new(f).speed(1.0).suffix(" mm"));
+                                }
+                                Value::Int(i) => {
+                                    ui.add(egui::DragValue::new(i));
+                                }
+                                Value::Text(s) => {
+                                    ui.text_edit_singleline(s);
+                                }
+                                Value::Bool(b) => {
+                                    ui.checkbox(b, "");
+                                }
+                                Value::Ref(r) => {
+                                    ui.label(format!("→ {r}"));
+                                }
                             }
-                            Value::Int(i) => {
-                                ui.add(egui::DragValue::new(i));
-                            }
-                        Value::Text(s) => {
-                            ui.text_edit_singleline(s);
+                            ui.end_row();
                         }
-                            Value::Bool(b) => {
-                                ui.checkbox(b, "");
-                            }
-                            Value::Ref(r) => {
-                                ui.label(format!("→ {r}"));
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
+                    });
                 ui.horizontal(|ui| {
                     if ui.button("应用并重建").clicked() {
                         apply_clicked = true;
@@ -877,9 +881,7 @@ impl BimApp {
         if apply_clicked {
             self.apply_rebuild();
         }
-        if revert_clicked
-            && let Some(e) = self.edit.as_mut()
-        {
+        if revert_clicked && let Some(e) = self.edit.as_mut() {
             e.values = elem.properties.values.clone();
         }
 
@@ -1117,9 +1119,7 @@ impl BimApp {
         let k = (avail_w / d2.width_mm.max(1.0)).min(avail_h / d2.height_mm.max(1.0));
         let ox = rect.left() as f64 + 16.0 + (avail_w - d2.width_mm * k) / 2.0;
         let oy = rect.bottom() as f64 - 16.0 - (avail_h - d2.height_mm * k) / 2.0;
-        let to_px = |p: [f64; 2]| {
-            egui::Pos2::new((ox + p[0] * k) as f32, (oy - p[1] * k) as f32)
-        };
+        let to_px = |p: [f64; 2]| egui::Pos2::new((ox + p[0] * k) as f32, (oy - p[1] * k) as f32);
         for c in &d2.curves {
             let color = egui::Color32::from_rgb(c.color[0], c.color[1], c.color[2]);
             let width = ((c.width_mm * k) as f32).clamp(0.5, 3.0);
@@ -1144,10 +1144,7 @@ impl BimApp {
                     let pts: Vec<egui::Pos2> = (0..=SEGMENTS)
                         .map(|i| {
                             let a = start_angle_rad + span * (i as f64 / SEGMENTS as f64);
-                            egui::Pos2::new(
-                                cx + (a.cos() * r) as f32,
-                                cy - (a.sin() * r) as f32,
-                            )
+                            egui::Pos2::new(cx + (a.cos() * r) as f32, cy - (a.sin() * r) as f32)
                         })
                         .collect();
                     painter.add(egui::Shape::line(pts, stroke));

@@ -36,7 +36,7 @@ use core_doc::{
 };
 use core_kernel::{KernelError, MeshData};
 use core_model::{Document, ElementId, PropertyMap, ShapeId, Value, ViewId};
-use core_sdk::{BuildOp, Module, OpInput, SdkError};
+use core_sdk::{BuildOp, Module, OpInput, PropertySchema, SdkError};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -208,6 +208,47 @@ impl CoreSession {
     /// 装载一个专业模块（失败则宿主保持原样，见 [`ModuleHost::install`]）。
     pub fn install_module(&mut self, module: Box<dyn Module>) -> AppResult<()> {
         self.modules.install(module)?;
+        Ok(())
+    }
+
+    /// 全部属性模式（按模式名排序；转发注册表，G5-M19）。
+    ///
+    /// 类型管理器的列表数据源；模块装载与纯 API 登记的模式都会出现在这里。
+    #[must_use]
+    pub fn list_schemas(&self) -> Vec<PropertySchema> {
+        self.modules
+            .registry()
+            .schemas()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// **覆盖式登记属性模式**（GUI 类型管理器编辑语义；转发注册表，G5-M19）。
+    ///
+    /// 存在则覆盖、不存在则插入（[`Registry::replace_schema`]）；模块装载的
+    /// 幂等语义仍走 [`CoreSession::install_module`] → `register_schema`。
+    ///
+    /// # Errors
+    /// 模式名为空时返回错误。覆盖不校验字段内容——编辑期自由，校验发生在
+    /// 实例属性上（见 [`CoreSession::validate_element_schema`]）。
+    pub fn upsert_schema(&mut self, schema: PropertySchema) -> AppResult<()> {
+        self.modules.registry_mut().replace_schema(schema)?;
+        Ok(())
+    }
+
+    /// 用已注册模式校验元素属性（转发注册表，G5-M19）。
+    ///
+    /// G5-M21 属性面板确认链路的拦截点：非法值（缺必填 / 类型不匹配 /
+    /// 未知字段）在 set 之前响亮拒绝。
+    ///
+    /// # Errors
+    /// 元素不存在 / 模式未注册（`UnknownSchema`）/ 属性不满足模式时返回错误。
+    pub fn validate_element_schema(&self, element: ElementId) -> AppResult<()> {
+        let e = self.document.doc().element(element).ok_or(AppError::Model(
+            core_model::ModelError::ElementNotFound(element),
+        ))?;
+        self.modules.registry().validate_element(e)?;
         Ok(())
     }
 
@@ -1283,7 +1324,7 @@ impl CoreSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_model::{PropertyMap, Value};
+    use core_model::{FieldDef, FieldType, PropertyMap, Value};
     use core_sdk::{
         CreateRequest, Element, ElementFactory, GeometryOp, ModuleManifest, OpOutput, Registry,
         SdkResult, build_element,
@@ -1395,6 +1436,123 @@ mod tests {
         assert_eq!(summary.modules, 1);
         assert_eq!(summary.elements, 1);
         assert_eq!(summary.geometry, 1);
+    }
+
+    /// G5 类型管理器同款 schema（长方体三向尺寸，全部必填带单位）。
+    fn g5_box_schema() -> PropertySchema {
+        PropertySchema::new("G5_BOX")
+            .with_field(
+                FieldDef::new("dx", FieldType::Float, "长")
+                    .with_unit("mm")
+                    .required(),
+            )
+            .with_field(
+                FieldDef::new("dy", FieldType::Float, "宽")
+                    .with_unit("mm")
+                    .required(),
+            )
+            .with_field(
+                FieldDef::new("dz", FieldType::Float, "高")
+                    .with_unit("mm")
+                    .required(),
+            )
+    }
+
+    #[test]
+    fn schema_api_upsert_validate_build_rebuild_end_to_end() {
+        let mut s = CoreSession::new().unwrap();
+
+        // ① 纯 API 登记模式（不经模块装载——类型管理器编辑语义）
+        s.upsert_schema(g5_box_schema()).unwrap();
+        let names: Vec<String> = s
+            .list_schemas()
+            .iter()
+            .map(|schema| schema.type_name.clone())
+            .collect();
+        assert_eq!(names, vec!["G5_BOX"]);
+
+        // ② 建通用元素挂该类型属性 → validate Ok
+        let id = s.create_generic_element("盒-G5").unwrap();
+        let legal = || {
+            PropertyMap::new("G5_BOX")
+                .with("dx", Value::Float(10.0))
+                .with("dy", Value::Float(20.0))
+                .with("dz", Value::Float(30.0))
+        };
+        s.document
+            .edit(|doc| {
+                doc.element_mut(id)?.properties = legal();
+                Ok(())
+            })
+            .unwrap();
+        s.validate_element_schema(id).unwrap();
+
+        // ③ 非法值拦截：缺必填 / 类型不匹配 / 未知字段
+        let bad_cases = vec![
+            PropertyMap::new("G5_BOX").with("dx", Value::Float(10.0)),
+            PropertyMap::new("G5_BOX")
+                .with("dx", Value::Float(10.0))
+                .with("dy", Value::Text("宽".to_string()))
+                .with("dz", Value::Float(30.0)),
+            legal().with("weight", Value::Float(1.0)),
+        ];
+        for bad in bad_cases {
+            s.document
+                .edit(|doc| {
+                    doc.element_mut(id)?.properties = bad;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(s.validate_element_schema(id).is_err());
+        }
+
+        // ③′ 模式未注册的元素 → UnknownSchema
+        let orphan = s.create_generic_element("无模式").unwrap();
+        assert!(matches!(
+            s.validate_element_schema(orphan),
+            Err(AppError::Sdk(SdkError::UnknownSchema(_)))
+        ));
+
+        // ④ build：元素属性即算子输入（DemoModule 提供算子）
+        s.document
+            .edit(|doc| {
+                doc.element_mut(id)?.properties = legal();
+                Ok(())
+            })
+            .unwrap();
+        s.install_module(Box::new(DemoModule)).unwrap();
+        let shape = s.build_geometry(id, "test.demo.box").unwrap();
+        assert_eq!(
+            s.document().doc().element(id).unwrap().geometry_ref,
+            Some(shape)
+        );
+
+        // ⑤ rebuild：M10 临时参数语义——params 进配方，元素属性不回写（G5-M21 待确认点）
+        let report = s
+            .rebuild_geometry(
+                id,
+                "test.demo.box",
+                PropertyMap::new("G5_BOX")
+                    .with("dx", Value::Float(50.0))
+                    .with("dy", Value::Float(20.0))
+                    .with("dz", Value::Float(30.0)),
+            )
+            .unwrap();
+        assert_eq!(
+            report.changed_shapes,
+            vec![shape],
+            "构件身份不变：复用原 ShapeId"
+        );
+        assert_eq!(
+            s.document()
+                .doc()
+                .element(id)
+                .unwrap()
+                .properties
+                .get_float("dx"),
+            Some(10.0),
+            "rebuild 不回写元素属性：元素属性保持 dx=10"
+        );
     }
 
     #[test]

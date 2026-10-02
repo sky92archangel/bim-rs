@@ -252,6 +252,31 @@ impl Registry {
         self.schemas.len()
     }
 
+    /// 全部属性模式（按模式名排序）。
+    ///
+    /// G5 类型管理器的列表数据源（照 [`Registry::categories`] 先例）。
+    #[must_use]
+    pub fn schemas(&self) -> Vec<&PropertySchema> {
+        self.schemas.values().collect()
+    }
+
+    /// **覆盖式登记属性模式**（GUI 类型管理器编辑语义：存在则覆盖，不存在则插入）。
+    ///
+    /// 与 [`Registry::register_schema`] 的差异：register_schema 对同名异内容
+    /// **响亮拒绝**（模块装载语义——两份不同定义撞名须人工裁决，模块被重复
+    /// 装载靠内容幂等容错）；本方法**直接覆盖**（类型管理器编辑语义——用户
+    /// 改完字段就该落库，不需要先删再建）。
+    ///
+    /// ⚠ 覆盖**只影响新实例**：既有实例的 `PropertyMap` 是元素落成时刻的
+    /// 快照，不回写（设计文档 3.3——句柄可丢、文本为真相）。
+    pub fn replace_schema(&mut self, schema: PropertySchema) -> SdkResult<()> {
+        if schema.type_name.trim().is_empty() {
+            return Err(SdkError::InvalidManifest("模式名不能为空".to_string()));
+        }
+        self.schemas.insert(schema.type_name.clone(), schema);
+        Ok(())
+    }
+
     /// 用已注册的模式校验一个元素的属性。
     pub fn validate_element(&self, element: &Element) -> SdkResult<()> {
         let name = element.properties.schema.clone();
@@ -554,6 +579,68 @@ mod tests {
         assert!(matches!(
             r.register_schema(different),
             Err(SdkError::DuplicateSchema(_))
+        ));
+    }
+
+    #[test]
+    fn schemas_list_in_name_order() {
+        let mut r = Registry::new();
+        r.register_schema(PropertySchema::new("B_SCHEMA").with_field(FieldDef::new(
+            "w",
+            FieldType::Float,
+            "宽",
+        )))
+        .unwrap();
+        r.register_schema(PropertySchema::new("A_SCHEMA").with_field(FieldDef::new(
+            "h",
+            FieldType::Float,
+            "高",
+        )))
+        .unwrap();
+        let names: Vec<&str> = r.schemas().iter().map(|s| s.type_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["A_SCHEMA", "B_SCHEMA"],
+            "BTreeMap 天然按模式名排序"
+        );
+    }
+
+    #[test]
+    fn replace_schema_overrides_existing_content() {
+        let mut r = Registry::new();
+        r.register_schema(demo_schema()).unwrap();
+        let edited = PropertySchema::new("DEMO").with_field(
+            FieldDef::new("depth", FieldType::Float, "深")
+                .with_unit("mm")
+                .required(),
+        );
+        r.replace_schema(edited).unwrap();
+        assert_eq!(r.schema_count(), 1, "覆盖不新增条目");
+        let current = r.schema("DEMO").unwrap();
+        assert!(current.field("width").is_none(), "旧字段已被覆盖");
+        assert!(current.field("depth").is_some(), "新字段已生效");
+        // 覆盖后旧内容再走 register_schema → 异内容拒绝（模块装载语义不变）
+        assert!(matches!(
+            r.register_schema(demo_schema()),
+            Err(SdkError::DuplicateSchema(_))
+        ));
+    }
+
+    #[test]
+    fn replace_schema_inserts_when_absent() {
+        let mut r = Registry::new();
+        assert_eq!(r.schema_count(), 0);
+        r.replace_schema(demo_schema()).unwrap();
+        assert_eq!(r.schema_count(), 1);
+        assert!(r.schema("DEMO").is_some());
+    }
+
+    #[test]
+    fn replace_schema_rejects_empty_name() {
+        let mut r = Registry::new();
+        assert!(matches!(
+            r.replace_schema(PropertySchema::new("  ")),
+            Err(SdkError::InvalidManifest(_))
         ));
     }
 

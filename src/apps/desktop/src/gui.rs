@@ -3,13 +3,17 @@
 //! 真实 GUI：**视口 / 拾取 / 属性面板 / 文件链路 / 图纸面板**。
 //!
 //! ```text
-//! ┌─────────┬──────────────────────────────┬──────────┬─────────┐
-//! │ 构件列表 │          三维视口             │  属性面板 │ 图纸面板 │
-//! │ (左栏)   │ 轨道相机 + 面着色 + 地面网格   │  (右栏)   │ (右栏)   │
-//! │         │ 左键拖动=旋转 右键=平移 滚轮=缩放│          │ 视图列表 │
-//! ├─────────┴──────────────────────────────┴──────────┴─────────┤
-//! │ 操作日志（底栏，失败响亮可见，不弹窗不吞错）          │
-//! └───────────────────────────────────────────────────┘
+//! ┌────────────────────────────────────────────────────────────┐
+//! │ 菜单栏: 文件 编辑 视图 帮助                                  │
+//! ├────────────────────────────────────────────────────────────┤
+//! │ 工具栏: 适配 清选 | 拾取:面/边/顶点 | 基线 | 日志开关          │
+//! ├────────────┬─────────────────────────────┬─────────────────┤
+//! │ 左栏(页签)  │                             │ 右栏(页签)       │
+//! │  元素/类型  │        三维视口              │  属性/图纸       │
+//! ├────────────┴─────────────────────────────┴─────────────────┤
+//! │ 状态栏: 文件名 · 坐标 · 拾取模式 · 内核 · 统计               │
+//! │ 日志（可折叠，失败响亮可见，不弹窗不吞错）                    │
+//! └────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## 渲染路线（为什么不用 wgpu paint callback）
@@ -269,6 +273,24 @@ fn view_presets() -> Vec<ViewPreset> {
     ]
 }
 
+/// 自制页签行（G2）：egui 无原生 Tabs 组件；返回被点击的页签（None = 未点击）。
+fn page_tabs(
+    ui: &mut egui::Ui,
+    pages: &[(Page, &'static str, &str)],
+    active: Page,
+) -> Option<Page> {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        for (page, icon, label) in pages {
+            let text = format!("{icon} {label}");
+            if ui.selectable_label(*page == active, text).clicked() {
+                clicked = Some(*page);
+            }
+        }
+    });
+    clicked
+}
+
 /// 按品类取基色（构件分色，便于区分模块）。
 fn base_color(category: &str) -> [u8; 3] {
     match category {
@@ -297,6 +319,20 @@ fn format_value(v: &Value) -> String {
 }
 
 /// GUI 应用状态。
+/// 面板页签（G2 五区布局：左右栏各一组自制页签——egui 无原生 Tabs 组件，
+/// 可停靠面板 egui_dock 在后续计划 §9）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    /// 左栏 · 元素（构件树）
+    Elements,
+    /// 左栏 · 类型管理器（G5 交付）
+    Types,
+    /// 右栏 · 属性
+    Props,
+    /// 右栏 · 图纸
+    Drawing,
+}
+
 struct BimApp {
     session: CoreSession,
     camera: OrbitCamera,
@@ -330,6 +366,12 @@ struct BimApp {
     pick_mode: PickMode,
     /// 增量重建集（M12）：None = 全量重建，Some = 只重建这些形状。
     dirty_shapes: Option<HashSet<ShapeId>>,
+    /// 左栏当前页签（G2：元素 / 类型管理器占位）
+    left_page: Page,
+    /// 右栏当前页签（G2：属性 / 图纸）
+    right_page: Page,
+    /// 日志面板显示开关（G2：可折叠，菜单"视图"或工具栏切换）
+    show_logs: bool,
 }
 
 /// 一次参数编辑的暂存（选中构件时快照；"应用并重建"提交）。
@@ -454,6 +496,9 @@ impl BimApp {
             preview_open: false,
             pick_mode: PickMode::Face,
             dirty_shapes: None,
+            left_page: Page::Elements,
+            right_page: Page::Props,
+            show_logs: true,
         })
     }
 
@@ -502,6 +547,9 @@ impl BimApp {
             preview_open: false,
             pick_mode: PickMode::Face,
             dirty_shapes: None,
+            left_page: Page::Elements,
+            right_page: Page::Props,
+            show_logs: true,
         })
     }
 
@@ -830,36 +878,84 @@ impl BimApp {
 
     // ---- 面板 ----
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    /// 菜单栏（G2 五区布局：文件 / 编辑 / 视图 / 帮助；文件动作与 M9 门面一致）。
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("文件", |ui| {
+                if ui.button("新建").clicked() {
+                    self.do_new();
+                    ui.close_menu();
+                }
+                if ui.button("打开").clicked() {
+                    self.do_open();
+                    ui.close_menu();
+                }
+                if ui.button("保存").clicked() {
+                    self.do_save();
+                    ui.close_menu();
+                }
+                if ui.button("另存为").clicked() {
+                    self.do_save_as();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("退出").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("编辑", |ui| {
+                if ui.button("清空选择").clicked() {
+                    self.selected = None;
+                    self.picked = None;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("视图", |ui| {
+                if ui.button("适配视图").clicked() {
+                    self.fit_view();
+                    ui.close_menu();
+                }
+                let toggle = if self.show_logs {
+                    "隐藏日志"
+                } else {
+                    "显示日志"
+                };
+                if ui.button(toggle).clicked() {
+                    self.show_logs = !self.show_logs;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("帮助", |ui| {
+                if ui.button("关于").clicked() {
+                    self.log(format!(
+                        "轻量化 BIM 内核平台 v{}（内核：{}）",
+                        env!("CARGO_PKG_VERSION"),
+                        self.session.geometry().backend_name()
+                    ));
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
+    /// 工具栏（G2：适配 / 清选 / 拾取模式 / 性能基线 / 日志开关；构建分组 G3 填充——
+    /// 计划 §5.1 的七组算子按钮落这里）。
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
         ui.horizontal(|ui| {
-            ui.heading("轻量化 BIM 内核平台");
-            ui.separator();
-            // —— 文件链路（M9：新建 / 打开 / 保存 / 另存）——
-            if ui.button("新建").clicked() {
-                self.do_new();
-            }
-            if ui.button("打开").clicked() {
-                self.do_open();
-            }
-            if ui.button("保存").clicked() {
-                self.do_save();
-            }
-            if ui.button("另存为").clicked() {
-                self.do_save_as();
-            }
-            ui.separator();
-            ui.monospace(format!("内核：{}", self.session.geometry().backend_name()));
-            ui.separator();
-            let sum = self.session.summary();
-            ui.label(format!(
-                "构件 {} · 几何 {} · 模块 {}",
-                sum.elements, sum.geometry, sum.modules
-            ));
-            ui.separator();
-            if ui.button("适配视图").clicked() {
+            // —— 构建（G3 预留：基本体 / 线框 / 扫掠放样 / 布尔 / 变换 / 修饰 / 修复）——
+            if ui
+                .button(format!("{} 适配", ph::ARROWS_OUT))
+                .on_hover_text("适配视图")
+                .clicked()
+            {
                 self.fit_view();
             }
-            if ui.button("清空选择").clicked() {
+            if ui
+                .button(format!("{} 清选", ph::BROOM))
+                .on_hover_text("清空选择")
+                .clicked()
+            {
                 self.selected = None;
                 self.picked = None;
             }
@@ -876,15 +972,116 @@ impl BimApp {
             }
             ui.separator();
             // —— 性能基线（M12：日志可见，不写死阈值）——
-            if ui.button("性能基线").clicked() {
+            if ui
+                .button(format!("{} 基线", ph::TIMER))
+                .on_hover_text("性能基线计时")
+                .clicked()
+            {
                 self.run_perf_baseline();
+            }
+            ui.separator();
+            // —— 日志折叠快捷开关（G2）——
+            if ui
+                .selectable_label(self.show_logs, format!("{} 日志", ph::CARET_DOUBLE_DOWN))
+                .clicked()
+            {
+                self.show_logs = !self.show_logs;
             }
         });
     }
 
-    fn elements_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("构件");
+    /// 左栏（G2 五区布局）：自制页签（元素 / 类型）+ 页面切换。
+    fn left_panel(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        ui.add_space(2.0);
+        let clicked = page_tabs(
+            ui,
+            &[
+                (Page::Elements, ph::LIST_BULLETS, "元素"),
+                (Page::Types, ph::GEAR, "类型"),
+            ],
+            self.left_page,
+        );
+        if let Some(p) = clicked {
+            self.left_page = p;
+        }
         ui.separator();
+        match self.left_page {
+            Page::Elements => self.elements_panel(ui),
+            Page::Types => {
+                ui.label("类型管理器");
+                ui.label("（G5 交付：PropertySchema 可视化编辑，见 GUI 计划 §5.3）");
+            }
+            _ => {}
+        }
+    }
+
+    /// 右栏（G2 五区布局）：自制页签（属性 / 图纸）+ 页面切换。
+    fn right_panel(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        ui.add_space(2.0);
+        let clicked = page_tabs(
+            ui,
+            &[
+                (Page::Props, ph::GEAR, "属性"),
+                (Page::Drawing, ph::FRAME_CORNERS, "图纸"),
+            ],
+            self.right_page,
+        );
+        if let Some(p) = clicked {
+            self.right_page = p;
+        }
+        ui.separator();
+        match self.right_page {
+            Page::Props => self.props_panel(ui),
+            Page::Drawing => self.views_panel(ui),
+            _ => {}
+        }
+    }
+
+    /// 状态栏（G2：文件名 · 命中坐标 · 拾取模式 · 内核 · 统计；内容自 top_bar 迁移）。
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        ui.horizontal(|ui| {
+            let name = self
+                .file_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "未命名文档".to_string());
+            // 点文件名 = 另存（快速指定路径）。
+            if ui.monospace(name).clicked() {
+                self.do_save_as();
+            }
+            ui.separator();
+            match &self.picked {
+                Some(pk) => {
+                    let p = pk.world_point;
+                    ui.monospace(format!(
+                        "{} ({:.0}, {:.0}, {:.0})",
+                        ph::CROSSHAIR,
+                        p.x,
+                        p.y,
+                        p.z
+                    ));
+                }
+                None => {
+                    ui.weak("未命中");
+                }
+            }
+            ui.separator();
+            ui.label(format!("拾取：{}", self.pick_mode.label()));
+            ui.separator();
+            ui.monospace(format!("内核：{}", self.session.geometry().backend_name()));
+            ui.separator();
+            let sum = self.session.summary();
+            ui.label(format!(
+                "构件 {} · 几何 {} · 模块 {}",
+                sum.elements, sum.geometry, sum.modules
+            ));
+        });
+    }
+
+    fn elements_panel(&mut self, ui: &mut egui::Ui) {
         // —— 新建构件（模块算子按钮；mock 腿不支持的算子点击后日志响亮报错）——
         ui.label("新建构件：");
         ui.horizontal_wrapped(|ui| {
@@ -933,8 +1130,6 @@ impl BimApp {
     }
 
     fn props_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("属性面板");
-        ui.separator();
         let Some(id) = self.selected else {
             ui.label("未选中构件");
             ui.label("（列表单击，或视口内单击拾取）");
@@ -1126,8 +1321,6 @@ impl BimApp {
     // ---- 图纸面板（M11：视图列表 + 新建视图 + 重新出图 + DXF 导出 + 2D 预览） ----
 
     fn views_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("图纸");
-        ui.separator();
         // —— 新建视图（三个内置视向预设）——
         ui.label("新建视图：");
         let presets = view_presets();
@@ -1637,28 +1830,32 @@ impl eframe::App for BimApp {
         }
 
         self.refresh_meshes();
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| self.top_bar(ui));
-        egui::SidePanel::left("elements_panel")
+        // G2 五区布局：菜单栏 → 工具栏 → 左栏（页签）→ 右栏（页签）→ 状态栏 →
+        // 日志（可折叠）→ 视口（中央）。
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| self.menu_bar(ui));
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+        egui::SidePanel::left("left_panel")
             .resizable(true)
             .default_width(230.0)
-            .show(ctx, |ui| self.elements_panel(ui));
-        egui::SidePanel::right("props_panel")
+            .show(ctx, |ui| self.left_panel(ui));
+        egui::SidePanel::right("right_panel")
             .resizable(true)
             .default_width(300.0)
-            .show(ctx, |ui| self.props_panel(ui));
-        // M11：图纸面板（在 props 左侧；视图列表 + 重新出图 + DXF 导出）。
-        egui::SidePanel::right("views_panel")
-            .resizable(true)
-            .default_width(220.0)
-            .show(ctx, |ui| self.views_panel(ui));
-        egui::TopBottomPanel::bottom("logs_panel")
-            .resizable(true)
-            .default_height(150.0)
-            .show(ctx, |ui| self.logs_panel(ui));
+            .show(ctx, |ui| self.right_panel(ui));
+        // bottom 面板先 show 的贴底：状态栏最底、日志在状态栏之上（可折叠）。
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(26.0)
+            .show(ctx, |ui| self.status_bar(ui));
+        if self.show_logs {
+            egui::TopBottomPanel::bottom("logs_panel")
+                .resizable(true)
+                .default_height(150.0)
+                .show(ctx, |ui| self.logs_panel(ui));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport(ui));
-        // M11：浮动图纸预览窗口（顶栏"图纸面板"选中视图后点"预览"打开）。
+        // M11：浮动图纸预览窗口（"图纸"页签选中视图后点"预览"打开）。
         self.drawing_preview_window(ctx);
     }
 }

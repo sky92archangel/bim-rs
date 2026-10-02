@@ -163,6 +163,38 @@ pub fn catmull_rom_to_bezier(points: &[DVec2]) -> Vec<[DVec2; 4]> {
         .collect()
 }
 
+/// n 阶贝塞尔取值（de Casteljau 逐层线性插值折叠）：controls 为控制点序列，
+/// t ∈ [0,1]。空序列返回原点、单点原样返回（调用方保证 ≥2 点，此处只为
+/// 不 panic）。
+#[must_use]
+pub fn bezier_sample(controls: &[DVec2], t: f64) -> DVec2 {
+    if controls.is_empty() {
+        return DVec2::ZERO;
+    }
+    let mut pts: Vec<DVec2> = controls.to_vec();
+    while pts.len() > 1 {
+        let mut next = Vec::with_capacity(pts.len() - 1);
+        for w in pts.windows(2) {
+            next.push(w[0] + (w[1] - w[0]) * t);
+        }
+        pts = next;
+    }
+    pts[0]
+}
+
+/// n 阶贝塞尔折线采样：0..=segments 均匀参数采样（segments+1 个点）——
+/// 画布无贝塞尔 primitive，渲染用折线近似；控制点 <2 原样返回。
+#[must_use]
+pub fn bezier_sample_polyline(controls: &[DVec2], segments: usize) -> Vec<DVec2> {
+    if controls.len() < 2 {
+        return controls.to_vec();
+    }
+    let n = segments.max(1);
+    (0..=n)
+        .map(|i| bezier_sample(controls, i as f64 / n as f64))
+        .collect()
+}
+
 /// 倒圆角：顶点 v，两邻边为 a→v 与 v→b，圆角半径 radius。
 /// 返回 (切点1, 切点2, 圆心)：切点1 在 v→a 上、切点2 在 v→b 上，距 v 均为 r/tan(φ/2)；
 /// 圆心在角平分线上距 v r/sin(φ/2)，φ 为 v→a 与 v→b 的夹角。
@@ -471,6 +503,44 @@ mod tests {
     fn catmull_rom_requires_two_points() {
         assert!(catmull_rom_to_bezier(&[DVec2::ZERO]).is_empty());
         assert!(catmull_rom_to_bezier(&[]).is_empty());
+    }
+
+    #[test]
+    fn bezier_sample_quadratic_midpoint() {
+        // 二次贝塞尔 t=0.5：(P0 + 2·P1 + P2) / 4
+        let b = bezier_sample(
+            &[DVec2::ZERO, DVec2::new(50.0, 100.0), DVec2::new(100.0, 0.0)],
+            0.5,
+        );
+        assert_near(b, [50.0, 50.0], 1e-9);
+    }
+
+    #[test]
+    fn bezier_sample_endpoints_match_controls() {
+        let controls = [
+            DVec2::new(1.0, 2.0),
+            DVec2::new(3.0, 8.0),
+            DVec2::new(9.0, 4.0),
+            DVec2::new(15.0, 20.0),
+        ];
+        // t=0 / t=1 落在首末控制点。
+        assert_near(bezier_sample(&controls, 0.0), [1.0, 2.0], 1e-9);
+        assert_near(bezier_sample(&controls, 1.0), [15.0, 20.0], 1e-9);
+        // 线性（2 控制点）：中点 = 平均。
+        assert_near(bezier_sample(&controls[..2], 0.5), [2.0, 5.0], 1e-9);
+    }
+
+    #[test]
+    fn bezier_sample_polyline_count_and_endpoints() {
+        let controls = [DVec2::ZERO, DVec2::new(10.0, 0.0)];
+        let pts = bezier_sample_polyline(&controls, 8);
+        assert_eq!(pts.len(), 9);
+        assert_near(pts[0], [0.0, 0.0], 1e-9);
+        assert_near(pts[8], [10.0, 0.0], 1e-9);
+        // 均匀参数下线性曲线采样等距：t=2/8 → (2.5, 0)。
+        assert_near(pts[2], [2.5, 0.0], 1e-9);
+        // 控制点不足 2：原样返回。
+        assert_eq!(bezier_sample_polyline(&controls[..1], 8).len(), 1);
     }
 
     #[test]

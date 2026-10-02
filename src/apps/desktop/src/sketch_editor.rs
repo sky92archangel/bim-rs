@@ -13,8 +13,9 @@
 //! ## 交互约定
 //!
 //! - 单击推进工具状态机（`sketch_tool::SketchDraft::click`）；Ctrl+单击改为
-//!   选中附近图元（不画）；
-//! - 回车 / 双击结束折线，Backspace 撤折线点，Esc 取消进行中，Del 删除选中；
+//!   选中附近图元（不画）；圆角 / 倒角工具单击拾取**线段图元**（不走点状态机）；
+//! - 回车 / 双击结束开放曲线（折线 / 贝塞尔 / 样条），Backspace 撤点，
+//!   Esc 取消进行中，Del 删除选中；
 //! - Ctrl+Z 撤销上一个图元，Ctrl+Y 重做（新动作使重做失效）；
 //! - 「完成」→ [`core_app::CoreSession::build_sketch_profile`]（造 wire +
 //!   建通用元素，失败零半成品）→ 调用方做渲染收尾（选中新构件 + 网格化 + 适配）。
@@ -23,8 +24,10 @@ use glam::DVec2;
 
 use core_app::{CoreSession, SketchEntity};
 
+use crate::sketch_geom::{bezier_sample_polyline, catmull_rom_to_bezier, circle_through_three};
 use crate::sketch_tool::{
-    ClickOutcome, SketchDraft, SketchTool, orthogonalize, snap_entities, snap_grid,
+    ClickOutcome, CornerPick, DEFAULT_POLYGON_SIDES, SketchDraft, SketchTool, apply_chamfer,
+    apply_fillet, orthogonalize, pick_corner_segment, polygon_vertices, snap_entities, snap_grid,
 };
 
 /// 网格捕捉步长（mm）。
@@ -61,6 +64,12 @@ pub struct SketchEditorState {
     pub view_scale: f64,
     /// 视图中心（mm，画布中心对应的草图纸面坐标）
     pub view_center: DVec2,
+    /// 正多边形边数（内接 / 外切工具参数行；建草稿时复制进草稿）
+    pub polygon_sides: usize,
+    /// 圆角半径（mm，圆角工具参数行）
+    pub fillet_radius: f64,
+    /// 倒角距离（mm，倒角工具参数行）
+    pub chamfer_distance: f64,
 }
 
 impl SketchEditorState {
@@ -78,7 +87,16 @@ impl SketchEditorState {
             snap_enabled: true,
             view_scale: INITIAL_SCALE,
             view_center: DVec2::new(0.0, 0.0),
+            polygon_sides: DEFAULT_POLYGON_SIDES,
+            fillet_radius: 10.0,
+            chamfer_distance: 10.0,
         }
+    }
+
+    /// 按当前工具 + 参数行新建草稿（正多边形边数从参数取，工具切换 /
+    /// 复位 / 清空共用）。
+    fn fresh_draft(&self) -> SketchDraft {
+        SketchDraft::with_params(self.tool, self.polygon_sides)
     }
 
     /// 段内撤销：弹出最后一个已提交图元进撤销栈。
@@ -144,19 +162,21 @@ pub fn run_editor(
         .default_width(860.0)
         .default_height(620.0)
         .show(ctx, |ui| {
-            // —— 工具栏（工具选择 + 捕捉开关 + 段内操作 + 完成）——
-            ui.horizontal(|ui| {
+            // —— 工具行（15 工具，换行显示）——
+            ui.horizontal_wrapped(|ui| {
                 for tool in SketchTool::ALL {
                     if ui
                         .selectable_label(st.tool == tool, tool.label())
                         .clicked()
                     {
                         st.tool = tool;
-                        st.draft = SketchDraft::new(tool);
+                        st.draft = st.fresh_draft();
                         st.selected = None;
                     }
                 }
-                ui.separator();
+            });
+            // —— 操作行（捕捉 + 段内操作 + 工具参数 + 完成）——
+            ui.horizontal(|ui| {
                 if ui
                     .selectable_label(st.snap_enabled, format!("{} 捕捉", ph::CROSSHAIR))
                     .on_hover_text("网格 / 对象捕捉开关（对象捕捉恒开，此处控制网格步长吸附）")
@@ -180,8 +200,43 @@ pub fn run_editor(
                 if ui.button(format!("{} 清空", ph::BROOM)).clicked() {
                     st.entities.clear();
                     st.undo.clear();
-                    st.draft = SketchDraft::new(st.tool);
+                    st.draft = st.fresh_draft();
                     st.selected = None;
+                }
+                // —— 工具参数（按当前工具显示 DragValue）——
+                match st.tool {
+                    SketchTool::PolygonIn | SketchTool::PolygonOut => {
+                        ui.separator();
+                        ui.label("边数");
+                        ui.add(
+                            egui::DragValue::new(&mut st.polygon_sides)
+                                .range(3..=64)
+                                .speed(0.5),
+                        );
+                        // 进行中草稿同步参数副本。
+                        if let SketchDraft::Polygon { sides, .. } = &mut st.draft {
+                            *sides = st.polygon_sides.max(3);
+                        }
+                    }
+                    SketchTool::Fillet => {
+                        ui.separator();
+                        ui.label("圆角半径");
+                        ui.add(
+                            egui::DragValue::new(&mut st.fillet_radius)
+                                .range(0.01..=100000.0)
+                                .speed(1.0),
+                        );
+                    }
+                    SketchTool::Chamfer => {
+                        ui.separator();
+                        ui.label("倒角距离");
+                        ui.add(
+                            egui::DragValue::new(&mut st.chamfer_distance)
+                                .range(0.01..=100000.0)
+                                .speed(1.0),
+                        );
+                    }
+                    _ => {}
                 }
                 ui.separator();
                 ui.add(
@@ -211,7 +266,7 @@ pub fn run_editor(
 
             // —— 画布（事件 → 状态机推进）——
             let ev = draw_canvas(st, ui);
-            apply_event(st, ev);
+            apply_event(st, logs, ev);
 
             // —— 状态栏（步骤提示 + 图元数 + 光标坐标）——
             ui.separator();
@@ -239,20 +294,44 @@ pub fn run_editor(
 }
 
 /// 把画布事件推进到工具状态机（渲染层与纯逻辑层的唯一衔接点）。
-fn apply_event(st: &mut SketchEditorState, ev: CanvasEvent) {
+fn apply_event(st: &mut SketchEditorState, logs: &mut Vec<String>, ev: CanvasEvent) {
     match ev {
         CanvasEvent::None => {}
-        CanvasEvent::Click(p) => match st.draft.click(p) {
-            ClickOutcome::Finished(entity) => {
-                st.push_entity(entity);
-                st.draft = SketchDraft::new(st.tool);
+        CanvasEvent::Click(p) => {
+            // 圆角 / 倒角：单击拾取线段图元（选图元不选点，不走点状态机）。
+            if matches!(
+                st.draft,
+                SketchDraft::Fillet { .. } | SketchDraft::Chamfer { .. }
+            ) {
+                let tol = SNAP_TOL_PX / st.view_scale;
+                let picked = pick_corner_segment(&st.entities, p, tol);
+                if let CornerPick::Both(a, b) = st.draft.pick_corner(picked) {
+                    let label = st.tool.label();
+                    let result = if matches!(st.tool, SketchTool::Fillet) {
+                        apply_fillet(&mut st.entities, a, b, st.fillet_radius)
+                    } else {
+                        apply_chamfer(&mut st.entities, a, b, st.chamfer_distance)
+                    };
+                    match result {
+                        Ok(()) => logs.push(format!("✓ {label} 完成")),
+                        Err(e) => logs.push(format!("✗ {label} 失败：{e}")),
+                    }
+                    st.draft = st.fresh_draft();
+                }
+            } else {
+                match st.draft.click(p) {
+                    ClickOutcome::Finished(entity) => {
+                        st.push_entity(entity);
+                        st.draft = st.fresh_draft();
+                    }
+                    ClickOutcome::Continued => {}
+                }
             }
-            ClickOutcome::Continued => {}
-        },
+        }
         CanvasEvent::DoubleClick => {
-            if let Some(entity) = st.draft.finish_polyline() {
+            if let Some(entity) = st.draft.finish_open() {
                 st.push_entity(entity);
-                st.draft = SketchDraft::new(st.tool);
+                st.draft = st.fresh_draft();
             }
         }
         CanvasEvent::Escape => {
@@ -332,9 +411,13 @@ fn draw_canvas(st: &mut SketchEditorState, ui: &mut egui::Ui) -> CanvasEvent {
     // —— 网格 ——
     draw_grid_lines(&painter, &rect, st, &to_px);
 
-    // —— 已提交实体（选中高亮）——
+    // —— 已提交实体（选中高亮 + 圆角/倒角拾取高亮）——
+    let corner_pick = match &st.draft {
+        SketchDraft::Fillet { first, .. } | SketchDraft::Chamfer { first, .. } => *first,
+        _ => None,
+    };
     for (i, e) in st.entities.iter().enumerate() {
-        let color = if st.selected == Some(i) {
+        let color = if st.selected == Some(i) || corner_pick == Some(i) {
             egui::Color32::from_rgb(0xff, 0xd0, 0x40)
         } else {
             egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)
@@ -500,10 +583,13 @@ fn draw_entity(
             painter.add(egui::Shape::line(pts, stroke));
         }
         SketchEntity::Bezier(segments) => {
-            // G4-M16 P0：控制多边形折线显示（每段一条）；提交 2 换 de Casteljau
-            // 精确采样（bezier_sample）。
+            // 每段 n 阶贝塞尔精确采样（de Casteljau）——提交 1 的控制多边形
+            // 折线显示升级为曲线。
             for seg in segments {
-                let pts: Vec<egui::Pos2> = seg.iter().map(|p| to_px(*p)).collect();
+                let pts: Vec<egui::Pos2> = bezier_sample_polyline(seg, 32)
+                    .iter()
+                    .map(|p| to_px(*p))
+                    .collect();
                 if pts.len() >= 2 {
                     painter.add(egui::Shape::line(pts, stroke));
                 }
@@ -615,6 +701,96 @@ fn draw_preview(
             }
             _ => {}
         },
+        SketchDraft::Polygon {
+            center,
+            sides,
+            circumscribed,
+        } => {
+            if let Some(c) = center {
+                dot(*c);
+                painter.line_segment([to_px(*c), to_px(cursor)], stroke);
+                // 预览多边形（含光标的顶点 / 边中点定大小）。
+                let verts = polygon_vertices(*c, cursor, *sides, *circumscribed);
+                if !verts.is_empty() {
+                    let pts: Vec<egui::Pos2> = verts.iter().map(|p| to_px(*p)).collect();
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+        }
+        SketchDraft::Arc3 { start, mid } => match (*start, *mid) {
+            (Some(s), None) => {
+                dot(s);
+                painter.line_segment([to_px(s), to_px(cursor)], stroke);
+            }
+            (Some(s), Some(m)) => {
+                dot(s);
+                dot(m);
+                painter.line_segment([to_px(m), to_px(cursor)], stroke);
+                // 预览弧：过三点的整圆采样（共线时无预览）。
+                if let Some((c, r)) = circle_through_three(s, m, cursor) {
+                    let pts: Vec<egui::Pos2> = (0..=48)
+                        .map(|i| {
+                            let t = std::f64::consts::TAU * (i as f64) / 48.0;
+                            to_px(DVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+            _ => {}
+        },
+        SketchDraft::Bezier { points } => {
+            for p in points {
+                dot(*p);
+            }
+            // 预览曲线（含光标的 n 阶采样）+ 细控制多边形。
+            let mut controls: Vec<DVec2> = points.clone();
+            controls.push(cursor);
+            if controls.len() >= 2 {
+                let pts: Vec<egui::Pos2> = bezier_sample_polyline(&controls, 32)
+                    .iter()
+                    .map(|p| to_px(*p))
+                    .collect();
+                painter.add(egui::Shape::line(pts, stroke));
+                let ctrl: Vec<egui::Pos2> = controls.iter().map(|p| to_px(*p)).collect();
+                painter.add(egui::Shape::line(
+                    ctrl,
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x55, 0x60, 0x70)),
+                ));
+            }
+        }
+        SketchDraft::Spline { points } => {
+            for p in points {
+                dot(*p);
+            }
+            // 预览样条（含光标的 Catmull-Rom 拟合采样）。
+            let mut fits: Vec<DVec2> = points.clone();
+            fits.push(cursor);
+            if fits.len() >= 2 {
+                for seg in catmull_rom_to_bezier(&fits) {
+                    let pts: Vec<egui::Pos2> = bezier_sample_polyline(&seg, 16)
+                        .iter()
+                        .map(|p| to_px(*p))
+                        .collect();
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+        }
+        SketchDraft::Point => {} // 单击即放置，无预览
+        SketchDraft::Construction { first } => {
+            if let Some(f) = first {
+                dot(*f);
+                painter.line_segment([to_px(*f), to_px(cursor)], stroke);
+            }
+        }
+        SketchDraft::Ray { start } => {
+            if let Some(s) = start {
+                dot(*s);
+                painter.line_segment([to_px(*s), to_px(cursor)], stroke);
+            }
+        }
+        // 圆角 / 倒角：选图元高亮在画布实体层做（corner_pick），无橡皮筋预览。
+        SketchDraft::Fillet { .. } | SketchDraft::Chamfer { .. } => {}
     }
 }
 
@@ -626,7 +802,14 @@ fn anchor_of(draft: &SketchDraft) -> Option<DVec2> {
         SketchDraft::Circle { center } => *center,
         SketchDraft::Ellipse { center, axis_end } => axis_end.or(*center),
         SketchDraft::Arc { center, start } => start.or(*center),
-        SketchDraft::None => None,
+        SketchDraft::Polygon { center, .. } => *center,
+        SketchDraft::Arc3 { start, mid } => mid.or(*start),
+        SketchDraft::Bezier { points } | SketchDraft::Spline { points } => points.last().copied(),
+        SketchDraft::Construction { first } | SketchDraft::Ray { start: first } => *first,
+        SketchDraft::Point
+        | SketchDraft::Fillet { .. }
+        | SketchDraft::Chamfer { .. }
+        | SketchDraft::None => None,
     }
 }
 
@@ -637,6 +820,9 @@ fn last_point_of(entities: &[SketchEntity]) -> Option<DVec2> {
         Some(SketchEntity::Circle { center, .. })
         | Some(SketchEntity::Ellipse { center, .. })
         | Some(SketchEntity::Arc { center, .. }) => Some(*center),
+        Some(SketchEntity::Bezier(segments)) => segments.last().and_then(|seg| seg.last().copied()),
+        Some(SketchEntity::Point(p)) => Some(*p),
+        Some(SketchEntity::AuxLine { to, .. }) => Some(*to),
         _ => None,
     }
 }

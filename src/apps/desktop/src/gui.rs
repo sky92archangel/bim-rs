@@ -35,7 +35,7 @@
 //! 与本仓铁律一致：**不 panic、不吞错**。装载 / 建几何 / 网格化 / 拾取的
 //! 失败一律写进底栏日志（错误原文），窗口照常可操作。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -46,7 +46,7 @@ use cable_tunnel::{
     GEOMETRY_OP_ID_RECT as OP_TUNNEL_RECT,
 };
 use core_app::CoreSession;
-use core_doc::{Camera, PickFilter, PickResult, Ray, ViewOrientation};
+use core_doc::{Camera, PickFilter, PickKind, PickParam, PickResult, Ray, ViewOrientation};
 use core_interop::{Drawing2D, Format};
 use core_model::{ElementId, PropertyMap, ShapeId, Value, ViewId};
 use core_sdk::Module;
@@ -326,6 +326,10 @@ struct BimApp {
     selected_view: Option<ViewId>,
     /// 浮动图纸预览窗口开关（M11）
     preview_open: bool,
+    /// 拾取模式（面 / 边 / 顶点；M12）
+    pick_mode: PickMode,
+    /// 增量重建集（M12）：None = 全量重建，Some = 只重建这些形状。
+    dirty_shapes: Option<HashSet<ShapeId>>,
 }
 
 /// 一次参数编辑的暂存（选中构件时快照；"应用并重建"提交）。
@@ -339,6 +343,49 @@ struct ParamEdit {
     schema: String,
     /// 编辑中的参数快照（含未提交修改）
     values: BTreeMap<String, Value>,
+}
+
+/// 拾取模式（顶栏三态单选；M12 边 / 顶点拾取的 GUI 入口）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickMode {
+    /// 拾取面（默认）
+    Face,
+    /// 拾取边（点附近的边，内核精算）
+    Edge,
+    /// 拾取顶点（点附近的顶点，内核精算）
+    Vertex,
+}
+
+impl PickMode {
+    /// 顶栏标签。
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Face => "拾取面",
+            Self::Edge => "拾取边",
+            Self::Vertex => "拾取顶点",
+        }
+    }
+
+    /// 对应的拾取过滤器（单选：只请求该种类）。
+    const fn filter(self) -> PickFilter {
+        match self {
+            Self::Face => PickFilter {
+                faces: true,
+                edges: false,
+                vertices: false,
+            },
+            Self::Edge => PickFilter {
+                faces: false,
+                edges: true,
+                vertices: false,
+            },
+            Self::Vertex => PickFilter {
+                faces: false,
+                edges: false,
+                vertices: true,
+            },
+        }
+    }
 }
 
 /// 装载全部三个专业模块（new / open 共用；失败逐条写日志，不 panic）。
@@ -405,6 +452,8 @@ impl BimApp {
             op_by_element,
             selected_view: None,
             preview_open: false,
+            pick_mode: PickMode::Face,
+            dirty_shapes: None,
         })
     }
 
@@ -451,6 +500,8 @@ impl BimApp {
             op_by_element: HashMap::new(),
             selected_view: None,
             preview_open: false,
+            pick_mode: PickMode::Face,
+            dirty_shapes: None,
         })
     }
 
@@ -554,6 +605,10 @@ impl BimApp {
         {
             Ok(report) => {
                 self.dirty = true;
+                // M12 增量重建：只网格化本次被改的形状。
+                if !report.changed_shapes.is_empty() {
+                    self.dirty_shapes = Some(report.changed_shapes.iter().copied().collect());
+                }
                 self.log(format!(
                     "✓ 关联更新：演化直连 {} + 指纹回退 {}，重投 {} 图元、重算 {} 标注、{} 视图已标脏",
                     report.evolution_resolved,
@@ -572,38 +627,121 @@ impl BimApp {
         }
     }
 
-    /// 脏标记置位时重建全部网格（占位内核便宜；真实内核单次也只是一次网格化）。
-    fn refresh_meshes(&mut self) {
-        if !self.dirty {
-            return;
-        }
-        self.meshes.clear();
-        let entries: Vec<(ShapeId, [u8; 3])> = self
+    // ---- 性能基线（M12：当前会话实测，日志可见；不写死阈值——不同机器不同） ----
+
+    /// 跑一轮性能基线：全量 tessellate 计时 + 视口中心附近 5 次拾取计时，写日志。
+    ///
+    /// **只测量、不断言**：性能边界随机器 / 内核腿（mock / occt）变化，
+    /// 硬阈值必然假红；实测数字进日志 + README 记录，回归靠人眼比对量级。
+    fn run_perf_baseline(&mut self) {
+        let shapes: Vec<ShapeId> = self
             .session
             .document()
             .doc()
             .elements()
             .values()
-            .filter_map(|e| e.geometry_ref.map(|s| (s, base_color(e.category.as_str()))))
+            .filter_map(|e| e.geometry_ref)
             .collect();
-        for (shape, base) in entries {
-            match self.session.tessellate(shape, VIEW_LINEAR, VIEW_ANGULAR) {
-                Ok(mesh) => {
-                    self.meshes.insert(
-                        shape,
-                        ShapeMesh {
-                            mesh,
-                            base_color: base,
-                        },
-                    );
+        if shapes.is_empty() {
+            self.log("· 无几何，性能基线跳过（先建几个构件）");
+            return;
+        }
+        // ① 全量网格化（渲染层挠度）。
+        let t0 = std::time::Instant::now();
+        let mut ok = 0usize;
+        for s in &shapes {
+            if self
+                .session
+                .tessellate(*s, VIEW_LINEAR, VIEW_ANGULAR)
+                .is_ok()
+            {
+                ok += 1;
+            }
+        }
+        let tess_ms = t0.elapsed().as_millis();
+        // ② 拾取 ×5（视口中心 ± 横向偏移，覆盖命中与未命中两类路径；
+        //    M12 缓存后第 2 次起走 pick_meshes，量的是"缓存热"的拾取代价）。
+        let (cx, cy, _) = self.camera.viewport;
+        let t1 = std::time::Instant::now();
+        let mut hits = 0usize;
+        for i in 0..5i32 {
+            let off = (i - 2) * 30;
+            let screen = ((cx + off as f64) as f32, cy as f32);
+            if let Ok(Some(_)) =
+                self.session
+                    .pick_at(screen, &self.camera, PickFilter::faces_only())
+            {
+                hits += 1;
+            }
+        }
+        let pick_ms = t1.elapsed().as_millis();
+        self.log(format!(
+            "⏱ 性能基线：tessellate {} 形状 {tess_ms} ms（成功 {ok}）；拾取 ×5 {pick_ms} ms（命中 {hits}）",
+            shapes.len()
+        ));
+    }
+
+    /// 脏标记置位时重建网格（M12：有增量集只重建集合内形状，否则全量）。
+    fn refresh_meshes(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        match self.dirty_shapes.take() {
+            // 全量重建（首帧 / 打开文档 / 增量集未登记时）。
+            None => {
+                self.meshes.clear();
+                let entries: Vec<(ShapeId, [u8; 3])> = self
+                    .session
+                    .document()
+                    .doc()
+                    .elements()
+                    .values()
+                    .filter_map(|e| e.geometry_ref.map(|s| (s, base_color(e.category.as_str()))))
+                    .collect();
+                for (shape, base) in entries {
+                    self.tessellate_into_cache(shape, base);
                 }
-                Err(e) => self.log(format!("✗ 网格化 {shape} 失败：{e}")),
+            }
+            // 增量重建：只碰登记过的形状（其余缓存一动不动）。
+            Some(shapes) => {
+                for shape in &shapes {
+                    let Some(elem) = self
+                        .session
+                        .document()
+                        .doc()
+                        .elements()
+                        .values()
+                        .find(|e| e.geometry_ref == Some(*shape))
+                        .cloned()
+                    else {
+                        // 形状已无元素引用（被删）→ 顺带清渲染缓存。
+                        self.meshes.remove(shape);
+                        continue;
+                    };
+                    self.tessellate_into_cache(*shape, base_color(elem.category.as_str()));
+                }
             }
         }
         self.dirty = false;
         if self.fit_pending {
             self.fit_view();
             self.fit_pending = false;
+        }
+    }
+
+    /// 网格化一个形状并写进渲染缓存（失败写日志，不 panic）。
+    fn tessellate_into_cache(&mut self, shape: ShapeId, base: [u8; 3]) {
+        match self.session.tessellate(shape, VIEW_LINEAR, VIEW_ANGULAR) {
+            Ok(mesh) => {
+                self.meshes.insert(
+                    shape,
+                    ShapeMesh {
+                        mesh,
+                        base_color: base,
+                    },
+                );
+            }
+            Err(e) => self.log(format!("✗ 网格化 {shape} 失败：{e}")),
         }
     }
 
@@ -641,6 +779,8 @@ impl BimApp {
                     self.selected = Some(elem);
                     self.picked = None;
                     self.dirty = true;
+                    // M12 增量重建：只网格化新建的形状。
+                    self.dirty_shapes = Some([shape].into_iter().collect());
                     self.fit_pending = true;
                     // 记录算子（M10：rebuild 需要同款算子）。
                     self.op_by_element.insert(elem, op_id.to_string());
@@ -652,20 +792,21 @@ impl BimApp {
         }
     }
 
-    /// 视口拾取（单击）：屏幕坐标 → 面 → 元素。
+    /// 视口拾取（单击）：屏幕坐标 → 图元（面 / 边 / 顶点按当前拾取模式）。
     fn do_pick(&mut self, screen: (f32, f32)) {
         let camera = &self.camera;
-        let filter = PickFilter {
-            faces: true,
-            edges: false,
-            vertices: false,
-        };
+        let filter = self.pick_mode.filter();
         match self.session.pick_at(screen, camera, filter) {
             Ok(Some(hit)) => {
                 self.selected = Some(hit.element);
                 let p = hit.world_point;
+                let kind = match hit.kind {
+                    PickKind::Face => "面",
+                    PickKind::Edge => "边",
+                    PickKind::Vertex => "顶点",
+                };
                 self.log(format!(
-                    "✓ 拾取面：命中点 ({:.0}, {:.0}, {:.0})",
+                    "✓ 拾取{kind}：命中点 ({:.0}, {:.0}, {:.0})",
                     p.x, p.y, p.z
                 ));
                 self.picked = Some(hit);
@@ -721,6 +862,22 @@ impl BimApp {
             if ui.button("清空选择").clicked() {
                 self.selected = None;
                 self.picked = None;
+            }
+            ui.separator();
+            // —— 拾取模式（M12：面 / 边 / 顶点三态单选）——
+            ui.label("拾取：");
+            for mode in [PickMode::Face, PickMode::Edge, PickMode::Vertex] {
+                if ui
+                    .selectable_label(self.pick_mode == mode, mode.label())
+                    .clicked()
+                {
+                    self.pick_mode = mode;
+                }
+            }
+            ui.separator();
+            // —— 性能基线（M12：日志可见，不写死阈值）——
+            if ui.button("性能基线").clicked() {
+                self.run_perf_baseline();
             }
         });
     }
@@ -889,21 +1046,39 @@ impl BimApp {
         ui.heading("拾取信息");
         match &self.picked {
             None => {
-                ui.label("（单击视口拾取面）");
+                ui.label("（单击视口拾取）");
             }
             Some(p) => {
                 let w = p.world_point;
                 egui::Grid::new("pick_grid").striped(true).show(ui, |ui| {
+                    ui.label("种类");
+                    ui.label(match p.kind {
+                        PickKind::Face => "面",
+                        PickKind::Edge => "边",
+                        PickKind::Vertex => "顶点",
+                    });
+                    ui.end_row();
                     ui.label("命中点");
                     ui.label(format!("({:.0}, {:.0}, {:.0})", w.x, w.y, w.z));
                     ui.end_row();
-                    ui.label("面哈希");
-                    ui.label(format!("{}", p.topo_hash));
+                    ui.label("参数");
+                    ui.label(match p.param {
+                        PickParam::Face { u, v } => format!("u={u:.3}, v={v:.3}"),
+                        PickParam::Edge { t } => format!("t={t:.3}"),
+                        PickParam::Vertex => "（顶点无参数）".to_string(),
+                    });
+                    ui.end_row();
+                    ui.label("拓扑哈希");
+                    ui.label(if p.topo_hash == 0 {
+                        "（边/顶点无哈希，高亮走标记点）".to_string()
+                    } else {
+                        format!("{}", p.topo_hash)
+                    });
                     ui.end_row();
                     ui.label("法向");
                     ui.label(match p.normal {
                         Some(n) => format!("({:.3}, {:.3}, {:.3})", n.x, n.y, n.z),
-                        None => "（内核未提供）".to_string(),
+                        None => "（边/顶点或内核未提供）".to_string(),
                     });
                     ui.end_row();
                 });
@@ -1231,6 +1406,16 @@ impl BimApp {
                 .and_then(|e| e.geometry_ref)
         });
         self.draw_shapes(&painter, &rect, selected_shape);
+
+        // —— 拾取标记（M12：边 / 顶点命中画黄圈标记，与面高亮橙实色区分）——
+        if let Some(pk) = &self.picked
+            && !matches!(pk.kind, PickKind::Face)
+            && let Some((sp, _)) = self.camera.project(pk.world_point, &rect)
+        {
+            let marker = egui::Color32::from_rgb(0xff, 0xd5, 0x2e);
+            painter.circle_stroke(sp, 7.0, egui::Stroke::new(2.0_f32, marker));
+            painter.circle_filled(sp, 2.5, marker);
+        }
 
         painter.text(
             rect.left_bottom() + egui::vec2(8.0, -8.0),

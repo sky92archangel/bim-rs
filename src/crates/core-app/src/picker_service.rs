@@ -14,6 +14,19 @@
 //!                       handle ──element.geometry_ref 反查──▶ ElementId
 //! ```
 //!
+//! ## 边 / 顶点精算（M12 扩展，§6.6 全链收尾）
+//!
+//! 粗筛（网格层）定"命中点在哪个构件"，精算（内核层）定"命中点附近的边 / 顶点"：
+//!
+//! - 面：`sub_shapes(Face)[g]`（R16 同序，粗筛三角形 → face_groups 定位）；
+//! - 边：`sub_shapes(Edge)` 枚举 → 逐条 `project_point_on_edge(edge, 命中点)`
+//!   → **到命中点最近**者（点附近的边）；
+//! - 顶点：`sub_shapes(Vertex)` 枚举 → 逐个 `bounding_box`（顶点形状
+//!   min == max == 坐标）→ **到命中点最近**者。
+//!
+//! 面请求的候选距离取 **0**（命中点就在面上）——面 / 边 / 顶点同时请求时，
+//! "命中面"天然胜出，语义与"点在面上、点附近有边"一致。
+//!
 //! ## 为什么是"具体服务"而不是 `core_doc::Picker` trait（据实校正，**非遗漏**）
 //!
 //! 方案 §2.4 里的 `fn pick(&self, …) -> Option<PickResult>` 只是**示例签名**，本批
@@ -27,18 +40,13 @@
 //!
 //! 故先落具体服务 [`KernelPicker`]，返回 `AppResult<Option<PickResult>>`：
 //! **未命中是 `Ok(None)`、错误是 `Err`**（两者可区分）。将来真有第二个实现再抽 trait。
-//!
-//! ## 本批范围（B4.1b-2）
-//!
-//! 首版**只做面拾取**。边 / 顶点过滤器 → [`AppError::Unsupported`]（**响亮拒绝**，
-//! 绝不 `Ok(None)` 假装"没选中"）。
 
 use core_doc::{Camera, PickFilter, PickKind, PickParam, PickResult, ray_hits_mesh};
 use core_kernel::{KernelError, ShapeHandle, SubShapeKind};
 use core_model::{Document, ShapeId};
 use glam::DVec3;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::geometry_service::GeometryService;
 
 /// 拾取粗筛用的**线性挠度**（mm）。
@@ -67,14 +75,14 @@ impl<'a> KernelPicker<'a> {
         Self { geometry, document }
     }
 
-    /// 拾取屏幕 `screen` 处的**面**。
+    /// 拾取屏幕 `screen` 处的图元（面 / 边 / 顶点按过滤器组合）。
     ///
     /// 返回语义（**未命中与错误严格区分**）：
-    /// - `Ok(Some(r))`：命中某个元素的某个面；
-    /// - `Ok(None)`：未请求面、缓存为空、或全部未命中（**正常情况，不是错误**）；
-    /// - `Err(AppError::Unsupported)`：请求了**边 / 顶点**（首版未实现）——**响亮拒绝**；
-    /// - `Err(AppError::Kernel(…))`：内核侧真错误（占位后端无面拓扑 / 网格分组不完整 /
-    ///   面组越界等），**绝不吞成 `None`**。
+    /// - `Ok(Some(r))`：命中某个元素的某个面 / 边 / 顶点（按请求种类取最近）；
+    /// - `Ok(None)`：粗筛未命中（点在所有构件之外）、缓存为空、或元素反查落空
+    ///   （**正常情况，不是错误**）；
+    /// - `Err(AppError::Kernel(…))`：内核侧真错误（占位后端无子形状拓扑 /
+    ///   网格分组不完整 / 子形状越界等），**绝不吞成 `None`**。
     ///
     /// 本方法**绝不 panic**。
     pub fn pick(
@@ -83,17 +91,10 @@ impl<'a> KernelPicker<'a> {
         camera: &dyn Camera,
         filter: PickFilter,
     ) -> AppResult<Option<PickResult>> {
-        // 边 / 顶点：首版未实现 → 响亮拒绝（绝不 `Ok(None)` 装作"没选中"）。
-        if filter.edges || filter.vertices {
-            return Err(AppError::Unsupported(
-                "边/顶点拾取尚未实现（B4.1b-2 首版只做面）".to_string(),
-            ));
-        }
-        // 未请求面 → 无事可做。
-        if !filter.faces {
+        // 全空过滤器 → 无事可做（不清粗筛，不精算，无候选）。
+        if !(filter.faces || filter.edges || filter.vertices) {
             return Ok(None);
         }
-
         let ray = camera.ray_through(screen);
 
         // 粗筛胜者：只留最小必要信息，**不长期持有 `mesh`**。
@@ -108,13 +109,10 @@ impl<'a> KernelPicker<'a> {
 
         let mut best: Option<Coarse> = None;
         for shape in self.geometry.cached_ids() {
-            let Some(handle) = self.geometry.handle_of(shape) else {
-                continue;
-            };
+            // 带缓存网格化（M12：同一形状反复拾取不再重跑内核 tessellate）。
             let mesh = self
                 .geometry
-                .kernel_mut()
-                .tessellate(handle, PICK_LINEAR, PICK_ANGULAR)?;
+                .tessellate_for_pick(shape, PICK_LINEAR, PICK_ANGULAR)?;
             let Some(hit) = ray_hits_mesh(&ray, &mesh.positions, &mesh.indices) else {
                 continue;
             };
@@ -138,7 +136,13 @@ impl<'a> KernelPicker<'a> {
             }
             best = Some(Coarse {
                 shape,
-                handle,
+                handle: self
+                    .geometry
+                    .handle_of(shape)
+                    .ok_or(KernelError::Geometry {
+                        op: "pick",
+                        msg: format!("形状 {shape} 在粗筛后句柄消失（缓存被并发清掉）"),
+                    })?,
                 distance: hit.distance,
                 group_index,
                 face_hash: mesh.face_groups[group_index].face_hash,
@@ -161,50 +165,170 @@ impl<'a> KernelPicker<'a> {
             return Ok(None);
         };
 
-        // ---- 精算：R16 同序 → `faces[g]` 即命中面 ----
-        let faces = self
-            .geometry
-            .kernel_mut()
-            .sub_shapes(best.handle, SubShapeKind::Face)?;
-        if faces.is_empty() {
-            // 粗筛命中一个有网格的形状，内核却**枚举不出任何面** → 这是数据不一致
-            // （网格与拓扑互相矛盾），**不是**"能力缺失"；与紧邻的 face_group 越界分支
-            // 同语义，如实报 `Geometry`（占位后端 mock 亦走此分支）。
-            return Err(KernelError::Geometry {
-                op: "pick",
-                msg: "粗筛命中但形状枚举不出面（内核返回空子形状）——网格与拓扑不一致".to_string(),
-            }
-            .into());
+        // ---- 精算（M12）：按请求种类各算候选，跨种类取"到命中点最近"者 ----
+        struct Refine {
+            kind: PickKind,
+            /// 面候选 = 命中面哈希；边 / 顶点候选 = 0（内核无子形状哈希 API，
+            /// 高亮层对边 / 顶点用 `world_point` 标记，不依赖该哈希）。
+            topo_hash: u64,
+            point: DVec3,
+            param: PickParam,
+            normal: Option<DVec3>,
+            /// 到粗筛命中点的距离（面候选恒 0——命中点就在面上）。
+            dist: f64,
         }
-        let Some(&face) = faces.get(best.group_index) else {
-            return Err(KernelError::Geometry {
-                op: "pick",
-                msg: format!(
-                    "命中面组索引 {} 越界（内核面数 {}）——R16 同序被破坏",
-                    best.group_index,
-                    faces.len()
-                ),
+        let mut candidates: Vec<Refine> = Vec::new();
+
+        if filter.faces {
+            // 面精算：R16 同序 → `faces[g]` 即命中面。
+            let faces = self
+                .geometry
+                .kernel_mut()
+                .sub_shapes(best.handle, SubShapeKind::Face)?;
+            if faces.is_empty() {
+                // 粗筛命中一个有网格的形状，内核却**枚举不出任何面** → 这是数据不一致
+                // （网格与拓扑互相矛盾），**不是**"能力缺失"；与紧邻的 face_group 越界分支
+                // 同语义，如实报 `Geometry`（占位后端 mock 亦走此分支）。
+                return Err(KernelError::Geometry {
+                    op: "pick",
+                    msg: "粗筛命中但形状枚举不出面（内核返回空子形状）——网格与拓扑不一致"
+                        .to_string(),
+                }
+                .into());
             }
-            .into());
-        };
-        let pof = self
-            .geometry
-            .kernel_mut()
-            .project_point_on_face(face, best.point)?;
-        // 法向取不到**不致命**（内核不提供时）→ `None`，不 panic。
-        let normal = self
-            .geometry
-            .kernel_mut()
-            .surface_normal(face, pof.u, pof.v)
-            .ok();
+            let Some(&face) = faces.get(best.group_index) else {
+                return Err(KernelError::Geometry {
+                    op: "pick",
+                    msg: format!(
+                        "命中面组索引 {} 越界（内核面数 {}）——R16 同序被破坏",
+                        best.group_index,
+                        faces.len()
+                    ),
+                }
+                .into());
+            };
+            let pof = self
+                .geometry
+                .kernel_mut()
+                .project_point_on_face(face, best.point)?;
+            // 法向取不到**不致命**（内核不提供时）→ `None`，不 panic。
+            let normal = self
+                .geometry
+                .kernel_mut()
+                .surface_normal(face, pof.u, pof.v)
+                .ok();
+            candidates.push(Refine {
+                kind: PickKind::Face,
+                topo_hash: best.face_hash,
+                point: best.point,
+                param: PickParam::Face { u: pof.u, v: pof.v },
+                normal,
+                dist: 0.0,
+            });
+        }
+
+        if filter.edges {
+            // 边精算：枚举边 → 逐条投影到命中点 → 最近者。
+            let edges = self
+                .geometry
+                .kernel_mut()
+                .sub_shapes(best.handle, SubShapeKind::Edge)?;
+            if edges.is_empty() {
+                // 同面款：粗筛命中但枚举不出任何边 → 网格与拓扑不一致，响亮报错。
+                return Err(KernelError::Geometry {
+                    op: "pick",
+                    msg: "粗筛命中但形状枚举不出边（内核返回空子形状）——网格与拓扑不一致"
+                        .to_string(),
+                }
+                .into());
+            }
+            let mut best_edge: Option<(DVec3, f64, f64)> = None; // (点, param, 距离)
+            for e in &edges {
+                let pe = self
+                    .geometry
+                    .kernel_mut()
+                    .project_point_on_edge(*e, best.point)?;
+                let d = (pe.point - best.point).length();
+                if best_edge.is_none_or(|(_, _, bd)| d < bd) {
+                    best_edge = Some((pe.point, pe.param, d));
+                }
+            }
+            let Some((p, t, d)) = best_edge else {
+                // edges 非空但一条都没投影成功 → 内核行为异常，响亮报错。
+                return Err(KernelError::Geometry {
+                    op: "pick",
+                    msg: "边精算全部失败（内核投影无结果）".to_string(),
+                }
+                .into());
+            };
+            candidates.push(Refine {
+                kind: PickKind::Edge,
+                topo_hash: 0,
+                point: p,
+                param: PickParam::Edge { t },
+                normal: None,
+                dist: d,
+            });
+        }
+
+        if filter.vertices {
+            // 顶点精算：枚举顶点 → 逐个 bbox（顶点形状 min==max==坐标）→ 最近者。
+            let verts = self
+                .geometry
+                .kernel_mut()
+                .sub_shapes(best.handle, SubShapeKind::Vertex)?;
+            if verts.is_empty() {
+                // 同面款：粗筛命中但枚举不出任何顶点 → 网格与拓扑不一致，响亮报错。
+                return Err(KernelError::Geometry {
+                    op: "pick",
+                    msg: "粗筛命中但形状枚举不出顶点（内核返回空子形状）——网格与拓扑不一致"
+                        .to_string(),
+                }
+                .into());
+            }
+            let mut best_vert: Option<(DVec3, f64)> = None; // (坐标, 距离)
+            for v in &verts {
+                let bb = self.geometry.kernel_mut().bounding_box(*v)?;
+                let p = DVec3::new(bb.min[0], bb.min[1], bb.min[2]);
+                let d = (p - best.point).length();
+                if best_vert.is_none_or(|(_, bd)| d < bd) {
+                    best_vert = Some((p, d));
+                }
+            }
+            let Some((p, d)) = best_vert else {
+                return Err(KernelError::Geometry {
+                    op: "pick",
+                    msg: "顶点精算全部失败（内核包围盒无结果）".to_string(),
+                }
+                .into());
+            };
+            candidates.push(Refine {
+                kind: PickKind::Vertex,
+                topo_hash: 0,
+                point: p,
+                param: PickParam::Vertex,
+                normal: None,
+                dist: d,
+            });
+        }
+
+        // 跨种类取"到命中点最近"（面候选恒 0 → 同时请求时面天然优先）。
+        let winner = candidates
+            .iter()
+            .min_by(|a, b| {
+                a.dist
+                    .partial_cmp(&b.dist)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("至少请求了一种图元且各分支已 push 候选（filter 全空时不应走到这里）");
 
         Ok(Some(PickResult {
             element,
-            kind: PickKind::Face,
-            topo_hash: best.face_hash,
-            world_point: best.point,
-            param: PickParam::Face { u: pof.u, v: pof.v },
-            normal,
+            kind: winner.kind,
+            topo_hash: winner.topo_hash,
+            world_point: winner.point,
+            param: winner.param,
+            normal: winner.normal,
         }))
     }
 }
@@ -212,6 +336,7 @@ impl<'a> KernelPicker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AppError;
     use core_doc::Ray;
     use core_model::{Category, Element};
 
@@ -224,42 +349,68 @@ mod tests {
         }
     }
 
-    /// 默认腿（mock）钉子 ①：**边 / 顶点过滤器必须响亮拒绝**（`Err`），绝不静默 `Ok(None)`。
+    /// 默认腿（mock）钉子 ①（**M12 更新**）：**边 / 顶点拾取在 mock 上响亮报错**，绝不 `Ok(None)`。
     ///
-    /// 守"跳过与通过可区分"：首版不支持边 / 顶点，若返回 `Ok(None)`，调用方会以为
-    /// "用户没点到"，从而**永远发现不了**这个能力缺失。
+    /// M12 起边 / 顶点精算已实现：粗筛命中后 mock 枚举不出任何子形状
+    /// （`sub_shapes(Edge/Vertex)` 返回空——网格与拓扑不一致）→ 如实报
+    /// `Err(Kernel(Geometry))`。"跳过与通过可区分"的语义保留：
+    /// 用户点了没反应（`Ok(None)`）**永远不该是能力缺失的表现**。
     #[test]
-    fn picker_rejects_edge_and_vertex_filters_loudly() {
+    fn picker_edge_vertex_fail_loudly_on_mock() {
+        // mock 建模 + 缓存 + 装元素（同钉子②的前置，否则粗筛不命中）。
         let mut g = GeometryService::with_mock_kernel();
-        let doc = Document::new("d");
-        let cam = FixedCamera(Ray {
-            origin: DVec3::ZERO,
-            direction: DVec3::NEG_Z,
-        });
+        let handle = g
+            .kernel_mut()
+            .make_box(10.0, 10.0, 10.0)
+            .expect("mock 建模应成功");
+        let shape = ShapeId::new();
+        g.cache(shape, handle);
+        let mut doc = Document::new("d");
+        let element = Element::new(Category::generic(), "box").with_geometry(shape);
+        doc.insert_element(element).expect("插入元素应成功");
+
+        // 构造一条确实命中该盒的射线（同钉子②：取 mesh 首三角形质心法向反打）。
+        let mesh = g
+            .kernel_mut()
+            .tessellate(handle, PICK_LINEAR, PICK_ANGULAR)
+            .expect("mock 网格应可用");
+        let a = DVec3::from(mesh.positions[mesh.indices[0] as usize]);
+        let b = DVec3::from(mesh.positions[mesh.indices[1] as usize]);
+        let c = DVec3::from(mesh.positions[mesh.indices[2] as usize]);
+        let centroid = (a + b + c) / 3.0;
+        let n = (b - a).cross(c - a).normalize();
+        let ray = Ray {
+            origin: centroid + n * 10.0,
+            direction: -n,
+        };
+        let cam = FixedCamera(ray);
         let mut p = KernelPicker::new(&mut g, &doc);
 
         for filter in [
             PickFilter {
-                faces: true,
+                faces: false,
                 edges: true,
                 vertices: false,
             },
             PickFilter {
-                faces: true,
+                faces: false,
                 edges: false,
                 vertices: true,
             },
-            // 连面都不请求、只请求边 / 顶点 → 仍须响亮拒绝（不能被"faces=false → Ok(None)"短路）。
+            // 面 + 边同时请求：mock 无任何子形状 → 仍须响亮（不许静默）。
             PickFilter {
-                faces: false,
+                faces: true,
                 edges: true,
                 vertices: true,
             },
         ] {
             let got = p.pick((0.0, 0.0), &cam, filter);
             assert!(
-                matches!(got, Err(AppError::Unsupported(_))),
-                "边/顶点过滤器应响亮拒绝（Err(Unsupported)），实得 {got:?}（filter={filter:?}）"
+                matches!(
+                    got,
+                    Err(AppError::Kernel(KernelError::Geometry { op: "pick", .. }))
+                ),
+                "边/顶点拾取在 mock 上应响亮报错（Kernel::Geometry 数据不一致），实得 {got:?}（filter={filter:?}）"
             );
         }
 
@@ -648,5 +799,139 @@ mod tests {
             matches!(got, Ok(None)),
             "粗筛命中但无对应元素应 Ok(None)，实得 {got:?}"
         );
+    }
+
+    /// occt 腿钉子 ⑥（M12）：**边拾取命中最近的边**。
+    ///
+    /// 立方体 (0,0,0)-(10,10,10)，射线打顶面 (5, 9.9, 10)（离 `y=10` 顶边仅 0.1）
+    /// → 最近的边是 `y=10` 那条，边上最近点 ≈ (5, 10, 10)。
+    #[test]
+    #[cfg(feature = "occt")]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "真实内核用例在 debug 下 wasmtime 编译过慢，请用 --release 运行"
+    )]
+    fn pick_hits_the_nearest_edge_on_real_kernel() {
+        let mut g = GeometryService::new().expect("真实内核应可用");
+        assert_eq!(g.backend_kind(), core_kernel::BackendKind::Real);
+        let handle = g
+            .kernel_mut()
+            .make_box(10.0, 10.0, 10.0)
+            .expect("建模应成功");
+        let shape = ShapeId::new();
+        g.cache(shape, handle);
+        let mut doc = Document::new("d");
+        let element = Element::new(Category::generic(), "box").with_geometry(shape);
+        let element_id = element.id;
+        doc.insert_element(element).expect("插入元素应成功");
+
+        let ray = Ray {
+            origin: DVec3::new(5.0, 9.9, 110.0),
+            direction: DVec3::NEG_Z,
+        };
+        let cam = FixedCamera(ray);
+        let r = {
+            let mut p = KernelPicker::new(&mut g, &doc);
+            p.pick(
+                (0.0, 0.0),
+                &cam,
+                PickFilter {
+                    faces: false,
+                    edges: true,
+                    vertices: false,
+                },
+            )
+            .expect("拾取不应报错")
+        };
+        let Some(r) = r else {
+            panic!("顶面边缘正上方的射线应命中最近的边，实得 None");
+        };
+
+        assert_eq!(r.kind, PickKind::Edge, "应拾取到边");
+        assert_eq!(r.element, element_id, "应命中持有的元素");
+        assert!(
+            (r.world_point - DVec3::new(5.0, 10.0, 10.0)).length() < 0.5,
+            "边上最近点应≈(5,10,10)（y=10 顶边距命中点仅 0.1），实得 {:?}",
+            r.world_point
+        );
+        match r.param {
+            PickParam::Edge { t } => assert!(t.is_finite(), "边参数应有限，实得 t={t}"),
+            other => panic!("边拾取的 param 应为 Edge{{t}}，实得 {other:?}"),
+        }
+        assert_eq!(
+            r.topo_hash, 0,
+            "边候选无哈希 API，topo_hash 应为 0（高亮走标记点）"
+        );
+    }
+
+    /// occt 腿钉子 ⑦（M12）：**顶点拾取命中最近的顶点；面 + 边 + 顶点同时请求时面胜出**。
+    #[test]
+    #[cfg(feature = "occt")]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "真实内核用例在 debug 下 wasmtime 编译过慢，请用 --release 运行"
+    )]
+    fn pick_hits_the_nearest_vertex_and_face_wins_when_all_requested() {
+        let mut g = GeometryService::new().expect("真实内核应可用");
+        assert_eq!(g.backend_kind(), core_kernel::BackendKind::Real);
+        let handle = g
+            .kernel_mut()
+            .make_box(10.0, 10.0, 10.0)
+            .expect("建模应成功");
+        let shape = ShapeId::new();
+        g.cache(shape, handle);
+        let mut doc = Document::new("d");
+        let element = Element::new(Category::generic(), "box").with_geometry(shape);
+        doc.insert_element(element).expect("插入元素应成功");
+
+        // ① 只请求顶点：射线打顶面 (9.9, 9.9, 10)（离角点 (10,10,10) 距离 ≈0.14）。
+        let ray = Ray {
+            origin: DVec3::new(9.9, 9.9, 110.0),
+            direction: DVec3::NEG_Z,
+        };
+        let cam = FixedCamera(ray);
+        let r = {
+            let mut p = KernelPicker::new(&mut g, &doc);
+            p.pick(
+                (0.0, 0.0),
+                &cam,
+                PickFilter {
+                    faces: false,
+                    edges: false,
+                    vertices: true,
+                },
+            )
+            .expect("拾取不应报错")
+        };
+        let Some(r) = r else {
+            panic!("顶面角点附近的射线应命中最近的顶点，实得 None");
+        };
+        assert_eq!(r.kind, PickKind::Vertex, "应拾取到顶点");
+        assert!(
+            (r.world_point - DVec3::new(10.0, 10.0, 10.0)).length() < 1e-6,
+            "最近顶点应为角点 (10,10,10)，实得 {:?}",
+            r.world_point
+        );
+        assert_eq!(r.param, PickParam::Vertex, "顶点候选无参数");
+
+        // ② 面 + 边 + 顶点同时请求：命中点就在面上（面候选距离恒 0）→ 面胜出。
+        let r = {
+            let mut p = KernelPicker::new(&mut g, &doc);
+            p.pick(
+                (0.0, 0.0),
+                &cam,
+                PickFilter {
+                    faces: true,
+                    edges: true,
+                    vertices: true,
+                },
+            )
+            .expect("拾取不应报错")
+        };
+        let Some(r) = r else {
+            panic!("全种类请求应命中面（距离恒 0 优先），实得 None");
+        };
+        assert_eq!(r.kind, PickKind::Face, "面 + 边 + 顶点同时请求时面应胜出");
+        assert_ne!(r.topo_hash, 0, "面候选带命中面哈希");
     }
 }

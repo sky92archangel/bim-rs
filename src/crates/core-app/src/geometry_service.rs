@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use core_kernel::{Kernel, KernelError, KernelResult, ShapeHandle};
+use core_kernel::{Kernel, KernelError, KernelResult, MeshData, ShapeHandle};
 use core_model::{Document, GeometryRecord, ShapeId};
 use core_sdk::{BuildOp, OpOutput};
 
@@ -156,6 +156,13 @@ pub struct GeometryService {
     /// [`GeometryService::remember_history`] 登记，供 [`GeometryService::history_of`]
     /// 回读——M6b 会话态，不落盘容器）。
     histories: BTreeMap<ShapeId, HistoryRecord>,
+    /// 拾取网格化缓存（ShapeId → 固定挠度 tessellate 结果，**会话态**，M12）。
+    ///
+    /// 拾取链路每次都用固定挠度重跑内核 `tessellate`——真实内核（wasm JIT）
+    /// 代价可观，同一形状反复拾取时白跑。按 `ShapeId` 缓存；
+    /// [`GeometryService::cache`] / [`GeometryService::forget`] 同步失效
+    /// （句柄替换 / 解除 → 旧网格必错），开新会话是全新服务（天然空缓存）。
+    pick_meshes: BTreeMap<ShapeId, MeshData>,
 }
 
 impl GeometryService {
@@ -189,6 +196,7 @@ impl GeometryService {
             reverse: BTreeMap::new(),
             loader: Box::new(crate::loader::BrepShapeLoader::new()),
             histories: BTreeMap::new(),
+            pick_meshes: BTreeMap::new(),
         }
     }
 
@@ -285,6 +293,8 @@ impl GeometryService {
             self.reverse.remove(&old.raw());
         }
         self.reverse.insert(handle.raw(), shape);
+        // 句柄替换 → 旧网格缓存必错，同步失效（M12）。
+        self.pick_meshes.remove(&shape);
     }
 
     /// 持久 → 会话。
@@ -321,6 +331,8 @@ impl GeometryService {
     pub fn forget(&mut self, shape: ShapeId) -> Option<ShapeHandle> {
         let handle = self.handles.remove(&shape)?;
         self.reverse.remove(&handle.raw());
+        // 映射解除 → 网格缓存同步失效（M12）。
+        self.pick_meshes.remove(&shape);
         Some(handle)
     }
 
@@ -367,6 +379,31 @@ impl GeometryService {
     #[must_use]
     pub fn cached_ids(&self) -> Vec<ShapeId> {
         self.handles.keys().copied().collect()
+    }
+
+    /// **拾取网格化（带缓存，M12）**：同 `ShapeId` 重复拾取不再重跑内核 tessellate。
+    ///
+    /// 拾取链路用固定挠度（PICK_LINEAR / PICK_ANGULAR）网格化做粗筛——真实内核
+    /// （wasm JIT）代价可观。缓存按 `ShapeId` 记（`cache` / `forget` 同步失效，
+    /// 见字段文档）；**不同挠度不共享缓存**——本方法只服务拾取这一固定挠度，
+    /// 渲染层另有自己的挠度（GUI 的 `VIEW_LINEAR`），互不混用。
+    pub fn tessellate_for_pick(
+        &mut self,
+        shape: ShapeId,
+        linear: f64,
+        angular: f64,
+    ) -> AppResult<MeshData> {
+        if let Some(mesh) = self.pick_meshes.get(&shape) {
+            return Ok(mesh.clone());
+        }
+        let Some(handle) = self.handle_of(shape) else {
+            return Err(AppError::Model(core_model::ModelError::GeometryNotFound(
+                shape,
+            )));
+        };
+        let mesh = self.kernel.tessellate(handle, linear, angular)?;
+        self.pick_meshes.insert(shape, mesh.clone());
+        Ok(mesh)
     }
 
     // ---------- 配方执行 ----------

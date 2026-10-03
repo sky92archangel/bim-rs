@@ -9,14 +9,21 @@
 //! │ 工具栏: 构建(基本体/线框/扫掠放样/布尔/变换/修饰/修复) 模块配方 │
 //! │         适配 清选 | 拾取:面/边/顶点 | 基线 | 日志开关          │
 //! ├────────────┬─────────────────────────────┬─────────────────┤
-//! │ 左栏(页签)  │                             │ 右栏(页签)       │
-//! │  元素/类型  │        三维视口              │  属性/图纸       │
+//! │ 元素│类型   │                             │ 属性│视图│图纸    │
+//! │ (可停靠)    │        三维视口              │  (可停靠)        │
+//! │             ├─────────────────────────────┤                 │
+//! │             │ 日志                         │                 │
 //! ├────────────┴─────────────────────────────┴─────────────────┤
 //! │ 状态栏: 文件名 · 坐标 · 拾取模式 · 内核 · 统计               │
-//! │ 日志（可折叠，失败响亮可见，不弹窗不吞错）                    │
 //! └────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! ## 可停靠面板（G6-M5：egui_dock 0.14）
+//!
+//! 面板区（元素/类型/属性/视图/图纸/日志/视口）由 [`egui_dock::DockState`] 管理：
+//! 每个面板是 [`DockTab`]，用户可拖动重排、拖出为独立窗口、关闭；
+//! 菜单栏「视图 · 重置布局」恢复默认五区布局。视口不可关闭（closeable=false）——
+//! 它是 3D 主体；其余面板关闭后可从重置布局找回。
 //! ## 构建链路（G3：原生算子门面 + 参数表单）
 //!
 //! 工具栏七组（基本体 / 线框 / 扫掠放样 / 布尔 / 变换 / 修饰 / 修复，计划
@@ -296,24 +303,6 @@ fn view_presets() -> Vec<ViewPreset> {
     ]
 }
 
-/// 自制页签行（G2）：egui 无原生 Tabs 组件；返回被点击的页签（None = 未点击）。
-fn page_tabs(
-    ui: &mut egui::Ui,
-    pages: &[(Page, &'static str, &str)],
-    active: Page,
-) -> Option<Page> {
-    let mut clicked = None;
-    ui.horizontal(|ui| {
-        for (page, icon, label) in pages {
-            let text = format!("{icon} {label}");
-            if ui.selectable_label(*page == active, text).clicked() {
-                clicked = Some(*page);
-            }
-        }
-    });
-    clicked
-}
-
 /// 按品类取基色（构件分色，便于区分模块）。
 fn base_color(category: &str) -> [u8; 3] {
     match category {
@@ -341,23 +330,100 @@ fn format_value(v: &Value) -> String {
     }
 }
 
-/// GUI 应用状态。
-/// 面板页签（G2 五区布局：左右栏各一组自制页签——egui 无原生 Tabs 组件，
-/// 可停靠面板 egui_dock 在后续计划 §9）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
-    /// 左栏 · 元素（构件树）
+/// 可停靠面板页签（G6-M5：egui_dock 的 Tab）。
+/// 面板内容与标题在 [`BimTabViewer`] 里路由；选中态由 `DockState` 管理。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DockTab {
+    /// 视口（中央，3D 主体——不可关闭）
+    Viewport,
+    /// 元素（构件树）
     Elements,
-    /// 左栏 · 类型管理器（G5 交付）
+    /// 类型管理器（G5 交付）
     Types,
-    /// 右栏 · 属性
+    /// 属性
     Props,
-    /// 右栏 · 视图（G6-M3 更名：本页实为视图列表——Sheet 是"图纸"）
-    Drawing,
-    /// 右栏 · 图纸（G6-M3 出图深化：Sheet 布置——图幅 / 标题栏 / 整图预览导出）
+    /// 视图列表（G6-M3 更名：本页实为视图列表——Sheet 是"图纸"）
+    Views,
+    /// 图纸（G6-M3 出图深化：Sheet 布置——图幅 / 标题栏 / 整图预览导出）
     Sheets,
+    /// 日志
+    Logs,
 }
 
+/// 默认停靠布局（G6-M5）：照五区语义——
+/// 左栏（元素/类型叠 tab）15% → 右栏（属性/视图/图纸叠 tab）22% → 底部日志 20%，
+/// 剩余为中央视口。两处构造（[`BimApp::new`] / [`BimApp::open_document`]）与
+/// 菜单栏「重置布局」共用。
+///
+/// split 语义（egui_dock 0.14 实现为准）：`split_left(parent, f, tabs)` 把
+/// **tabs 放左侧占 f**、原内容（old）在右占 1−f；`split_right` / `split_below` 同理
+/// （new 在方向侧占 1−f——注意 fraction 恒属于 old 节点）。
+fn default_dock() -> egui_dock::DockState<DockTab> {
+    let mut dock = egui_dock::DockState::new(vec![DockTab::Viewport]);
+    let surface = dock.main_surface_mut();
+    // ① 左栏：元素 + 类型叠 tab，占 15%（old=其余内容在右占 85%）
+    let [rest, _left] = surface.split_left(
+        egui_dock::NodeIndex::root(),
+        0.15,
+        vec![DockTab::Elements, DockTab::Types],
+    );
+    // ② 右栏：属性 / 视图 / 图纸叠 tab，占 22%（old=中央块在左占 78%）
+    let [center, _right] = surface.split_right(
+        rest,
+        0.78,
+        vec![DockTab::Props, DockTab::Views, DockTab::Sheets],
+    );
+    // ③ 底部：日志占 20%（old=视口块在上占 80%）
+    let [_viewport, _logs] = surface.split_below(center, 0.80, vec![DockTab::Logs]);
+    dock
+}
+
+/// 把 [`DockTab`] 的路由进 [`BimApp`] 的对应面板方法（egui_dock `TabViewer`）。
+///
+/// 借用说明：`update()` 里用 `mem::replace` 把 dock 暂移出去、
+/// viewer 持 `&mut BimApp`，渲染完再还回——避免 self.dock 与 self 双重借用。
+struct BimTabViewer<'a> {
+    app: &'a mut BimApp,
+}
+
+impl egui_dock::TabViewer for BimTabViewer<'_> {
+    type Tab = DockTab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        use egui_phosphor::regular as ph;
+        let (icon, name) = match tab {
+            DockTab::Viewport => (ph::CUBE, "视口"),
+            DockTab::Elements => (ph::LIST_BULLETS, "元素"),
+            DockTab::Types => (ph::GEAR, "类型"),
+            DockTab::Props => (ph::GEAR, "属性"),
+            DockTab::Views => (ph::FRAME_CORNERS, "视图"),
+            DockTab::Sheets => (ph::BROWSER, "图纸"),
+            DockTab::Logs => (ph::CARET_DOUBLE_DOWN, "日志"),
+        };
+        format!("{icon} {name}").into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        match tab {
+            DockTab::Viewport => self.app.viewport(ui),
+            DockTab::Elements => self.app.elements_panel(ui),
+            DockTab::Types => self.app.types_panel(ui),
+            DockTab::Props => self.app.props_panel(ui),
+            DockTab::Views => self.app.views_panel(ui),
+            DockTab::Sheets => self.app.sheets_panel(ui),
+            DockTab::Logs => self.app.logs_panel(ui),
+        }
+    }
+
+    /// 视口不可关闭——它是 3D 主体，关了没地方画；其余面板可关（重置布局找回）。
+    fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
+        !matches!(tab, DockTab::Viewport)
+    }
+}
+
+/// GUI 应用状态。
+/// 面板区由 [`egui_dock::DockState`] 管理可停靠页签（G6-M5），
+/// 菜单栏 / 工具栏 / 状态栏仍是固定 TopBottomPanel。
 struct BimApp {
     session: CoreSession,
     camera: OrbitCamera,
@@ -409,12 +475,9 @@ struct BimApp {
     pick_mode: PickMode,
     /// 增量重建集（M12）：None = 全量重建，Some = 只重建这些形状。
     dirty_shapes: Option<HashSet<ShapeId>>,
-    /// 左栏当前页签（G2：元素 / 类型管理器占位）
-    left_page: Page,
-    /// 右栏当前页签（G2：属性 / 图纸）
-    right_page: Page,
-    /// 日志面板显示开关（G2：可折叠，菜单"视图"或工具栏切换）
-    show_logs: bool,
+    /// 可停靠面板布局（G6-M5：egui_dock——面板选中态/关闭/重排由它管理；
+    /// 默认五区布局见 [`default_dock`]）
+    dock: egui_dock::DockState<DockTab>,
     /// 待确认的原生算子参数表单（G3：点工具栏算子项 → 表单浮窗 → 确认执行）
     op_form: Option<OpForm>,
     /// 副选构件（G3：布尔 / 扫掠类第二输入；元素列表 / 视口 Ctrl+单击设置）
@@ -596,9 +659,7 @@ impl BimApp {
             place_y_mm: 100.0,
             pick_mode: PickMode::Face,
             dirty_shapes: None,
-            left_page: Page::Elements,
-            right_page: Page::Props,
-            show_logs: true,
+            dock: default_dock(),
             op_form: None,
             secondary: None,
             sketch: None,
@@ -661,9 +722,7 @@ impl BimApp {
             place_y_mm: 100.0,
             pick_mode: PickMode::Face,
             dirty_shapes: None,
-            left_page: Page::Elements,
-            right_page: Page::Props,
-            show_logs: true,
+            dock: default_dock(),
             op_form: None,
             secondary: None,
             sketch: None,
@@ -1162,13 +1221,15 @@ impl BimApp {
                     self.fit_view();
                     ui.close_menu();
                 }
-                let toggle = if self.show_logs {
-                    "隐藏日志"
-                } else {
-                    "显示日志"
-                };
-                if ui.button(toggle).clicked() {
-                    self.show_logs = !self.show_logs;
+                // G6-M5：日志面板是 dock tab——点这里聚焦它；被关了就加回当前 leaf。
+                if ui.button("聚焦日志").clicked() {
+                    self.focus_or_restore_tab(DockTab::Logs);
+                    ui.close_menu();
+                }
+                // G6-M5：面板拖动/关闭后一键恢复默认五区布局。
+                if ui.button("重置布局").clicked() {
+                    self.dock = default_dock();
+                    self.log("✓ 已恢复默认面板布局".to_string());
                     ui.close_menu();
                 }
             });
@@ -1358,12 +1419,13 @@ impl BimApp {
                 self.run_perf_baseline();
             }
             ui.separator();
-            // —— 日志折叠快捷开关（G2）——
+            // —— 日志面板快捷开关（G2 → G6-M5 聚焦语义）——
             if ui
-                .selectable_label(self.show_logs, format!("{} 日志", ph::CARET_DOUBLE_DOWN))
+                .button(format!("{} 日志", ph::CARET_DOUBLE_DOWN))
+                .on_hover_text("聚焦日志面板（关闭后点此恢复）")
                 .clicked()
             {
-                self.show_logs = !self.show_logs;
+                self.focus_or_restore_tab(DockTab::Logs);
             }
         });
     }
@@ -1667,55 +1729,6 @@ impl BimApp {
             crate::sketch_editor::EditorFrame::Closed => {
                 self.log("草图编辑器已关闭（未提交，草稿丢弃）");
             }
-        }
-    }
-
-    /// 左栏（G2 五区布局）：自制页签（元素 / 类型）+ 页面切换。
-    fn left_panel(&mut self, ui: &mut egui::Ui) {
-        use egui_phosphor::regular as ph;
-        ui.add_space(2.0);
-        let clicked = page_tabs(
-            ui,
-            &[
-                (Page::Elements, ph::LIST_BULLETS, "元素"),
-                (Page::Types, ph::GEAR, "类型"),
-            ],
-            self.left_page,
-        );
-        if let Some(p) = clicked {
-            self.left_page = p;
-        }
-        ui.separator();
-        match self.left_page {
-            Page::Elements => self.elements_panel(ui),
-            Page::Types => self.types_panel(ui),
-            _ => {}
-        }
-    }
-
-    /// 右栏（G2 五区布局）：自制页签（属性 / 图纸）+ 页面切换。
-    fn right_panel(&mut self, ui: &mut egui::Ui) {
-        use egui_phosphor::regular as ph;
-        ui.add_space(2.0);
-        let clicked = page_tabs(
-            ui,
-            &[
-                (Page::Props, ph::GEAR, "属性"),
-                // G6-M3 更名：本页实为视图列表（View），"图纸"让给 Sheet 页
-                (Page::Drawing, ph::FRAME_CORNERS, "视图"),
-                (Page::Sheets, ph::BROWSER, "图纸"),
-            ],
-            self.right_page,
-        );
-        if let Some(p) = clicked {
-            self.right_page = p;
-        }
-        ui.separator();
-        match self.right_page {
-            Page::Props => self.props_panel(ui),
-            Page::Drawing => self.views_panel(ui),
-            Page::Sheets => self.sheets_panel(ui),
-            _ => {}
         }
     }
 
@@ -3161,6 +3174,15 @@ impl BimApp {
             painter.add(egui::Shape::mesh(mesh_out));
         }
     }
+
+    /// 聚焦一个 dock tab；若它已被关闭，加回当前聚焦的 leaf（G6-M5 日志开关语义）。
+    fn focus_or_restore_tab(&mut self, tab: DockTab) {
+        if let Some((surface, node, _tab_index)) = self.dock.find_tab(&tab) {
+            self.dock.set_focused_node_and_surface((surface, node));
+        } else {
+            self.dock.push_to_focused_leaf(tab);
+        }
+    }
 }
 
 /// 画地面网格（z=0 平面，±6 m，1 m 间距）与三根坐标轴（X 红 / Y 绿 / Z 蓝）。
@@ -3232,31 +3254,28 @@ impl eframe::App for BimApp {
         }
 
         self.refresh_meshes();
-        // G2 五区布局：菜单栏 → 工具栏 → 左栏（页签）→ 右栏（页签）→ 状态栏 →
-        // 日志（可折叠）→ 视口（中央）。
+        // G6-M5 可停靠面板：菜单栏 → 工具栏 → dock（面板区：元素/类型/属性/视图/
+        // 图纸/日志/视口，用户可拖动重排 / 拖出窗口 / 关闭）→ 状态栏 → 浮窗。
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| self.menu_bar(ui));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
-        egui::SidePanel::left("left_panel")
-            .resizable(true)
-            .default_width(230.0)
-            .show(ctx, |ui| self.left_panel(ui));
-        egui::SidePanel::right("right_panel")
-            .resizable(true)
-            .default_width(300.0)
-            .show(ctx, |ui| self.right_panel(ui));
-        // bottom 面板先 show 的贴底：状态栏最底、日志在状态栏之上（可折叠）。
+        // bottom 面板先 show 的贴底：状态栏最底。
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(26.0)
             .show(ctx, |ui| self.status_bar(ui));
-        if self.show_logs {
-            egui::TopBottomPanel::bottom("logs_panel")
-                .resizable(true)
-                .default_height(150.0)
-                .show(ctx, |ui| self.logs_panel(ui));
-        }
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
-            .show(ctx, |ui| self.viewport(ui));
+            .show(ctx, |ui| {
+                // 借用拆分：dock 暂移出去、viewer 持 &mut self——
+                // 避免 self.dock 与 self 双重可变借用；渲染完还回。
+                let mut dock = std::mem::replace(&mut self.dock, default_dock());
+                {
+                    let mut viewer = BimTabViewer { app: self };
+                    egui_dock::DockArea::new(&mut dock)
+                        .style(egui_dock::Style::from_egui(ui.style().as_ref()))
+                        .show_inside(ui, &mut viewer);
+                }
+                self.dock = dock;
+            });
         // M11：浮动图纸预览窗口（"视图"页签选中视图后点"预览"打开）。
         self.drawing_preview_window(ctx);
         // G6-M3：整图预览窗口（"图纸"页签选中图纸后点"整图预览"打开——
@@ -3295,4 +3314,84 @@ pub fn run_gui() -> Result<(), String> {
         }),
     )
     .map_err(|e| format!("GUI 运行错误：{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    // workspace lints（unwrap_used / panic deny）在测试模块放开——仓库同款。
+    #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
+
+    use super::*;
+
+    /// `find_tab` 的薄包装：断言 tab 在主 surface 并返回其 node。
+    fn main_surface_node_of(
+        dock: &egui_dock::DockState<DockTab>,
+        tab: DockTab,
+    ) -> egui_dock::NodeIndex {
+        let (surface, node, _tab_index) = dock
+            .find_tab(&tab)
+            .unwrap_or_else(|| panic!("默认布局缺少 {tab:?} 页签"));
+        assert!(surface.is_main(), "{tab:?} 应在主 surface");
+        node
+    }
+
+    /// 默认布局钉 1：7 个面板全在主 surface，视口与其他面板不同 node。
+    #[test]
+    fn default_dock_contains_all_seven_tabs() {
+        let dock = default_dock();
+        let viewport = main_surface_node_of(&dock, DockTab::Viewport);
+        for tab in [
+            DockTab::Elements,
+            DockTab::Types,
+            DockTab::Props,
+            DockTab::Views,
+            DockTab::Sheets,
+            DockTab::Logs,
+        ] {
+            let node = main_surface_node_of(&dock, tab);
+            assert_ne!(node, viewport, "{tab:?} 不应与视口同 node");
+        }
+    }
+
+    /// 默认布局钉 2：元素/类型叠 tab（同 node），属性/视图/图纸叠 tab（同 node）——
+    /// 五区布局的"左右栏各一组页签"语义。
+    #[test]
+    fn default_dock_stacks_tabs_per_region() {
+        let dock = default_dock();
+        let elements = main_surface_node_of(&dock, DockTab::Elements);
+        let types = main_surface_node_of(&dock, DockTab::Types);
+        assert_eq!(elements, types, "元素与类型应同 node（左栏叠 tab）");
+
+        let props = main_surface_node_of(&dock, DockTab::Props);
+        let views = main_surface_node_of(&dock, DockTab::Views);
+        let sheets = main_surface_node_of(&dock, DockTab::Sheets);
+        assert_eq!(props, views, "属性与视图应同 node（右栏叠 tab）");
+        assert_eq!(views, sheets, "视图与图纸应同 node（右栏叠 tab）");
+
+        let logs = main_surface_node_of(&dock, DockTab::Logs);
+        assert_ne!(logs, elements, "日志是独立底部区");
+        assert_ne!(props, elements, "左右栏是两个分区");
+    }
+
+    /// 默认布局钉 3：布局可重建——mem::replace 的兜底值与默认布局同构。
+    #[test]
+    fn default_dock_is_rebuildable() {
+        let a = default_dock();
+        let b = default_dock();
+        for tab in [
+            DockTab::Viewport,
+            DockTab::Elements,
+            DockTab::Types,
+            DockTab::Props,
+            DockTab::Views,
+            DockTab::Sheets,
+            DockTab::Logs,
+        ] {
+            assert_eq!(
+                main_surface_node_of(&a, tab),
+                main_surface_node_of(&b, tab),
+                "两次构造的 {tab:?} 布局应一致"
+            );
+        }
+    }
 }

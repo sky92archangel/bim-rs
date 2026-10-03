@@ -62,6 +62,18 @@ pub struct Element {
     pub properties: PropertyMap,
     /// 关系 id
     pub relations: Vec<RelationId>,
+    /// 可见性（G6-M2：元素树眼睛——文档级显隐，随 .bimdoc 持久化）。
+    ///
+    /// `false` 时视口渲染跳过该元素引用的形状（某形状的**全部**引用元素
+    /// 都隐藏时才不画——多元素共享同一段几何按"任一可见即画"）。
+    /// `#[serde(default)]` 让旧容器缺字段时默认可见——双向兼容：
+    /// 旧程序读新文件（serde 忽略未知字段）也不受影响。
+    #[serde(default = "default_visible")]
+    pub visible: bool,
+}
+
+fn default_visible() -> bool {
+    true
 }
 
 impl Element {
@@ -75,6 +87,7 @@ impl Element {
             geometry_ref: None,
             properties: PropertyMap::new(Category::GENERIC),
             relations: Vec::new(),
+            visible: true,
         }
     }
 
@@ -89,6 +102,13 @@ impl Element {
     #[must_use]
     pub fn with_properties(mut self, properties: PropertyMap) -> Self {
         self.properties = properties;
+        self
+    }
+
+    /// 指定可见性（链式；默认可见）。
+    #[must_use]
+    pub fn with_visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
         self
     }
 
@@ -132,5 +152,42 @@ mod tests {
     #[test]
     fn category_has_a_stable_generic_name() {
         assert_eq!(Category::generic().as_str(), Category::GENERIC);
+    }
+
+    // ---- G6-M2：元素可见性（元素树眼睛的数据层） ----
+
+    /// G6-M2 钉 1：新元素默认可见；with_visible 链式生效。
+    #[test]
+    fn new_element_is_visible_by_default() {
+        let e = Element::new(Category::generic(), "柱");
+        assert!(e.visible, "新元素默认可见");
+
+        let hidden = Element::new(Category::generic(), "柱").with_visible(false);
+        assert!(!hidden.visible, "with_visible(false) 生效");
+    }
+
+    /// G6-M2 钉 2：visible 随 JSON 往返；**旧容器缺字段时默认可见**（serde
+    /// default 向后兼容——旧 .bimdoc 反序列化不受影响）。
+    #[test]
+    fn visible_persists_and_old_json_without_the_field_defaults_to_visible() {
+        // 新格式：visible=true 与 false 都完整往返
+        let shown = Element::new(Category::generic(), "显");
+        let hidden = Element::new(Category::generic(), "隐").with_visible(false);
+        for e in [shown, hidden] {
+            let json = serde_json::to_string(&e).unwrap();
+            let back: Element = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, e, "visible 随 JSON 往返");
+        }
+
+        // 旧格式：手工造一份**没有 visible 字段**的 JSON（旧版本程序写出的容器）
+        let e = Element::new(Category::generic(), "旧格式");
+        let mut value = serde_json::to_value(&e).unwrap();
+        value.as_object_mut().unwrap().remove("visible");
+        let old_json = serde_json::to_string(&value).unwrap();
+        let back: Element = serde_json::from_str(&old_json).unwrap();
+        assert!(
+            back.visible,
+            "旧容器缺 visible 字段时必须默认可见（serde default 向后兼容）"
+        );
     }
 }

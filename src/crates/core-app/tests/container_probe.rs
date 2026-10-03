@@ -143,11 +143,11 @@ fn c1_empty_document_round_trips_both_forms() {
     let doc = Document::new("空");
 
     let zip = dir.join("empty.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     assert_eq!(open_document(&zip).unwrap().0, doc, "zip 形态空文档往返");
 
     let container = dir.join("emptydir");
-    pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+    pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
     assert_eq!(
         open_from_dir(&container).unwrap().0,
         doc,
@@ -161,13 +161,13 @@ fn c2_three_geometry_round_trips_both_forms() {
     let doc = sample_doc("三份几何", 3);
 
     let zip = dir.join("three.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     let back = open_document(&zip).unwrap().0;
     assert_eq!(back, doc);
     assert_eq!(back.geometry_count(), 3);
 
     let container = dir.join("threedir");
-    pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+    pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
     assert_eq!(open_from_dir(&container).unwrap().0.geometry_count(), 3);
 }
 
@@ -176,7 +176,7 @@ fn c3_zip_tampered_geom_is_rejected() {
     let dir = TempDir::new("tamperzip");
     let doc = sample_doc("篡改", 2);
     let zip = dir.join("t.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
 
     let names = geom_names(&zip_entries(&zip));
     assert!(!names.is_empty());
@@ -194,7 +194,7 @@ fn c4_zip_missing_geom_is_rejected() {
     let dir = TempDir::new("missgeomzip");
     let doc = sample_doc("缺几何", 2);
     let zip = dir.join("m.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
 
     drop_matching(&zip, |n| n.starts_with("geom/"));
 
@@ -212,7 +212,7 @@ fn c5_zero_format_version_is_rejected_both_forms() {
     let bad = br#"{"format_version":0,"app":"qa","created_utc":"","file_count":2}"#;
 
     let zip = dir.join("v.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     mutate_entry(&zip, "manifest.json", bad);
     let err = open_document(&zip).unwrap_err();
     assert!(
@@ -221,7 +221,7 @@ fn c5_zero_format_version_is_rejected_both_forms() {
     );
 
     let container = dir.join("vdir");
-    pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+    pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
     fs::write(container.join("manifest.json"), bad).unwrap();
     let err = open_from_dir(&container).unwrap_err();
     assert!(
@@ -243,7 +243,7 @@ fn c6b_zip_with_non_utf8_docjson_is_err_not_panic() {
     let dir = TempDir::new("badutf8");
     let doc = sample_doc("坏编码", 1);
     let zip = dir.join("u.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     // 合法 zip，但 doc.json 是非法 UTF-8 字节
     mutate_entry(&zip, "doc.json", &[0xFFu8, 0xFE, 0xFD, 0x00, 0x80]);
     let err = open_document(&zip).unwrap_err();
@@ -257,7 +257,7 @@ fn c6b_zip_with_non_utf8_docjson_is_err_not_panic() {
 fn c7_directory_passed_as_zip_path_is_err() {
     let dir = TempDir::new("typeconfuse");
     let container = dir.join("adirectory");
-    pack_to_dir(&container, &sample_doc("d", 1), &Drawing::new()).unwrap();
+    pack_to_dir(&container, &sample_doc("d", 1), &Drawing::new(), &[]).unwrap();
     // 类型混淆：把目录当 .bimdoc 传给 open_document
     assert!(
         matches!(open_document(&container), Err(AppError::Container(_))),
@@ -272,7 +272,7 @@ fn c8_valid_json_but_wrong_shape_docjson_is_err() {
 
     // 目录形态
     let container = dir.join("wsdir");
-    pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+    pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
     fs::write(container.join("doc.json"), b"{}").unwrap();
     assert!(
         matches!(open_from_dir(&container), Err(AppError::Container(_))),
@@ -281,7 +281,7 @@ fn c8_valid_json_but_wrong_shape_docjson_is_err() {
 
     // zip 形态（另一条读取路径）
     let zip = dir.join("ws.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     mutate_entry(&zip, "doc.json", b"{}");
     assert!(matches!(open_document(&zip), Err(AppError::Container(_))));
 }
@@ -297,11 +297,11 @@ fn c9_chinese_named_document_round_trips() {
     .unwrap();
 
     let zip = dir.join("中文.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     assert_eq!(open_document(&zip).unwrap().0, doc, "中文名文档 zip 往返");
 
     let container = dir.join("中文目录");
-    pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+    pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
     assert_eq!(
         open_from_dir(&container).unwrap().0,
         doc,
@@ -324,7 +324,7 @@ fn c10_session_scoped_datum_must_not_be_persisted() {
     assert_eq!(doc.session_datums().len(), 1, "会话态工作平面 1 个");
 
     let zip = dir.join("s.bimdoc");
-    save_document(&zip, &doc, &Drawing::new()).unwrap();
+    save_document(&zip, &doc, &Drawing::new(), &[]).unwrap();
     let back = open_document(&zip).unwrap().0;
 
     assert_eq!(

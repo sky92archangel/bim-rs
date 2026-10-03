@@ -51,7 +51,9 @@ use crate::projection_service::{project_shape, reproject_into};
 use crate::sketch::{SKETCH_CLOSED_TOL_MM, SketchEntity, is_closed_profile};
 use crate::store;
 use crate::topo_naming::face_hash_names_from_handle;
-use crate::update_service::{UpdateReport, update_after_commit};
+use crate::update_service::{
+    RemovalReport, UpdateReport, update_after_commit, update_after_removal,
+};
 
 /// 会话概览（供桌面端自检打印、状态栏显示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,11 +144,15 @@ impl CoreSession {
     /// 打开一个 `.bimdoc`（zip 或目录形态）并包成会话。
     ///
     /// v2 容器自带图纸段（`drawing.json` + `views/`），`Drawing` 随容器恢复；
-    /// 装载器 / 模块需要调用方在打开后自行装回（模块是启动期动作，
-    /// 文档本身不记录"用了哪些模块"，见设计文档 8.4）。
+    /// 属性模式段（`schemas.json`，G6-M2）随容器装回——**可选段**：旧容器
+    /// 缺段恢复空 registry（向后兼容）。装载器 / 模块需要调用方在打开后
+    /// 自行装回（模块是启动期动作，文档本身不记录"用了哪些模块"，
+    /// 见设计文档 8.4）。
     pub fn open(path: &Path) -> AppResult<Self> {
-        let (doc, drawing) = store::open_document(path)?;
-        Ok(Self::from_parts(doc, drawing))
+        let (doc, drawing, schemas) = store::open_document(path)?;
+        let mut session = Self::from_parts(doc, drawing);
+        session.modules.registry_mut().restore_schemas(schemas)?;
+        Ok(session)
     }
 
     /// 用**真实内核**新建一个空会话（occt feature 门控；M6b 真腿装配）。
@@ -166,18 +172,21 @@ impl CoreSession {
 
     /// 打开 `.bimdoc` 并配**真实内核**（occt feature 门控；M6b 真腿装配）。
     ///
-    /// [`CoreSession::open`] 的真腿变体：容器装配相同（图纸随容器恢复），
-    /// 几何服务用 [`GeometryService::new`]（真实内核）——重开后的 rebuild /
-    /// 投影 / 指纹计算走真实几何，而 [`CoreSession::open`] 配占位内核。
+    /// [`CoreSession::open`] 的真腿变体：容器装配相同（图纸随容器恢复 +
+    /// 属性模式段 G6-M2 装回），几何服务用 [`GeometryService::new`]
+    /// （真实内核）——重开后的 rebuild / 投影 / 指纹计算走真实几何，
+    /// 而 [`CoreSession::open`] 配占位内核。
     #[cfg(feature = "occt")]
     pub fn open_real(path: &Path) -> AppResult<Self> {
-        let (doc, drawing) = store::open_document(path)?;
-        Ok(Self {
+        let (doc, drawing, schemas) = store::open_document(path)?;
+        let mut session = Self {
             document: DocumentService::with_parts(doc, drawing),
             geometry: GeometryService::new()?,
             interop: InteropService::new(),
             modules: ModuleHost::new(),
-        })
+        };
+        session.modules.registry_mut().restore_schemas(schemas)?;
+        Ok(session)
     }
 
     /// 用一份已恢复的文档构造会话（几何缓存 / 历史皆为空）。
@@ -293,17 +302,20 @@ impl CoreSession {
         Ok(())
     }
 
-    /// **删除构件**（G5-M21 元素树）：删元素 + 级联清关系（`remove_element`
-    /// 语义，自动成为一个撤销步）+ 删几何记录（不残留孤儿几何——
-    /// `has_dangling_geometry` 的消除路径）。
+    /// **删除构件**（G5-M21 元素树；G6-M2 升级——删除后视图自动清理）：
+    /// 删元素 + 级联清关系（`remove_element` 语义，自动成为一个撤销步）
+    /// + 删几何记录（不残留孤儿几何——`has_dangling_geometry` 的消除路径）
+    /// + **受影响视图的孤儿图元 / 标注自动清除**
+    ///   （[`update_after_removal`]——G5-M21 的已知限制已消除：不再需要
+    ///   提示用户「重新生成」；索引随清理重建）。
     ///
-    /// ⚠ 已知限制（诚实）：受影响视图的**图纸实体不自动清除**（本门面不做
-    /// 重投——那是 rebuild 链路的 `update_after_commit`）；调用方应提示用户
-    /// 对相关视图做「重新生成」。
+    /// ⚠ 清理发生在 `edit` 之后（不产生撤销步）——随后一次 `undo` 会把
+    /// 文档与图纸**一起**回滚到删除前快照（孤儿图元随图纸回滚回来，与
+    /// 回滚后的元素 / 几何一致），`redo` 同理前进。双侧快照天然保证一致。
     ///
     /// # Errors
     /// 元素不存在时返回错误。
-    pub fn delete_element(&mut self, element: ElementId) -> AppResult<()> {
+    pub fn delete_element(&mut self, element: ElementId) -> AppResult<RemovalReport> {
         let shape = {
             let e = self.document.doc().element(element).ok_or(AppError::Model(
                 core_model::ModelError::ElementNotFound(element),
@@ -315,6 +327,27 @@ impl CoreSession {
                 doc.remove_geometry(s);
             }
             doc.remove_element(element)?;
+            Ok(())
+        })?;
+        let report = match shape {
+            Some(s) => update_after_removal(self.document.drawing_mut(), &[s]),
+            None => RemovalReport::default(),
+        };
+        Ok(report)
+    }
+
+    /// **设置元素可见性**（G6-M2 元素树眼睛）：文档级显隐，自动成为一个
+    /// 撤销步（`document.edit`），随 `.bimdoc` 持久化。
+    ///
+    /// 渲染语义：某形状的**全部**引用元素都隐藏时视口才不画
+    /// （多元素共享同一段几何按"任一可见即画"）。
+    ///
+    /// # Errors
+    /// 元素不存在时返回错误。
+    pub fn set_element_visibility(&mut self, element: ElementId, visible: bool) -> AppResult<()> {
+        self.document.edit(|doc| {
+            let e = doc.element_mut(element)?;
+            e.visible = visible;
             Ok(())
         })?;
         Ok(())
@@ -1385,9 +1418,17 @@ impl CoreSession {
 
     /// 存盘（= [`store::save_document`] 的 zip 形态）。
     ///
-    /// v2 容器：文档 + **图纸**一并落盘（`drawing.json` + `views/*.json`）。
+    /// v2 容器：文档 + **图纸** + **属性模式**（G6-M2 schemas.json——自定义
+    /// 类型重开不丢）一并落盘（`drawing.json` + `views/*.json` + `schemas.json`）。
     pub fn save(&self, path: &Path) -> AppResult<()> {
-        store::save_document(path, self.document.doc(), self.document.drawing())
+        let schemas: Vec<PropertySchema> = self
+            .modules
+            .registry()
+            .schemas()
+            .into_iter()
+            .cloned()
+            .collect();
+        store::save_document(path, self.document.doc(), self.document.drawing(), &schemas)
     }
 
     // ---------- 只读访问器 ----------
@@ -1723,6 +1764,122 @@ mod tests {
         assert!(!s.document().has_dangling_geometry(id));
         // 元素不存在 → 明确报错
         assert!(s.delete_element(id).is_err());
+    }
+
+    // ---- G6-M2：余 P1 三项（可见性眼睛 / schema 持久化 / 删除后视图重投） ----
+
+    /// G6-M2 钉 8：删除后视图自动清理——带投影图元的视图里 delete_element →
+    /// 孤儿图元 / 标注清除、报告对账、up_to_date 不动；undo / redo 双侧一致。
+    #[test]
+    fn delete_element_cleans_orphan_projection_entities_and_undo_redo_stay_consistent() {
+        let mut s = CoreSession::new().unwrap();
+        s.install_module(Box::new(DemoModule)).unwrap();
+        let id = s.create_element("DEMO_BOX", "盒-删图").unwrap();
+        let shape = s.build_geometry(id, "test.demo.box").unwrap();
+        // 建视图（投影初生成——mock 内核可投影）
+        let view_id = s.create_view("正立面", ViewOrientation::front()).unwrap();
+        let entity_count = {
+            let view = s.document().drawing().view(view_id).unwrap();
+            assert!(
+                !view.entities.is_empty(),
+                "探针前提：投影应产出图元（mock 内核盒体可投影）"
+            );
+            view.entities.len()
+        };
+        // 该视图绑定本形状（投影图元的 source 指向它）
+        assert_eq!(
+            s.document().drawing().views_bound_to_shapes(&[shape]).len(),
+            1,
+            "探针前提：视图绑定被删形状"
+        );
+
+        let report = s.delete_element(id).unwrap();
+        assert_eq!(report.removed_shapes, vec![shape]);
+        assert_eq!(
+            report.removed_entities, entity_count,
+            "全部投影图元被清除，实得 report={report:?}"
+        );
+        let view = s.document().drawing().view(view_id).unwrap();
+        assert!(view.entities.is_empty(), "删除后视图里不得残留孤儿图元");
+
+        // undo：文档回滚（元素 + 几何回来）+ 图纸回滚到删除前快照（图元回来）——一致
+        assert!(s.undo());
+        assert!(s.document().doc().element(id).is_some(), "undo 后元素回来");
+        let view = s.document().drawing().view(view_id).unwrap();
+        assert_eq!(
+            view.entities.len(),
+            entity_count,
+            "undo 后图纸回滚到删除前快照——投影图元回来（与元素一致）"
+        );
+
+        // redo：文档前进（元素删）+ 图纸前进（图元清）——一致
+        assert!(s.redo());
+        assert!(s.document().doc().element(id).is_none());
+        let view = s.document().drawing().view(view_id).unwrap();
+        assert!(view.entities.is_empty(), "redo 后视图保持清理后状态");
+    }
+
+    /// G6-M2 钉 9：可见性眼睛的数据层——set_element_visibility 是一个撤销步
+    /// （undo / redo 可回滚），随文档持久化（visible 进 Element）。
+    #[test]
+    fn element_visibility_is_an_undo_step_and_persists() {
+        let mut s = CoreSession::new().unwrap();
+        let id = s.create_generic_element("柱-显隐").unwrap();
+        assert!(s.document().doc().element(id).unwrap().visible);
+
+        // 隐藏：一个撤销步
+        s.set_element_visibility(id, false).unwrap();
+        assert!(!s.document().doc().element(id).unwrap().visible);
+        assert_eq!(s.undo_depth(), 2, "建元素 + 隐藏 = 两个撤销步");
+
+        // undo 回滚显隐（撤销步语义）
+        assert!(s.undo());
+        assert!(
+            s.document().doc().element(id).unwrap().visible,
+            "undo 回滚到隐藏前（元素还在、可见）"
+        );
+
+        // redo
+        assert!(s.redo());
+        assert!(!s.document().doc().element(id).unwrap().visible);
+    }
+
+    /// G6-M2 钉 10：schema 持久化端到端——upsert_schema → save → open →
+    /// list_schemas 恢复（自定义类型重开不丢）；无 schema 时空 registry。
+    #[test]
+    fn schemas_persist_through_save_and_open() {
+        let dir = std::env::temp_dir().join(format!("bim-session-schemas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schemas.bimdoc");
+
+        let mut s = CoreSession::new().unwrap();
+        s.upsert_schema(g5_box_schema()).unwrap();
+        s.save(&path).unwrap();
+
+        let back = CoreSession::open(&path).unwrap();
+        let names: Vec<String> = back
+            .list_schemas()
+            .iter()
+            .map(|schema| schema.type_name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["G5_BOX"],
+            "schema 随容器恢复（自定义类型重开不丢）"
+        );
+
+        // 无 schema 的会话存盘 → 打开后空 registry（不是猜，是空）
+        let path2 = dir.join("noschemas.bimdoc");
+        let s2 = CoreSession::new().unwrap();
+        s2.save(&path2).unwrap();
+        let back2 = CoreSession::open(&path2).unwrap();
+        assert!(
+            back2.list_schemas().is_empty(),
+            "无 schema 会话打开后空 registry"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

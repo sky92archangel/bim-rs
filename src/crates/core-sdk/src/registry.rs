@@ -277,6 +277,21 @@ impl Registry {
         Ok(())
     }
 
+    /// **批量恢复属性模式**（G6-M2：schema 持久化——容器 schemas.json 段
+    /// 打开时装回；同名逐个覆盖，空名响应拒绝）。
+    ///
+    /// 恢复语义与 [`Self::replace_schema`] 相同（覆盖式）：容器里的定义
+    /// 就是真相来源，撞名以容器为准。
+    pub fn restore_schemas(
+        &mut self,
+        schemas: impl IntoIterator<Item = PropertySchema>,
+    ) -> SdkResult<()> {
+        for schema in schemas {
+            self.replace_schema(schema)?;
+        }
+        Ok(())
+    }
+
     /// 用已注册的模式校验一个元素的属性。
     pub fn validate_element(&self, element: &Element) -> SdkResult<()> {
         let name = element.properties.schema.clone();
@@ -705,6 +720,41 @@ mod tests {
         .unwrap();
         assert_eq!(r.layer_count(), 1);
         assert_eq!(r.layers()[0].name, "TRAY-电缆桥架");
+    }
+
+    // ---- G6-M2：schema 持久化（容器 schemas.json 段打开时装回） ----
+
+    /// G6-M2 钉 3：restore_schemas 批量装回——空 registry 恢复两个模式；
+    /// **同名覆盖**（容器里的定义就是真相来源）；空名响应拒绝。
+    #[test]
+    fn restore_schemas_batch_loads_and_overrides_by_name() {
+        let mut r = Registry::new();
+        assert_eq!(r.schema_count(), 0);
+
+        // 批量恢复两个模式
+        let second = PropertySchema::new("SECOND").with_field(
+            core_model::FieldDef::new("h", core_model::FieldType::Float, "高").required(),
+        );
+        r.restore_schemas(vec![demo_schema(), second]).unwrap();
+        assert_eq!(r.schema_count(), 2);
+        assert!(r.schema("DEMO").is_some());
+        assert!(r.schema("SECOND").is_some());
+
+        // 同名覆盖：SECOND 换掉字段后恢复，旧字段消失新字段生效
+        let replaced = PropertySchema::new("SECOND").with_field(
+            core_model::FieldDef::new("len", core_model::FieldType::Float, "长").required(),
+        );
+        r.restore_schemas(vec![replaced]).unwrap();
+        assert_eq!(r.schema_count(), 2, "同名覆盖不增加条目");
+        let s = r.schema("SECOND").unwrap();
+        assert!(s.field("h").is_none(), "旧字段消失");
+        assert!(s.field("len").is_some(), "新字段生效");
+
+        // 空名响应拒绝
+        assert!(matches!(
+            r.restore_schemas(vec![PropertySchema::new("  ")]),
+            Err(SdkError::InvalidManifest(_))
+        ));
     }
 
     #[test]

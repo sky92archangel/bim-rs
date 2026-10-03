@@ -67,7 +67,7 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use core_doc::Drawing;
-use core_model::{Document, ShapeId};
+use core_model::{Document, PropertySchema, ShapeId};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -81,6 +81,11 @@ use crate::error::{AppError, AppResult};
 ///
 /// v2（M6a）：新增 `drawing.json` + `views/` 内容段——图纸随容器落盘。
 /// 旧 v1 容器无此段，Drawing 无从恢复，故 v1 一律拒收（不做向后兼容）。
+///
+/// v2 + 可选段（G6-M2）：新增 `schemas.json`（属性模式持久化）。这是
+/// **可选段**而非不兼容变更——旧程序读新容器直接忽略该段（按段显式读、
+/// file_count 只供人核对不校验），新程序读旧 v2 容器容忍缺段（恢复为空
+/// registry，行为退化为类型管理器为空、validate 不拦截）。故版本号保持 2。
 pub const FORMAT_VERSION: u32 = 2;
 
 /// 清单文件名。
@@ -91,6 +96,11 @@ const DOC_ENTRY: &str = "doc.json";
 
 /// 图纸头部（standard / sheets / dependencies + views 计数）的文件名。
 pub const DRAWING_ENTRY: &str = "drawing.json";
+
+/// 属性模式持久化段（G6-M2：自定义类型重开不丢）的文件名。
+///
+/// **可选段**：旧 v2 容器无此段，`open` 恢复为空 registry（向后兼容）。
+pub const SCHEMAS_ENTRY: &str = "schemas.json";
 
 /// 视图本体所在目录（每个 View 一份 `views/<view-id>.json`）。
 pub const VIEWS_DIR: &str = "views";
@@ -129,8 +139,9 @@ fn manifest_json(doc: &Document, drawing: &Drawing) -> AppResult<String> {
         format_version: FORMAT_VERSION,
         app: APP_NAME.to_string(),
         created_utc: doc.meta().created_utc.clone(),
-        // 1 份 doc.json + 1 份 drawing.json + 每个视图一份 + 每份几何一份 .brep
-        file_count: 1 + 1 + drawing.view_count() + doc.geometry_count(),
+        // 1 份 doc.json + 1 份 drawing.json + 1 份 schemas.json（G6-M2 可选段）
+        // + 每个视图一份 + 每份几何一份 .brep
+        file_count: 1 + 1 + 1 + drawing.view_count() + doc.geometry_count(),
     };
     serde_json::to_string_pretty(&manifest)
         .map_err(|e| AppError::Container(format!("manifest.json 序列化失败：{e}")))
@@ -192,6 +203,22 @@ where
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// 属性模式拆装（G6-M2：schemas.json 可选段——自定义类型重开不丢）
+// ============================================================================
+
+/// 把属性模式序列化为 `schemas.json`。
+fn schemas_json(schemas: &[PropertySchema]) -> AppResult<String> {
+    serde_json::to_string_pretty(schemas)
+        .map_err(|e| AppError::Container(format!("{SCHEMAS_ENTRY} 序列化失败：{e}")))
+}
+
+/// 解析 `schemas.json`。
+fn parse_schemas(text: &str) -> AppResult<Vec<PropertySchema>> {
+    serde_json::from_str(text)
+        .map_err(|e| AppError::Container(format!("{SCHEMAS_ENTRY} 解析失败：{e}")))
 }
 
 // ============================================================================
@@ -346,7 +373,12 @@ fn read_views_dir(dir: &Path) -> AppResult<Vec<(String, String)>> {
 /// 把文档写成一个 `.bimdoc`（zip）。
 ///
 /// 路径约定后缀 `.bimdoc`，但本函数**不强制**——交给调用方决定（测试用临时名）。
-pub fn save_document(path: &Path, doc: &Document, drawing: &Drawing) -> AppResult<()> {
+pub fn save_document(
+    path: &Path,
+    doc: &Document,
+    drawing: &Drawing,
+    schemas: &[PropertySchema],
+) -> AppResult<()> {
     let file = fs::File::create(path)
         .map_err(|e| AppError::Container(format!("创建 {} 失败：{e}", path.display())))?;
     let mut zip = ZipWriter::new(file);
@@ -362,6 +394,7 @@ pub fn save_document(path: &Path, doc: &Document, drawing: &Drawing) -> AppResul
     )?;
     write_zip_entry(&mut zip, DOC_ENTRY, &doc_json(doc)?, options)?;
     write_zip_entry(&mut zip, DRAWING_ENTRY, &drawing_text, options)?;
+    write_zip_entry(&mut zip, SCHEMAS_ENTRY, &schemas_json(schemas)?, options)?;
     for (entry, text) in &view_entries {
         write_zip_entry(&mut zip, entry, text, options)?;
     }
@@ -388,8 +421,11 @@ fn write_zip_entry<W: Write + Seek>(
     Ok(())
 }
 
-/// 从一个 `.bimdoc`（zip）读回文档与图纸。
-pub fn open_document(path: &Path) -> AppResult<(Document, Drawing)> {
+/// 从一个 `.bimdoc`（zip）读回文档、图纸与属性模式。
+///
+/// `schemas.json` 是**可选段**：旧 v2 容器无此段，恢复为空 `Vec`
+/// （向后兼容——行为退化为类型管理器为空、validate 不拦截）。
+pub fn open_document(path: &Path) -> AppResult<(Document, Drawing, Vec<PropertySchema>)> {
     let file = fs::File::open(path)
         .map_err(|e| AppError::Container(format!("打开 {} 失败：{e}", path.display())))?;
     let mut archive = ZipArchive::new(file).map_err(|e| {
@@ -408,10 +444,15 @@ pub fn open_document(path: &Path) -> AppResult<(Document, Drawing)> {
         AppError::Container(format!("容器缺少 {DRAWING_ENTRY}（v2 容器必须带图纸段）"))
     })?;
     let view_entries = read_views_zip(&mut archive)?;
+    // 可选段：缺（旧 v2 容器）→ 空 Vec
+    let schemas = match read_zip_entry(&mut archive, SCHEMAS_ENTRY)? {
+        Some(text) => parse_schemas(&text)?,
+        None => Vec::new(),
+    };
 
     verify_geometry(&doc, |entry| read_zip_entry(&mut archive, entry))?;
     let drawing = drawing_from_parts(&drawing_text, view_entries)?;
-    Ok((doc, drawing))
+    Ok((doc, drawing, schemas))
 }
 
 /// 读取一个 zip 成员为字符串；成员不存在返回 `Ok(None)`（其余错误照报）。
@@ -437,8 +478,13 @@ fn read_zip_entry<R: Read + Seek>(
 // ============================================================================
 
 /// 把文档摊平写进一个目录（`manifest.json` / `doc.json` / `drawing.json` /
-/// `views/*.json` / `geom/*.brep`）。
-pub fn pack_to_dir(dir: &Path, doc: &Document, drawing: &Drawing) -> AppResult<()> {
+/// `schemas.json` / `views/*.json` / `geom/*.brep`）。
+pub fn pack_to_dir(
+    dir: &Path,
+    doc: &Document,
+    drawing: &Drawing,
+    schemas: &[PropertySchema],
+) -> AppResult<()> {
     fs::create_dir_all(dir)
         .map_err(|e| AppError::Container(format!("创建目录 {} 失败：{e}", dir.display())))?;
     let geom_dir = dir.join(GEOM_DIR);
@@ -455,6 +501,8 @@ pub fn pack_to_dir(dir: &Path, doc: &Document, drawing: &Drawing) -> AppResult<(
         .map_err(|e| AppError::Container(format!("写 {DOC_ENTRY} 失败：{e}")))?;
     fs::write(dir.join(DRAWING_ENTRY), drawing_text)
         .map_err(|e| AppError::Container(format!("写 {DRAWING_ENTRY} 失败：{e}")))?;
+    fs::write(dir.join(SCHEMAS_ENTRY), schemas_json(schemas)?)
+        .map_err(|e| AppError::Container(format!("写 {SCHEMAS_ENTRY} 失败：{e}")))?;
     for (entry, text) in &view_entries {
         fs::write(dir.join(entry), text)
             .map_err(|e| AppError::Container(format!("写 {entry} 失败：{e}")))?;
@@ -467,8 +515,11 @@ pub fn pack_to_dir(dir: &Path, doc: &Document, drawing: &Drawing) -> AppResult<(
     Ok(())
 }
 
-/// 从一个目录读回文档与图纸。
-pub fn open_from_dir(dir: &Path) -> AppResult<(Document, Drawing)> {
+/// 从一个目录读回文档、图纸与属性模式。
+///
+/// `schemas.json` 是**可选段**：目录里无此文件（手工构造的旧 v2 容器）
+/// 恢复为空 `Vec`（向后兼容）。
+pub fn open_from_dir(dir: &Path) -> AppResult<(Document, Drawing, Vec<PropertySchema>)> {
     let manifest_path = dir.join(CONTAINER_MANIFEST);
     let manifest_text = fs::read_to_string(&manifest_path)
         .map_err(|e| AppError::Container(format!("读取 {} 失败：{e}", manifest_path.display())))?;
@@ -487,6 +538,17 @@ pub fn open_from_dir(dir: &Path) -> AppResult<(Document, Drawing)> {
         ))
     })?;
     let view_entries = read_views_dir(dir)?;
+    // 可选段：缺（手工构造的旧 v2 容器）→ 空 Vec
+    let schemas = match fs::read_to_string(dir.join(SCHEMAS_ENTRY)) {
+        Ok(text) => parse_schemas(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(AppError::Container(format!(
+                "读取 {} 失败：{e}",
+                dir.join(SCHEMAS_ENTRY).display()
+            )));
+        }
+    };
 
     let geom_dir = dir.join(GEOM_DIR);
     verify_geometry(&doc, |entry| {
@@ -501,7 +563,7 @@ pub fn open_from_dir(dir: &Path) -> AppResult<(Document, Drawing)> {
         }
     })?;
     let drawing = drawing_from_parts(&drawing_text, view_entries)?;
-    Ok((doc, drawing))
+    Ok((doc, drawing, schemas))
 }
 
 #[cfg(test)]
@@ -575,8 +637,8 @@ mod tests {
         let doc = sample_document();
         let drawing = Drawing::new();
 
-        save_document(&path, &doc, &drawing).unwrap();
-        let (back, back_drawing) = open_document(&path).unwrap();
+        save_document(&path, &doc, &drawing, &[]).unwrap();
+        let (back, back_drawing, _) = open_document(&path).unwrap();
 
         // 逐字段（Document: PartialEq）相等
         assert_eq!(back, doc);
@@ -593,8 +655,8 @@ mod tests {
         let doc = sample_document();
         let drawing = Drawing::new();
 
-        pack_to_dir(&container, &doc, &drawing).unwrap();
-        let (back, back_drawing) = open_from_dir(&container).unwrap();
+        pack_to_dir(&container, &doc, &drawing, &[]).unwrap();
+        let (back, back_drawing, _) = open_from_dir(&container).unwrap();
 
         assert_eq!(back, doc);
         assert_eq!(back_drawing, drawing);
@@ -605,7 +667,7 @@ mod tests {
         let dir = TempDir::new("badver");
         let container = dir.join("model");
         let doc = sample_document();
-        pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+        pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
 
         // 手写一个"未来版本"的清单进去
         let bad = r#"{"format_version": 999, "app": "future", "created_utc": "", "file_count": 1}"#;
@@ -623,7 +685,7 @@ mod tests {
         let dir = TempDir::new("nodoc");
         let container = dir.join("model");
         let doc = sample_document();
-        pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+        pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
 
         fs::remove_file(container.join(DOC_ENTRY)).unwrap();
         let err = open_from_dir(&container).unwrap_err();
@@ -640,7 +702,7 @@ mod tests {
         // 手工造一个只有 manifest 的 zip
         let path = dir.join("broken.bimdoc");
         let doc = sample_document();
-        save_document(&path, &doc, &Drawing::new()).unwrap();
+        save_document(&path, &doc, &Drawing::new(), &[]).unwrap();
         // 重新打包：只写 manifest（模拟缺 doc.json 的坏容器）
         {
             let file = fs::File::create(&path).unwrap();
@@ -672,7 +734,7 @@ mod tests {
         doc.insert_geometry(GeometryRecord::brep(b, "MOCK-BREP v1 sphere 4 4 4 33.5"))
             .unwrap();
 
-        pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+        pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
 
         for (shape, record) in doc.geometry() {
             let p = container.join(GEOM_DIR).join(format!("{shape}.{GEOM_EXT}"));
@@ -690,7 +752,7 @@ mod tests {
         let dir = TempDir::new("mismatch");
         let container = dir.join("model");
         let doc = sample_document();
-        pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+        pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
 
         // 把某一份导出副本改坏
         let shape = *doc.geometry().keys().next().unwrap();
@@ -716,8 +778,8 @@ mod tests {
         assert_eq!(doc.persistent_datums().count(), 1, "文档级标高 1 个");
         assert_eq!(doc.session_datums().len(), 1, "会话态工作平面 1 个");
 
-        save_document(&path, &doc, &Drawing::new()).unwrap();
-        let (back, _) = open_document(&path).unwrap();
+        save_document(&path, &doc, &Drawing::new(), &[]).unwrap();
+        let (back, _, _) = open_document(&path).unwrap();
 
         // 打开后的文档 == 可持久化副本（会话态被剔除）
         assert_eq!(back, doc.to_persistable());
@@ -756,7 +818,7 @@ mod tests {
         let dir = TempDir::new("v1manifest");
         let container = dir.join("model");
         let doc = sample_document();
-        pack_to_dir(&container, &doc, &Drawing::new()).unwrap();
+        pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
 
         let v1 = format!(
             r#"{{"format_version": 1, "app": "legacy", "created_utc": "", "file_count": {}}}"#,
@@ -772,7 +834,7 @@ mod tests {
 
         // zip 形态同样拒收（另一条读取路径）
         let zip_path = dir.join("legacy.bimdoc");
-        save_document(&zip_path, &doc, &Drawing::new()).unwrap();
+        save_document(&zip_path, &doc, &Drawing::new(), &[]).unwrap();
         let mut es: Vec<(String, Vec<u8>)> = {
             let f = fs::File::open(&zip_path).unwrap();
             let mut archive = ZipArchive::new(f).unwrap();
@@ -814,7 +876,7 @@ mod tests {
         drawing.rebuild_index();
         assert_eq!(drawing.view_count(), 2);
 
-        save_document(&path, &doc, &drawing).unwrap();
+        save_document(&path, &doc, &drawing, &[]).unwrap();
 
         // 容器结构先核对：drawing.json + 2 个 views/*.json
         let f = fs::File::open(&path).unwrap();
@@ -836,7 +898,7 @@ mod tests {
         );
         drop(archive);
 
-        let (back_doc, back_drawing) = open_document(&path).unwrap();
+        let (back_doc, back_drawing, _) = open_document(&path).unwrap();
         assert_eq!(back_doc, doc, "文档往返相等");
         assert_eq!(
             back_drawing, drawing,
@@ -859,7 +921,7 @@ mod tests {
         let mut drawing = Drawing::new();
         drawing.add_view(sample_view("俯视"));
         drawing.add_view(sample_view("侧视"));
-        pack_to_dir(&container, &doc, &drawing).unwrap();
+        pack_to_dir(&container, &doc, &drawing, &[]).unwrap();
 
         let mut views: Vec<PathBuf> = fs::read_dir(container.join(VIEWS_DIR))
             .unwrap()
@@ -882,6 +944,94 @@ mod tests {
         assert!(
             matches!(&err, AppError::Container(_)),
             "views/*.json 解析失败必须报错，实得 {err:?}"
+        );
+    }
+
+    // ---- G6-M2：schema 持久化（schemas.json 可选段） ----
+
+    /// G6-M2 钉 4：schemas 随容器往返——save 带 2 个模式 → open 恢复；
+    /// 容器内确实有 schemas.json；zip 与目录两形态都钉。
+    #[test]
+    fn schemas_persist_through_both_container_shapes() {
+        use core_model::{FieldType, PropertySchema};
+
+        let schema = |name: &str| {
+            PropertySchema::new(name).with_field(
+                core_model::FieldDef::new("width", FieldType::Float, "宽")
+                    .with_unit("mm")
+                    .required(),
+            )
+        };
+        let schemas = vec![schema("TRAY"), schema("DUCT")];
+
+        // zip 形态
+        let dir = TempDir::new("zipchemas");
+        let path = dir.join("model.bimdoc");
+        let doc = sample_document();
+        save_document(&path, &doc, &Drawing::new(), &schemas).unwrap();
+        let (_, _, back) = open_document(&path).unwrap();
+        assert_eq!(back, schemas, "zip 形态 schemas 往返相等");
+
+        // 目录形态
+        let dir2 = TempDir::new("dirchemas");
+        let container = dir2.join("model");
+        pack_to_dir(&container, &doc, &Drawing::new(), &schemas).unwrap();
+        let (_, _, back) = open_from_dir(&container).unwrap();
+        assert_eq!(back, schemas, "目录形态 schemas 往返相等");
+
+        // 容器结构先核对：zip 内确实有 schemas.json
+        let f = fs::File::open(&path).unwrap();
+        let mut archive = ZipArchive::new(f).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names.contains(&SCHEMAS_ENTRY.to_string()),
+            "容器必须含 {SCHEMAS_ENTRY}：{names:?}"
+        );
+    }
+
+    /// G6-M2 钉 5（向后兼容）：旧 v2 容器**没有** schemas.json → open 成功、
+    /// 恢复空 Vec（不报错——可选段的明确语义；zip 与目录两形态都钉）。
+    #[test]
+    fn old_v2_container_without_schemas_still_opens_with_empty_registry() {
+        let dir = TempDir::new("oldschemas");
+        let doc = sample_document();
+
+        // 目录形态：手工构造无 schemas.json 的旧 v2 容器
+        let container = dir.join("model");
+        pack_to_dir(&container, &doc, &Drawing::new(), &[]).unwrap();
+        fs::remove_file(container.join(SCHEMAS_ENTRY)).unwrap();
+        let (_, _, back) = open_from_dir(&container).unwrap();
+        assert!(
+            back.is_empty(),
+            "缺 schemas.json 的旧容器恢复空 Vec（向后兼容）"
+        );
+
+        // zip 形态：手工重构一个无 schemas.json 的 zip
+        let zip_path = dir.join("legacy.bimdoc");
+        save_document(&zip_path, &doc, &Drawing::new(), &[]).unwrap();
+        {
+            let f = fs::File::open(&zip_path).unwrap();
+            let mut archive = ZipArchive::new(f).unwrap();
+            let kept: Vec<(String, Vec<u8>)> = (0..archive.len())
+                .filter_map(|i| {
+                    let mut e = archive.by_index(i).unwrap();
+                    let name = e.name().to_string();
+                    if name == SCHEMAS_ENTRY {
+                        return None; // 模拟旧容器：没有这个段
+                    }
+                    let mut buf = Vec::new();
+                    std::io::Read::read_to_end(&mut e, &mut buf).unwrap();
+                    Some((name, buf))
+                })
+                .collect();
+            write_zip(&zip_path, &kept);
+        }
+        let (_, _, back) = open_document(&zip_path).unwrap();
+        assert!(
+            back.is_empty(),
+            "zip 缺 schemas.json 同样恢复空 Vec（向后兼容）"
         );
     }
 

@@ -1718,13 +1718,15 @@ impl BimApp {
         });
     }
 
-    /// 左栏 · 元素树（G5-M21：§5.5——品类分组折叠 + 节点选中联动 + 删除）。
+    /// 左栏 · 元素树（G5-M21：§5.5——品类分组折叠 + 节点选中联动 + 删除；
+    /// G6-M2：可见性眼睛 + 删除后视图自动清理）。
     ///
     /// 分组：按品类（BTreeMap 天然按品类名排序）；组头折叠开关 + 计数；
-    /// 节点：显示名（无几何标注）+ 选中 / Ctrl 副选联动（与视口 do_pick 同
-    /// 语义）+ 删除按钮（`delete_element`：元素 + 级联清关系 + 几何记录一并
-    /// 删，自动成为一个撤销步；图纸实体不自动清除——log 如实提示重新生成）。
-    /// ⚠ 可见性眼睛记 P1：`Element` 无 visible 字段（会话态显隐，后续交付）。
+    /// 节点：显示名（无几何标注 + 隐藏淡显）+ 选中 / Ctrl 副选联动（与视口
+    /// do_pick 同语义）+ 眼睛按钮（`set_element_visibility`：文档级显隐，
+    /// 自动成为一个撤销步，随 .bimdoc 持久化）+ 删除按钮（`delete_element`：
+    /// 元素 + 级联清关系 + 几何记录 + **受影响视图的孤儿图元 / 标注自动清除**
+    /// ——`update_after_removal`，不再需要提示「重新生成」）。
     fn elements_panel(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
         // —— 新建构件（模块算子按钮；mock 腿不支持的算子点击后日志响亮报错）——
@@ -1738,18 +1740,19 @@ impl BimApp {
         });
         ui.separator();
         // 先收集再交互（避免边遍历文档边改状态）：按品类分组（BTreeMap 天然有序）。
-        let mut groups: BTreeMap<String, Vec<(ElementId, String, bool)>> = BTreeMap::new();
+        let mut groups: BTreeMap<String, Vec<(ElementId, String, bool, bool)>> = BTreeMap::new();
         for (id, e) in self.session.document().doc().elements() {
             groups
                 .entry(e.category.as_str().to_string())
                 .or_default()
-                .push((*id, e.name.clone(), e.geometry_ref.is_some()));
+                .push((*id, e.name.clone(), e.geometry_ref.is_some(), e.visible));
         }
         if groups.is_empty() {
             ui.label("（无构件，从上方按钮新建）");
             return;
         }
         let mut delete: Option<(ElementId, String)> = None;
+        let mut toggle_visible: Option<(ElementId, bool, String)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (category, items) in &groups {
                 // 组头：折叠开关 + 品类名 + 计数
@@ -1772,11 +1775,11 @@ impl BimApp {
                 if collapsed {
                     continue;
                 }
-                for (id, name, has_geom) in items {
-                    let text = if *has_geom {
-                        name.clone()
-                    } else {
-                        format!("{name}（无几何）")
+                for (id, name, has_geom, visible) in items {
+                    let text = match (*has_geom, *visible) {
+                        (true, true) => name.clone(),
+                        (true, false) => format!("{name}（已隐藏）"),
+                        (false, _) => format!("{name}（无几何）"),
                     };
                     // 副选构件同高亮（G3：布尔 / 扫掠类的第二输入）。
                     let is_sel = self.selected == Some(*id) || self.secondary == Some(*id);
@@ -1791,6 +1794,15 @@ impl BimApp {
                                 self.picked = None;
                             }
                         }
+                        // 可见性眼睛（G6-M2：文档级显隐，撤销步；动作收集）
+                        let (icon, tip) = if *visible {
+                            (ph::EYE, "隐藏（撤销可回滚）")
+                        } else {
+                            (ph::EYE_SLASH, "显示（撤销可回滚）")
+                        };
+                        if ui.small_button(icon).on_hover_text(tip).clicked() {
+                            toggle_visible = Some((*id, !*visible, name.clone()));
+                        }
                         // 删除（G5-M21：动作收集，借用结束后执行）
                         if ui.small_button(ph::TRASH).clicked() {
                             delete = Some((*id, name.clone()));
@@ -1800,6 +1812,19 @@ impl BimApp {
             }
         });
         // —— 动作段（文档遍历借用已结束）——
+        if let Some((id, visible, name)) = toggle_visible {
+            match self.session.set_element_visibility(id, visible) {
+                Ok(()) => {
+                    self.dirty = true; // 视口过滤按 visible 重算
+                    self.log(if visible {
+                        format!("✓ 已显示「{name}」（撤销可回滚）")
+                    } else {
+                        format!("✓ 已隐藏「{name}」（撤销可回滚）")
+                    });
+                }
+                Err(e) => self.log(format!("✗ 显隐失败：{e}")),
+            }
+        }
         if let Some((id, name)) = delete {
             let shape = self
                 .session
@@ -1808,7 +1833,7 @@ impl BimApp {
                 .element(id)
                 .and_then(|e| e.geometry_ref);
             match self.session.delete_element(id) {
-                Ok(()) => {
+                Ok(report) => {
                     if let Some(s) = shape {
                         self.meshes.remove(&s);
                     }
@@ -1828,7 +1853,10 @@ impl BimApp {
                     self.log(format!(
                         "✓ 已删除构件「{name}」（元素 + 级联关系 + 几何记录；撤销可整体回滚）"
                     ));
-                    self.log("· 相关视图的图纸实体未自动清除，请对相关视图做「重新生成」");
+                    self.log(format!(
+                        "· 已清理相关视图的孤儿图元 {} 个 / 标注 {} 条（索引随清理重建）",
+                        report.removed_entities, report.removed_annotations
+                    ));
                 }
                 Err(e) => self.log(format!("✗ 删除失败：{e}")),
             }
@@ -1840,9 +1868,9 @@ impl BimApp {
     /// 编辑语义（`types_editor` 模块文档同款）：新建模式重名校验拒绝（新建不
     /// 该静默覆盖既有类型）；编辑模式 type_name 只读（不做改名语义——改名会
     /// 插入新条目、旧条目残留）、保存走 `upsert_schema` 覆盖。约束（诚实提示）：
-    /// ①覆盖**只影响新实例**——既有实例 PropertyMap 是落成时刻快照不回写；
-    /// ②schema 是**会话态**——`.bimdoc` 不持久化 registry，重开文档后自定义
-    /// 类型丢失。
+    /// 覆盖**只影响新实例**——既有实例 PropertyMap 是落成时刻快照不回写。
+    /// schema 持久化（G6-M2）：自定义类型随 `.bimdoc` 的 `schemas.json` 段
+    /// 落盘，重开文档不丢；旧容器无该段恢复空 registry。
     fn types_panel(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
         ui.horizontal(|ui| {
@@ -1884,7 +1912,7 @@ impl BimApp {
                 } else {
                     "⚠ 覆盖保存只影响新实例：既有构件的属性是落成时刻快照，不回写"
                 });
-                ui.weak("（自定义类型是会话态：不随 .bimdoc 持久化，重开文档后丢失）");
+                ui.weak("（自定义类型随 .bimdoc 持久化；旧容器无该段打开后为空）");
                 ui.horizontal(|ui| {
                     ui.label("类型名：");
                     if edit.is_new {
@@ -2639,7 +2667,22 @@ impl BimApp {
         }
         let mut tris: Vec<Tri> = Vec::new();
 
+        // 元素级显隐过滤（G6-M2 眼睛）：某形状的**全部**引用元素都隐藏时才不画
+        // （多元素共享同一段几何按"任一可见即画"）。每帧从元素预计算一次，
+        // O(元素数)——视口渲染本身就要遍历全部 mesh，代价可接受。
+        let visible_shapes: HashSet<ShapeId> = self
+            .session
+            .document()
+            .doc()
+            .elements()
+            .values()
+            .filter(|e| e.visible)
+            .filter_map(|e| e.geometry_ref)
+            .collect();
         for (shape_id, sm) in self.meshes.iter() {
+            if !visible_shapes.contains(shape_id) {
+                continue;
+            }
             let mesh = &sm.mesh;
             let tri_count = mesh.triangle_count();
             let is_selected = Some(*shape_id) == selected_shape;

@@ -192,6 +192,87 @@ fn view_binds_shape(view: &View, shape: ShapeId) -> bool {
             .any(|key| key.shape == shape)
 }
 
+// ============================================================================
+// 删除清理（G6-M2：update_after_commit 的 remove 场景——孤儿图元/标注清除）
+// ============================================================================
+
+/// 一次删除清理的可观测结果。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RemovalReport {
+    /// 本次被删除的形状（回显入参，便于调用方记账）。
+    pub removed_shapes: Vec<ShapeId>,
+    /// 受影响并被清理过的视图数（只含确实清理过的视图）。
+    pub cleaned_views: usize,
+    /// 清除掉的孤儿图元数（`source` 指向被删形状）。
+    pub removed_entities: usize,
+    /// 清除掉的孤儿标注数（`bound_to` 指向被删形状）。
+    pub removed_annotations: usize,
+}
+
+/// **删除清理编排**（G6-M2）：几何记录删除之后，把视图里的孤儿图元 / 标注清掉。
+///
+/// ## 与 [`update_after_commit`] 的分工
+///
+/// 变更场景（尺寸改了 / 布尔重算）走 [`update_after_commit`]——**重投**
+/// （新几何要投影进去）；删除场景（几何记录没了）走本函数——**清除**
+/// （没有新几何可投，孤儿图元留在视图里只会误导，标注量不到几何会静默失效）。
+///
+/// ## 语义
+///
+/// - 只清"绑定了被删形状"的视图；无关视图一个字节不动；
+/// - 清除后视图与模型一致，**不动 `up_to_date`**（该新鲜的还是新鲜、
+///   本来就 stale 的不会因清理变新鲜）；
+/// - 索引用 `rebuild_index` 重建（删除是低频操作，O(全部图元) 可接受；
+///   清除后视图已无该形状的图元 / 标注，重建自然清干净）；
+/// - 图元与标注的 `EntityId` 关联（标注 `associates`）随图元一起消失——
+///   绑定到被删形状的标注本就是该构件的标注（共存亡），一并清除。
+pub fn update_after_removal(drawing: &mut Drawing, removed_shapes: &[ShapeId]) -> RemovalReport {
+    if removed_shapes.is_empty() {
+        return RemovalReport::default();
+    }
+
+    let affected_views = drawing.views_bound_to_shapes(removed_shapes);
+
+    let mut removed_entities = 0usize;
+    let mut removed_annotations = 0usize;
+    let mut cleaned_views = 0usize;
+    for &view_id in &affected_views {
+        let Some(view) = drawing.views.get_mut(&view_id) else {
+            continue;
+        };
+        let before_entities = view.entities.len();
+        let before_annotations = view.annotations.len();
+        view.entities.retain(|entity| {
+            !entity
+                .source
+                .as_ref()
+                .is_some_and(|key| removed_shapes.contains(&key.shape))
+        });
+        view.annotations.retain(|ann| {
+            !ann.bound_to
+                .as_ref()
+                .is_some_and(|key| removed_shapes.contains(&key.shape))
+        });
+        let de = before_entities - view.entities.len();
+        let da = before_annotations - view.annotations.len();
+        if de + da > 0 {
+            cleaned_views += 1;
+        }
+        removed_entities += de;
+        removed_annotations += da;
+    }
+
+    // 索引重建：清除后视图已无被删形状的图元 / 标注，重建自然清干净。
+    drawing.rebuild_index();
+
+    RemovalReport {
+        removed_shapes: removed_shapes.to_vec(),
+        cleaned_views,
+        removed_entities,
+        removed_annotations,
+    }
+}
+
 /// **定向重投单个形状**到一个视图，返回 `(写回的新图元数, 警告)`。
 ///
 /// 保持"其余形状的图元逐字节不变"：只摘除属于 `shape` 的旧图元，把新投影按位置
@@ -260,6 +341,115 @@ mod tests {
         assert_eq!(report.evolution_resolved, 0);
         assert_eq!(report.fingerprint_resolved, 0);
         assert_eq!(drawing, before, "无改动时图纸必须逐字节不变（可观测）");
+    }
+
+    // ======================= 删除清理（G6-M2，mock 腿可测——不碰内核） =======================
+
+    /// G6-M2 钉 6：update_after_removal 清孤儿——shape_a 的图元 / 标注清除、
+    /// shape_b 的**逐字节不变**；报告计数对账；索引重建干净；up_to_date 不动。
+    #[test]
+    fn update_after_removal_clears_orphans_and_keeps_the_rest_byte_identical() {
+        use core_model::GeometryKey;
+        use glam::DVec2;
+
+        let shape_a = ShapeId::new();
+        let shape_b = ShapeId::new();
+
+        let mut drawing = Drawing::new();
+        let mut view = View::new("正立面", core_doc::ViewKind::Elevation);
+        // shape_a 的图元 + shape_b 的图元
+        let mut ea = core_doc::Entity2D::line(
+            core_model::LayerId::new(),
+            DVec2::ZERO,
+            DVec2::new(100.0, 0.0),
+        );
+        ea.source = Some(GeometryKey::whole(shape_a));
+        let mut eb = core_doc::Entity2D::line(
+            core_model::LayerId::new(),
+            DVec2::ZERO,
+            DVec2::new(200.0, 0.0),
+        );
+        eb.source = Some(GeometryKey::whole(shape_b));
+        // 一条无关图元（无 source——纯手绘图元不得被动）
+        let mut free = core_doc::Entity2D::line(
+            core_model::LayerId::new(),
+            DVec2::ZERO,
+            DVec2::new(300.0, 0.0),
+        );
+        free.source = None;
+        view.push_entity(ea);
+        view.push_entity(eb);
+        view.push_entity(free);
+        // 标注：一条绑 shape_a、一条绑 shape_b
+        view.push_annotation(
+            core_doc::Annotation::linear(DVec2::ZERO, DVec2::new(10.0, 0.0))
+                .bound_to(GeometryKey::whole(shape_a)),
+        );
+        view.push_annotation(
+            core_doc::Annotation::linear(DVec2::ZERO, DVec2::new(20.0, 0.0))
+                .bound_to(GeometryKey::whole(shape_b)),
+        );
+        drawing.add_view(view);
+        drawing.rebuild_index();
+        drawing.mark_views_stale(&drawing.views_bound_to_shapes(&[shape_a]));
+        let up_to_date_before = drawing.views.values().next().unwrap().up_to_date;
+
+        let keep_json = |d: &Drawing| {
+            d.views
+                .values()
+                .next()
+                .unwrap()
+                .entities
+                .iter()
+                .filter(|e| e.source.as_ref().is_some_and(|k| k.shape == shape_b))
+                .map(|e| serde_json::to_string(e).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before_b = keep_json(&drawing);
+
+        let report = update_after_removal(&mut drawing, &[shape_a]);
+
+        assert_eq!(report.removed_shapes, vec![shape_a]);
+        assert_eq!(report.removed_entities, 1, "shape_a 的图元清 1 个");
+        assert_eq!(report.removed_annotations, 1, "shape_a 的标注清 1 条");
+        assert_eq!(report.cleaned_views, 1, "恰好清理 1 张视图");
+        assert_eq!(
+            keep_json(&drawing),
+            before_b,
+            "shape_b 的图元必须逐字节不变（只清受影响形状）"
+        );
+        // 无 source 的手绘图元不得被动
+        let view = drawing.views.values().next().unwrap();
+        assert_eq!(
+            view.entities.len(),
+            2,
+            "剩 shape_b 图元 + 无 source 手绘图元"
+        );
+        assert_eq!(view.annotations.len(), 1, "剩 shape_b 的标注");
+        assert_eq!(
+            view.up_to_date, up_to_date_before,
+            "清理不动 up_to_date（该新鲜的新鲜、stale 的保持 stale）"
+        );
+        // 索引重建干净：shape_a 的键不再出现在 forward
+        assert!(
+            drawing
+                .dependencies
+                .dependents_of(&GeometryKey::whole(shape_a))
+                .is_empty(),
+            "索引里 shape_a 的绑定必须清干净"
+        );
+    }
+
+    /// G6-M2 钉 7：空 removed_shapes → 全 0 报告、图纸逐字节不变（红线同款）。
+    #[test]
+    fn update_after_removal_noop_when_nothing_removed() {
+        let mut drawing = Drawing::new();
+        let before = drawing.clone();
+
+        let report = update_after_removal(&mut drawing, &[]);
+
+        assert_eq!(report, RemovalReport::default(), "无删除必须给出全 0 报告");
+        assert_eq!(drawing, before, "无删除时图纸必须逐字节不变（可观测）");
     }
 
     // ======================= 真实内核腿（--features occt --release） =======================

@@ -190,6 +190,35 @@ impl DocumentService {
         Ok(())
     }
 
+    /// **图纸侧编辑**（G6-M3 出图深化）：与 [`Self::edit`] 同款快照语义，
+    /// 但闭包参数是 `&mut Drawing`——填补「改图纸没有撤销步」的空白
+    /// （[`Self::drawing_mut`] 本身不产生撤销步，只有随后一次 `edit`
+    /// 才把改动前的图纸间接压栈）。
+    ///
+    /// 快照**同时**保存文档与图纸两侧：闭包只改图纸、文档不动——`undo`
+    /// 回滚两侧时文档原样恢复，语义无损。图纸布置（Sheet 布置 / 移除布置）
+    /// 一律走这里，保证可撤销。
+    ///
+    /// # Errors
+    /// 闭包返回 `Err` 时**文档与图纸一并回滚**（含版本号），错误原样上抛。
+    pub fn edit_drawing<F>(&mut self, f: F) -> AppResult<()>
+    where
+        F: FnOnce(&mut Drawing) -> AppResult<()>,
+    {
+        let snapshot = HistoryEntry {
+            doc: self.doc.clone(),
+            drawing: self.drawing.clone(),
+        };
+        if let Err(e) = f(&mut self.drawing) {
+            // 回滚（含版本号）：文档与图纸一并恢复
+            self.doc = snapshot.doc;
+            self.drawing = snapshot.drawing;
+            return Err(e);
+        }
+        self.push_undo(snapshot);
+        Ok(())
+    }
+
     /// 便捷：加一个元素（自动成为一个撤销步）。
     pub fn add_element(&mut self, element: Element) -> AppResult<ElementId> {
         let mut id_slot: Option<ElementId> = None;
@@ -667,5 +696,40 @@ mod tests {
             svc.doc().element(id).unwrap().properties.get_float("width"),
             Some(600.0)
         );
+    }
+
+    /// G6-M3 钉：edit_drawing 是撤销步——改图纸 → undo 图纸回滚（文档
+    /// 不受影响）→ redo 前进；闭包 Err 时**不留半成品**、不进撤销栈。
+    #[test]
+    fn edit_drawing_is_an_undo_step_rolling_back_the_drawing() {
+        let mut svc = DocumentService::new("测试");
+        let before = svc.drawing().clone();
+
+        // 改图纸：一个撤销步
+        svc.edit_drawing(|drawing| {
+            drawing.add_sheet(Sheet::new("一层平面", "建施-01", SheetFormat::A2));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(svc.drawing().sheet_count(), 1);
+        assert_eq!(svc.undo_depth(), 1);
+
+        // undo：图纸回滚（逐字节回到编辑前），文档不受影响
+        assert!(svc.undo());
+        assert_eq!(svc.drawing().sheet_count(), 0);
+        assert_eq!(svc.drawing(), &before, "图纸逐字节回到编辑前");
+
+        // redo：前进
+        assert!(svc.redo());
+        assert_eq!(svc.drawing().sheet_count(), 1);
+
+        // 闭包 Err：文档与图纸一并回滚，不留半成品
+        svc.edit_drawing(|drawing| {
+            drawing.add_sheet(Sheet::new("会失败的图纸", "BAD", SheetFormat::A3));
+            Err(crate::error::AppError::Container("故意失败".to_string()))
+        })
+        .unwrap_err();
+        assert_eq!(svc.drawing().sheet_count(), 1, "Err 时不留半成品");
+        assert_eq!(svc.undo_depth(), 1, "失败的编辑不进撤销栈");
     }
 }

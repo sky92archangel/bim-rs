@@ -31,11 +31,11 @@
 //! 真实内核待 `occt-wasm` 可实例化后再切（见仓库 README 的「M1」节）。
 
 use core_doc::{
-    Camera, DraftingStandard, Drawing, Entity2D, PickFilter, PickResult, View, ViewKind,
-    ViewOrientation,
+    Camera, DraftingStandard, Drawing, Entity2D, PickFilter, PickResult, Placement, Sheet,
+    SheetFormat, View, ViewKind, ViewOrientation,
 };
 use core_kernel::{KernelError, MeshData};
-use core_model::{Document, ElementId, PropertyMap, ShapeId, Value, ViewId};
+use core_model::{Document, ElementId, PropertyMap, ShapeId, SheetId, Value, ViewId};
 use core_sdk::{BuildOp, Module, OpInput, PropertySchema, SdkError};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -351,6 +351,112 @@ impl CoreSession {
             Ok(())
         })?;
         Ok(())
+    }
+
+    // ---------- 图纸布置（G6-M3 出图深化：Sheet 管理） ----------
+
+    /// **新建一张图纸**（图幅 + 标题栏用国标默认），自动成为一个撤销步。
+    ///
+    /// 顺序是关键：**先 `edit`**（登记 doc 引用 id 并压入"图纸尚无新图纸"
+    /// 的快照），**后 `add_sheet`** 加本体——随后一次 `undo` 会把 doc 引用
+    /// 与图纸本体**一起**回滚（双侧快照天然保证一致）。
+    ///
+    /// # Errors
+    /// 撤销栈溢出等内部错误原样上抛。
+    pub fn create_sheet(
+        &mut self,
+        name: &str,
+        number: &str,
+        format: SheetFormat,
+    ) -> AppResult<SheetId> {
+        let sheet = Sheet::new(name, number, format);
+        let id = sheet.id;
+        self.document.edit(|doc| {
+            doc.register_sheet(id);
+            Ok(())
+        })?;
+        self.document.drawing_mut().add_sheet(sheet);
+        Ok(id)
+    }
+
+    /// **删除一张图纸**，自动成为一个撤销步（它引用的**视图不动**）。
+    ///
+    /// 与 [`Self::create_sheet`] 反向：先 `edit`（撤销 doc 引用并压快照——
+    /// 此时图纸本体还在），后 `remove_sheet` 删本体——`undo` 双侧一起恢复。
+    ///
+    /// # Errors
+    /// 图纸不存在时返回错误。
+    pub fn remove_sheet(&mut self, sheet_id: SheetId) -> AppResult<()> {
+        if self.document.drawing().sheet(sheet_id).is_none() {
+            return Err(AppError::Doc(core_doc::DocError::SheetNotFound(sheet_id)));
+        }
+        self.document.edit(|doc| {
+            doc.unregister_sheet(sheet_id);
+            Ok(())
+        })?;
+        self.document
+            .drawing_mut()
+            .remove_sheet(sheet_id)
+            .map_err(AppError::from)?;
+        Ok(())
+    }
+
+    /// **把一个视图布置到图纸上**（位置 + 比例），自动成为一个撤销步。
+    ///
+    /// 走 [`DocumentService::edit_drawing`]（改图纸也有撤销步）；布置后对
+    /// **整张图纸**过 [`Sheet::validate`]——越界 / 比例分母为 0 在放置时
+    /// 当场拦截（早失败），失败时布置回滚。
+    ///
+    /// # Errors
+    /// 图纸或视图不存在、布置越界、比例分母为 0 时返回错误。
+    pub fn place_view_on_sheet(
+        &mut self,
+        sheet_id: SheetId,
+        view_id: ViewId,
+        at: glam::DVec2,
+        scale_denominator: u32,
+    ) -> AppResult<()> {
+        self.document.edit_drawing(|drawing| {
+            // 先查视图存在（不可变借用圈随语句结束），再取图纸可变借用
+            if drawing.view(view_id).is_none() {
+                return Err(AppError::Doc(core_doc::DocError::ViewNotFound(view_id)));
+            }
+            let sheet = drawing
+                .sheets
+                .get_mut(&sheet_id)
+                .ok_or(AppError::Doc(core_doc::DocError::SheetNotFound(sheet_id)))?;
+            sheet.place(Placement::new(view_id, at).with_scale(scale_denominator));
+            sheet.validate()?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// **移除图纸上的一个布置**（按行下标），自动成为一个撤销步。
+    ///
+    /// 同一视图可以在一张图纸上布置多次（详图索引），故按下标精确移除；
+    /// 返回被移除的视图 id（GUI 日志用）。
+    ///
+    /// # Errors
+    /// 图纸不存在或下标越界时返回错误。
+    pub fn remove_placement(&mut self, sheet_id: SheetId, index: usize) -> AppResult<ViewId> {
+        let mut removed: Option<ViewId> = None;
+        self.document.edit_drawing(|drawing| {
+            let sheet = drawing
+                .sheets
+                .get_mut(&sheet_id)
+                .ok_or(core_doc::DocError::SheetNotFound(sheet_id))?;
+            if index >= sheet.placements.len() {
+                return Err(AppError::Doc(core_doc::DocError::Standard(format!(
+                    "布置下标 {index} 越界（共 {} 条）",
+                    sheet.placements.len()
+                ))));
+            }
+            let p = sheet.placements.remove(index);
+            removed = Some(p.view);
+            Ok(())
+        })?;
+        removed.ok_or_else(|| AppError::Container("布置移除未生效（内部错误）".to_string()))
     }
 
     // ---------- 建模用例 ----------
@@ -1878,6 +1984,151 @@ mod tests {
             back2.list_schemas().is_empty(),
             "无 schema 会话打开后空 registry"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---------- G6-M3：出图深化·图纸布置 ----------
+
+    /// G6-M3 钉 1：create_sheet / remove_sheet 都是撤销步——undo / redo
+    /// 双侧快照把 doc 引用与图纸本体一起回滚 / 前进。
+    #[test]
+    fn sheet_create_and_remove_are_undo_steps() {
+        let mut s = CoreSession::new().unwrap();
+
+        // 新建图纸：一个撤销步
+        let sid = s
+            .create_sheet("一层平面", "建施-01", SheetFormat::A2)
+            .unwrap();
+        assert_eq!(s.document().drawing().sheet_count(), 1);
+        assert_eq!(s.undo_depth(), 1);
+
+        // undo：doc 引用与图纸本体一起消失
+        assert!(s.undo());
+        assert_eq!(s.document().drawing().sheet_count(), 0);
+        assert!(s.document().doc().sheets().is_empty(), "doc 引用一起回滚");
+
+        // redo：一起回来
+        assert!(s.redo());
+        assert_eq!(s.document().drawing().sheet_count(), 1);
+        assert!(s.document().doc().sheets().contains(&sid));
+
+        // 删除：也是一个撤销步（它引用的视图不动——本例无视图）
+        s.remove_sheet(sid).unwrap();
+        assert_eq!(s.document().drawing().sheet_count(), 0);
+        assert!(s.undo());
+        assert_eq!(s.document().drawing().sheet_count(), 1, "undo 恢复被删图纸");
+        assert!(s.redo());
+        assert_eq!(s.document().drawing().sheet_count(), 0);
+    }
+
+    /// G6-M3 钉 2：place_view_on_sheet 是撤销步 + 越界 / 比例 0 当场拦截
+    /// （edit_drawing 的 Err 回滚——失败的布置不留下半成品）。
+    #[test]
+    fn place_view_on_sheet_is_an_undo_step_and_validates_bounds() {
+        let mut s = CoreSession::new().unwrap();
+        let sid = s.create_sheet("标准图", "G-01", SheetFormat::A3).unwrap();
+        let vid = s.create_view("立面", ViewOrientation::front()).unwrap();
+
+        // A3 横放 420×297；(200, 200) 在图幅内
+        s.place_view_on_sheet(sid, vid, glam::DVec2::new(200.0, 200.0), 100)
+            .unwrap();
+        assert_eq!(
+            s.document().drawing().sheet(sid).unwrap().placement_count(),
+            1
+        );
+        assert!(s.undo(), "布置是撤销步");
+        assert_eq!(
+            s.document().drawing().sheet(sid).unwrap().placement_count(),
+            0
+        );
+        assert!(s.redo());
+        assert_eq!(
+            s.document().drawing().sheet(sid).unwrap().placement_count(),
+            1
+        );
+
+        // 越界：A3 放 (1000, 1000) → validate 拦截，布置回滚
+        let err = s
+            .place_view_on_sheet(sid, vid, glam::DVec2::new(1000.0, 1000.0), 100)
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Doc(_)),
+            "越界报 Doc 错，实际：{err:?}"
+        );
+        assert_eq!(
+            s.document().drawing().sheet(sid).unwrap().placement_count(),
+            1,
+            "失败的布置不留下半成品"
+        );
+
+        // 比例分母 0：validate 拦截
+        assert!(
+            s.place_view_on_sheet(sid, vid, glam::DVec2::new(100.0, 100.0), 0)
+                .is_err()
+        );
+        assert_eq!(
+            s.document().drawing().sheet(sid).unwrap().placement_count(),
+            1
+        );
+    }
+
+    /// G6-M3 钉 3：remove_placement 按下标精确移除——同一视图布置两次
+    /// （详图索引）时只移除指定下标的那条；下标越界响亮报错。
+    #[test]
+    fn remove_placement_by_index_removes_exactly_one() {
+        let mut s = CoreSession::new().unwrap();
+        let sid = s.create_sheet("标准图", "G-01", SheetFormat::A1).unwrap();
+        let vid = s.create_view("平面", ViewOrientation::top()).unwrap();
+        s.place_view_on_sheet(sid, vid, glam::DVec2::new(200.0, 400.0), 100)
+            .unwrap();
+        s.place_view_on_sheet(sid, vid, glam::DVec2::new(500.0, 400.0), 50)
+            .unwrap();
+        assert_eq!(
+            s.document().drawing().sheet(sid).unwrap().placement_count(),
+            2
+        );
+
+        // 移除下标 0（1:100 那条）——剩 1:50
+        let removed = s.remove_placement(sid, 0).unwrap();
+        assert_eq!(removed, vid);
+        let sheet = s.document().drawing().sheet(sid).unwrap();
+        assert_eq!(sheet.placement_count(), 1);
+        assert_eq!(
+            sheet.placements[0].scale_denominator, 50,
+            "移除的是下标 0，剩的是 1:50"
+        );
+
+        // 下标越界：响亮报错
+        assert!(s.remove_placement(sid, 5).is_err());
+    }
+
+    /// G6-M3 钉 4：图纸布置随容器持久化——create_sheet + place → save →
+    /// open → 图纸 / 布置 / 比例 / 图幅全部恢复（sheets 随 drawing.json）。
+    #[test]
+    fn sheet_persists_through_save_and_open_with_placements() {
+        let dir = std::env::temp_dir().join(format!("bim-session-sheet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sheet.bimdoc");
+
+        let mut s = CoreSession::new().unwrap();
+        let sid = s
+            .create_sheet("一层平面", "建施-01", SheetFormat::A2)
+            .unwrap();
+        let vid = s.create_view("立面", ViewOrientation::front()).unwrap();
+        s.place_view_on_sheet(sid, vid, glam::DVec2::new(250.0, 300.0), 100)
+            .unwrap();
+        s.save(&path).unwrap();
+
+        let back = CoreSession::open(&path).unwrap();
+        assert_eq!(back.document().drawing().sheet_count(), 1, "图纸随容器恢复");
+        let sheet = back.document().drawing().sheet(sid).unwrap();
+        assert_eq!(sheet.number, "建施-01");
+        assert_eq!(sheet.format, SheetFormat::A2);
+        assert_eq!(sheet.placement_count(), 1);
+        assert_eq!(sheet.placements[0].view, vid, "布置引用的视图 id 一致");
+        assert_eq!(sheet.placements[0].scale_denominator, 100);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -86,6 +86,14 @@ impl Drawing {
         self.sheets.get(&id)
     }
 
+    /// 删一张图纸（G6-M3），返回被删的图纸本体。
+    ///
+    /// ⚠ 只删图纸自身——它引用的**视图不动**（视图是"算出来的"投影结果，
+    /// 可以摆到别的图纸上；`Sheet::placements` 随图纸一起消失即可）。
+    pub fn remove_sheet(&mut self, id: SheetId) -> DocResult<Sheet> {
+        self.sheets.remove(&id).ok_or(DocError::SheetNotFound(id))
+    }
+
     /// 删视图，并**清掉所有引用它的布置与绑定**（防悬空）。
     ///
     /// 返回被删的视图与被连带移除的布置数量。
@@ -432,5 +440,36 @@ mod tests {
         d.rebuild_index();
         let json = serde_json::to_string(&d).unwrap();
         assert_eq!(serde_json::from_str::<Drawing>(&json).unwrap(), d);
+    }
+
+    /// G6-M3 钉：remove_sheet 删本体并返回它；它引用的**视图不动**（可摆
+    /// 到别的图纸）；再删同 id 响亮报错（SheetNotFound）。
+    #[test]
+    fn remove_sheet_returns_the_sheet_and_keeps_views() {
+        let mut d = Drawing::new();
+        let mut view = View::new("平面", ViewKind::Drafting);
+        let vid = view.id;
+        view.push_entity(Entity2D::line(
+            LayerId::new(),
+            DVec2::ZERO,
+            DVec2::new(10.0, 0.0),
+        ));
+        d.add_view(view);
+        let mut s = Sheet::new("一层平面", "建施-01", SheetFormat::A2);
+        s.place(Placement::new(vid, DVec2::new(250.0, 300.0)));
+        let sid = d.add_sheet(s);
+        assert_eq!(d.sheet_count(), 1);
+
+        // 删除：返回本体（布置随本体一起返回）；视图不动
+        let sheet = d.remove_sheet(sid).unwrap();
+        assert_eq!(sheet.placement_count(), 1, "布置随图纸本体一起返回");
+        assert_eq!(d.sheet_count(), 0);
+        assert!(d.view(vid).is_some(), "视图不动（可摆到别的图纸）");
+
+        // 再删：响亮报错
+        assert!(matches!(
+            d.remove_sheet(sid),
+            Err(DocError::SheetNotFound(_))
+        ));
     }
 }

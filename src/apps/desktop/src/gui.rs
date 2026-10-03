@@ -68,9 +68,11 @@ use cable_tunnel::{
     GEOMETRY_OP_ID_RECT as OP_TUNNEL_RECT,
 };
 use core_app::CoreSession;
-use core_doc::{Camera, PickFilter, PickKind, PickParam, PickResult, Ray, ViewOrientation};
+use core_doc::{
+    Camera, PickFilter, PickKind, PickParam, PickResult, Ray, SheetFormat, ViewOrientation,
+};
 use core_interop::{Drawing2D, Format};
-use core_model::{ElementId, FieldDef, FieldType, PropertyMap, ShapeId, Value, ViewId};
+use core_model::{ElementId, FieldDef, FieldType, PropertyMap, ShapeId, SheetId, Value, ViewId};
 use core_sdk::{BuildOp, Module, ParamDef, ParamDefault, ParamKind};
 use example_beam::{
     CATEGORY as BEAM_CATEGORY, ExampleBeam, GEOMETRY_OP_ID as OP_BEAM_RECT,
@@ -350,8 +352,10 @@ enum Page {
     Types,
     /// 右栏 · 属性
     Props,
-    /// 右栏 · 图纸
+    /// 右栏 · 视图（G6-M3 更名：本页实为视图列表——Sheet 是"图纸"）
     Drawing,
+    /// 右栏 · 图纸（G6-M3 出图深化：Sheet 布置——图幅 / 标题栏 / 整图预览导出）
+    Sheets,
 }
 
 struct BimApp {
@@ -383,6 +387,24 @@ struct BimApp {
     selected_view: Option<ViewId>,
     /// 浮动图纸预览窗口开关（M11）
     preview_open: bool,
+    /// 图纸页选中的图纸（G6-M3）
+    selected_sheet: Option<SheetId>,
+    /// 浮动整图预览窗口开关（G6-M3：Sheet 级——图幅/图框/标题栏/布置）
+    sheet_preview_open: bool,
+    /// 新建图纸输入暂存（G6-M3）
+    sheet_new_name: String,
+    /// 新建图纸图号暂存（G6-M3）
+    sheet_new_number: String,
+    /// 新建图纸图幅暂存（G6-M3）
+    sheet_new_format: SheetFormat,
+    /// 放置视图表单：视图暂存（G6-M3）
+    place_view_id: Option<ViewId>,
+    /// 放置视图表单：比例分母暂存（G6-M3）
+    place_scale: u32,
+    /// 放置视图表单：位置 X 暂存（mm，G6-M3）
+    place_x_mm: f64,
+    /// 放置视图表单：位置 Y 暂存（mm，G6-M3）
+    place_y_mm: f64,
     /// 拾取模式（面 / 边 / 顶点；M12）
     pick_mode: PickMode,
     /// 增量重建集（M12）：None = 全量重建，Some = 只重建这些形状。
@@ -563,6 +585,15 @@ impl BimApp {
             op_by_element,
             selected_view: None,
             preview_open: false,
+            selected_sheet: None,
+            sheet_preview_open: false,
+            sheet_new_name: String::new(),
+            sheet_new_number: String::new(),
+            sheet_new_format: SheetFormat::A2,
+            place_view_id: None,
+            place_scale: 100,
+            place_x_mm: 100.0,
+            place_y_mm: 100.0,
             pick_mode: PickMode::Face,
             dirty_shapes: None,
             left_page: Page::Elements,
@@ -619,6 +650,15 @@ impl BimApp {
             op_by_element: HashMap::new(),
             selected_view: None,
             preview_open: false,
+            selected_sheet: None,
+            sheet_preview_open: false,
+            sheet_new_name: String::new(),
+            sheet_new_number: String::new(),
+            sheet_new_format: SheetFormat::A2,
+            place_view_id: None,
+            place_scale: 100,
+            place_x_mm: 100.0,
+            place_y_mm: 100.0,
             pick_mode: PickMode::Face,
             dirty_shapes: None,
             left_page: Page::Elements,
@@ -1661,7 +1701,9 @@ impl BimApp {
             ui,
             &[
                 (Page::Props, ph::GEAR, "属性"),
-                (Page::Drawing, ph::FRAME_CORNERS, "图纸"),
+                // G6-M3 更名：本页实为视图列表（View），"图纸"让给 Sheet 页
+                (Page::Drawing, ph::FRAME_CORNERS, "视图"),
+                (Page::Sheets, ph::BROWSER, "图纸"),
             ],
             self.right_page,
         );
@@ -1672,6 +1714,7 @@ impl BimApp {
         match self.right_page {
             Page::Props => self.props_panel(ui),
             Page::Drawing => self.views_panel(ui),
+            Page::Sheets => self.sheets_panel(ui),
             _ => {}
         }
     }
@@ -2462,6 +2505,312 @@ impl BimApp {
         }
     }
 
+    // ---- 图纸页（G6-M3 出图深化：Sheet 布置——图幅 / 标题栏 / 整图预览导出） ----
+
+    /// 图纸页：图纸列表 + 新建（图幅下拉）+ 布置表单 + 整图预览 / 导出。
+    ///
+    /// Sheet 是"把若干视图按比例摆到一张图幅上，再套图框与标题栏"（core-doc
+    /// 语义）；本页只编排布置——摊平 / 图框 / 标题栏渲染全部复用既有
+    /// `sheet_to_2d` 链路，`sheets` 随 drawing.json 持久化。
+    fn sheets_panel(&mut self, ui: &mut egui::Ui) {
+        // —— 新建图纸（标题栏用国标默认 180×56 右下角）——
+        ui.label("新建图纸：");
+        ui.horizontal(|ui| {
+            ui.label("名称");
+            ui.add(egui::TextEdit::singleline(&mut self.sheet_new_name).desired_width(110.0));
+            ui.label("图号");
+            ui.add(egui::TextEdit::singleline(&mut self.sheet_new_number).desired_width(80.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("图幅");
+            egui::ComboBox::from_id_salt("sheet_new_format")
+                .selected_text(self.sheet_new_format.code())
+                .show_ui(ui, |ui| {
+                    for f in [
+                        SheetFormat::A0,
+                        SheetFormat::A1,
+                        SheetFormat::A2,
+                        SheetFormat::A3,
+                        SheetFormat::A4,
+                        SheetFormat::A4Extended,
+                    ] {
+                        ui.selectable_value(&mut self.sheet_new_format, f, f.code());
+                    }
+                });
+            if ui.button("新建").clicked() {
+                let name = self.sheet_new_name.trim();
+                let number = self.sheet_new_number.trim();
+                let name = if name.is_empty() { "图纸" } else { name };
+                let number = if number.is_empty() { "G-01" } else { number };
+                match self
+                    .session
+                    .create_sheet(name, number, self.sheet_new_format)
+                {
+                    Ok(sid) => {
+                        self.selected_sheet = Some(sid);
+                        self.log(format!(
+                            "✓ 图纸已创建：{number} · {name}（{}，撤销可恢复）",
+                            self.sheet_new_format.code()
+                        ));
+                    }
+                    Err(e) => self.log(format!("✗ 创建图纸失败：{e}")),
+                }
+            }
+        });
+        ui.separator();
+        // 图纸列表（先收集再交互，避免边遍历边改状态）。
+        let items: Vec<(SheetId, String, String, String, usize)> = self
+            .session
+            .document()
+            .drawing()
+            .sheets
+            .iter()
+            .map(|(id, s)| {
+                (
+                    *id,
+                    s.number.clone(),
+                    s.name.clone(),
+                    s.format.code().to_string(),
+                    s.placement_count(),
+                )
+            })
+            .collect();
+        if items.is_empty() {
+            ui.label("（无图纸，从上方新建）");
+            return;
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // 渲染收集动作（elements_panel 先例：可变借用圈在渲染段，动作借用结束后执行）
+            let mut do_remove_sheet: Option<SheetId> = None;
+            let mut do_remove_pl: Option<(SheetId, usize)> = None;
+            let mut do_place: Option<(SheetId, ViewId, glam::DVec2, u32)> = None;
+            for (id, number, name, fmt_code, count) in items {
+                let text = if count > 0 {
+                    format!("{number} · {name}（{fmt_code}，{count} 布置）")
+                } else {
+                    format!("{number} · {name}（{fmt_code}，空图纸）")
+                };
+                if ui
+                    .selectable_label(self.selected_sheet == Some(id), &text)
+                    .clicked()
+                {
+                    self.selected_sheet = Some(id);
+                }
+                // 选中图纸的操作条 + 放置表单 + 布置列表
+                if self.selected_sheet == Some(id) {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("整图预览").clicked() {
+                            self.sheet_preview_open = true;
+                        }
+                        if ui.small_button("导出 DXF").clicked() {
+                            self.export_sheet_file(Format::Dxf, id);
+                        }
+                        if ui.small_button("导出 SVG").clicked() {
+                            self.export_sheet_file(Format::Svg, id);
+                        }
+                        if ui.small_button("删除图纸").clicked() {
+                            do_remove_sheet = Some(id);
+                        }
+                    });
+                    // —— 放置视图表单（视图下拉 + 比例下拉 + 位置；都先克隆出快照，
+                    //    避免 session 不可变借用与暂存字段可变借用并存）——
+                    ui.label("放置视图：");
+                    let views: Vec<(ViewId, String)> = self
+                        .session
+                        .document()
+                        .drawing()
+                        .views
+                        .iter()
+                        .map(|(vid, v)| (*vid, v.name.clone()))
+                        .collect();
+                    if self
+                        .place_view_id
+                        .is_none_or(|vid| !views.iter().any(|(v, _)| *v == vid))
+                    {
+                        self.place_view_id = views.first().map(|(vid, _)| *vid);
+                    }
+                    let scales = self
+                        .session
+                        .document()
+                        .drawing()
+                        .standard
+                        .scale_series
+                        .clone();
+                    ui.horizontal(|ui| {
+                        let pv = self
+                            .place_view_id
+                            .and_then(|vid| views.iter().find(|(v, _)| *v == vid))
+                            .map(|(_, n)| n.clone())
+                            .unwrap_or_else(|| "（选视图）".to_string());
+                        egui::ComboBox::from_id_salt(format!("place_view_{id}"))
+                            .selected_text(pv)
+                            .show_ui(ui, |ui| {
+                                for (vid, vname) in &views {
+                                    ui.selectable_value(&mut self.place_view_id, Some(*vid), vname);
+                                }
+                            });
+                        ui.label("比例");
+                        egui::ComboBox::from_id_salt(format!("place_scale_{id}"))
+                            .selected_text(format!("1:{}", self.place_scale))
+                            .show_ui(ui, |ui| {
+                                for d in &scales {
+                                    ui.selectable_value(
+                                        &mut self.place_scale,
+                                        *d,
+                                        format!("1:{d}"),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("位置");
+                        ui.add(
+                            egui::DragValue::new(&mut self.place_x_mm)
+                                .prefix("X ")
+                                .suffix(" mm")
+                                .speed(1.0),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.place_y_mm)
+                                .prefix("Y ")
+                                .suffix(" mm")
+                                .speed(1.0),
+                        );
+                        if ui.button("布置").clicked()
+                            && let Some(vid) = self.place_view_id
+                        {
+                            do_place = Some((
+                                id,
+                                vid,
+                                glam::DVec2::new(self.place_x_mm, self.place_y_mm),
+                                self.place_scale,
+                            ));
+                        }
+                    });
+                    // —— 布置列表（快照 + 视图名解析）——
+                    if count > 0 {
+                        let placements: Vec<(usize, ViewId, glam::DVec2, u32)> = self
+                            .session
+                            .document()
+                            .drawing()
+                            .sheet(id)
+                            .map(|s| {
+                                s.placements
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, p)| (idx, p.view, p.at, p.scale_denominator))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        ui.label(format!("布置（{count}）："));
+                        for (idx, pvid, at, scale) in placements {
+                            let pname = self
+                                .session
+                                .document()
+                                .drawing()
+                                .view(pvid)
+                                .map(|v| v.name.clone())
+                                .unwrap_or_else(|| "（视图已删）".to_string());
+                            ui.horizontal(|ui| {
+                                ui.label(format!("· {pname}（{:.0}, {:.0}）1:{scale}", at.x, at.y));
+                                if ui.small_button("移除").clicked() {
+                                    do_remove_pl = Some((id, idx));
+                                }
+                            });
+                        }
+                    }
+                    ui.separator();
+                }
+            }
+            // 动作段（渲染段的可变借用已结束）
+            if let Some(sid) = do_remove_sheet {
+                match self.session.remove_sheet(sid) {
+                    Ok(()) => {
+                        if self.selected_sheet == Some(sid) {
+                            self.selected_sheet = None;
+                        }
+                        self.log("✓ 图纸已删除（其引用的视图不动；撤销可恢复）".to_string());
+                    }
+                    Err(e) => self.log(format!("✗ 删除图纸失败：{e}")),
+                }
+            }
+            if let Some((sid, idx)) = do_remove_pl {
+                match self.session.remove_placement(sid, idx) {
+                    Ok(vid) => self.log(format!("✓ 布置已移除（ViewId {vid}；撤销可恢复）")),
+                    Err(e) => self.log(format!("✗ 移除布置失败：{e}")),
+                }
+            }
+            if let Some((sid, vid, at, scale)) = do_place {
+                match self.session.place_view_on_sheet(sid, vid, at, scale) {
+                    Ok(()) => self.log(format!("✓ 视图已布置到图纸（1:{scale}，撤销可恢复）")),
+                    Err(e) => self.log(format!("✗ 布置失败：{e}")),
+                }
+            }
+        });
+    }
+
+    /// 导出整张图纸（G6-M3：布置求值 + 图框 + 标题栏一起出，`export_sheet` 既有门面）。
+    fn export_sheet_file(&mut self, format: Format, sid: SheetId) {
+        let (label, ext) = match format {
+            Format::Svg => ("SVG", "svg"),
+            _ => ("DXF", "dxf"),
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(label, &[ext])
+            .set_file_name(format!("图纸.{ext}"))
+            .save_file()
+        else {
+            self.log(format!("· {label} 导出已取消"));
+            return;
+        };
+        let drawing = self.session.document().drawing().clone();
+        match self.session.interop().export_sheet(format, &drawing, sid) {
+            Ok(out) => match std::fs::write(&path, &out.bytes) {
+                Ok(()) => self.log(format!(
+                    "✓ {label} 已导出：{}（{} 字节）",
+                    path.display(),
+                    out.bytes.len()
+                )),
+                Err(e) => self.log(format!("✗ {label} 写文件失败：{e}")),
+            },
+            Err(e) => self.log(format!("✗ {label} 导出失败：{e}")),
+        }
+    }
+
+    /// 浮动"整图预览"窗口（G6-M3）：把选中图纸摊平成 Drawing2D 后用 egui 画
+    /// （图幅 / 图框 / 标题栏 / 全部布置一起画，`sheet_to_2d` 既有链路）。
+    fn sheet_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.sheet_preview_open {
+            return;
+        }
+        let mut open = self.sheet_preview_open;
+        egui::Window::new("整图预览")
+            .open(&mut open)
+            .default_width(820.0)
+            .default_height(600.0)
+            .show(ctx, |ui| {
+                let Some(sid) = self.selected_sheet else {
+                    ui.label("（图纸页未选中图纸）");
+                    return;
+                };
+                let Some(sheet) = self.session.document().drawing().sheet(sid).cloned() else {
+                    ui.label("图纸不存在");
+                    return;
+                };
+                let drawing = self.session.document().drawing().clone();
+                match core_app::interop_service::sheet_to_2d(&drawing, &sheet) {
+                    Ok(d2) => {
+                        let title = format!("{}（{}）", sheet.number, sheet.name);
+                        self.draw_drawing_2d(ui, &d2, title);
+                    }
+                    Err(e) => {
+                        ui.label(format!("摊平失败：{e}"));
+                    }
+                }
+            });
+        self.sheet_preview_open = open;
+    }
+
     /// 浮动"图纸预览"窗口：把选中视图摊平成 Drawing2D 后用 egui 画。
     fn drawing_preview_window(&mut self, ctx: &egui::Context) {
         if !self.preview_open {
@@ -2908,8 +3257,11 @@ impl eframe::App for BimApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport(ui));
-        // M11：浮动图纸预览窗口（"图纸"页签选中视图后点"预览"打开）。
+        // M11：浮动图纸预览窗口（"视图"页签选中视图后点"预览"打开）。
         self.drawing_preview_window(ctx);
+        // G6-M3：整图预览窗口（"图纸"页签选中图纸后点"整图预览"打开——
+        // 图幅 / 图框 / 标题栏 / 全部布置一起画）。
+        self.sheet_preview_window(ctx);
         // G3：原生算子参数表单浮窗（工具栏构建七组的算子项点击后打开）。
         self.op_form_window(ctx);
         // G4-M15：草图编辑器浮窗（工具栏三入口点击后打开）。

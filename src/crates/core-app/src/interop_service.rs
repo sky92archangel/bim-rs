@@ -65,26 +65,55 @@ const FALLBACK_TEXT_HEIGHT_MM: f64 = 3.5;
 /// 标题栏字段文字距格线内边的留白（mm）。
 const TITLE_BLOCK_PAD_MM: f64 = 2.0;
 
+/// 视图标题标签距内容底边的间距（mm）。
+const VIEW_LABEL_GAP_MM: f64 = 4.0;
+
 // ============================================================================
 // 转换：core-doc → Drawing2D
 // ============================================================================
 
 /// 把**一张图纸**摊平成中性二维结构（含布置求值）。
 ///
-/// 视点中心对准 [`Placement::at`]，按 `1/scale_denominator` 缩放。
+/// 视点中心对准 [`Placement::at`]，按 `1/scale_denominator` 缩放；
+/// 每个布置的内容包围盒下方再写一条「视图名 1:N」标签（G6-M4 出图深化）。
 pub fn sheet_to_2d(drawing: &Drawing, sheet: &Sheet) -> AppResult<Drawing2D> {
     sheet.validate()?;
     let (width_mm, height_mm) = sheet.size_mm();
     let mut out = Drawing2D::new(width_mm, height_mm);
+
+    // 标签的图层与字高照标题栏的既有口径解析一次（循环外，不重复查表）。
+    let text_layer = drawing.standard.require_layer(LAYER_TEXT)?.name.clone();
+    let normal_height = drawing
+        .standard
+        .text_style("标准")
+        .map_or(FALLBACK_TEXT_HEIGHT_MM, |t| t.height_mm);
 
     for placement in &sheet.placements {
         let view = drawing
             .view(placement.view)
             .ok_or(core_doc::DocError::ViewNotFound(placement.view))?;
         let scale = placement.drawing_scale();
-        let center = content_bbox(view).map_or(DVec2::ZERO, |(min, max)| (min + max) * 0.5);
+        let bbox = content_bbox(view);
+        let center = bbox.map_or(DVec2::ZERO, |(min, max)| (min + max) * 0.5);
         let offset = placement.at - center * scale;
         append_view_content(&drawing.standard, view, scale, offset, &mut out)?;
+
+        // 视图标题标签：内容包围盒底边下方 GAP 处，左端对齐内容左边缘。
+        // 空视图（bbox = None）half_w/half_h 取 0，标签落在布置点正下方。
+        let (half_w, half_h) = bbox.map_or((0.0, 0.0), |(min, max)| {
+            ((max.x - min.x) * scale * 0.5, (max.y - min.y) * scale * 0.5)
+        });
+        out.push_text(
+            Text2D::new(
+                [
+                    placement.at.x - half_w,
+                    placement.at.y - half_h - VIEW_LABEL_GAP_MM,
+                ],
+                format!("{} 1:{}", view.name, placement.scale_denominator),
+                normal_height,
+            )
+            .on_layer(text_layer.clone()),
+        );
     }
 
     // 图框 + 标题栏**必须在所有 placement 之后**追加：
@@ -1254,6 +1283,141 @@ mod tests {
     }
 
     #[test]
+    fn sheet_export_writes_a_view_label_under_each_placement() {
+        let s = standard();
+        let mut drawing = Drawing::with_standard(s.clone());
+        let mut v = View::plan("一层平面图", ElementId::new(), 0.0);
+        // L 形两条线：模型坐标包围盒 x∈[-500,500]、y∈[0,1000]
+        v.push_entity(Entity2D::line(
+            outline_layer(&s),
+            DVec2::new(-500.0, 0.0),
+            DVec2::new(500.0, 0.0),
+        ));
+        v.push_entity(Entity2D::line(
+            outline_layer(&s),
+            DVec2::new(500.0, 0.0),
+            DVec2::new(500.0, 1000.0),
+        ));
+        let view_id = drawing.add_view(v);
+
+        let mut sheet = Sheet::new("一层平面", "建施-01", SheetFormat::A2);
+        sheet.place(Placement::new(view_id, DVec2::new(300.0, 200.0)).with_scale(100));
+        let flat = sheet_to_2d(&drawing, &sheet).unwrap();
+
+        // 几何：1:100 → half_w = half_h = 5 mm → 标签插入点 (300-5, 200-5-4) = (295, 191)
+        let label = flat
+            .texts
+            .iter()
+            .find(|t| t.content == "一层平面图 1:100")
+            .expect("每个布置下方应有「视图名 1:N」标签");
+        assert!(
+            (label.at[0] - 295.0).abs() < 1e-9,
+            "左端应对齐内容左边缘，实际 {}",
+            label.at[0]
+        );
+        assert!(
+            (label.at[1] - 191.0).abs() < 1e-9,
+            "应在内容底边(195)下方 4 mm，实际 {}",
+            label.at[1]
+        );
+        assert_eq!(
+            label.layer,
+            core_doc::standard::LAYER_TEXT,
+            "标签走文字图层"
+        );
+        assert!(
+            (label.height_mm - 3.5).abs() < 1e-12,
+            "字高取「标准」样式，实际 {}",
+            label.height_mm
+        );
+
+        // 标签是 texts、不产生 curves：curves[0] 仍是第一条视图实体（1 m 线 → 图上 10 mm）
+        let curve = &flat.curves[0];
+        let dx = (curve.points[1][0] - curve.points[0][0]).abs();
+        assert!(
+            (dx - 10.0).abs() < 1e-9,
+            "curves[0] 仍是 1:100 的水平线，实际 dx={dx}"
+        );
+    }
+
+    #[test]
+    fn sheet_export_labels_each_placement_individually() {
+        let s = standard();
+        let mut drawing = Drawing::with_standard(s.clone());
+        let mut v = View::plan("一层平面图", ElementId::new(), 0.0);
+        v.push_entity(Entity2D::line(
+            outline_layer(&s),
+            DVec2::new(-500.0, 0.0),
+            DVec2::new(500.0, 0.0),
+        ));
+        v.push_entity(Entity2D::line(
+            outline_layer(&s),
+            DVec2::new(500.0, 0.0),
+            DVec2::new(500.0, 1000.0),
+        ));
+        let view_id = drawing.add_view(v);
+
+        // 同一视图布置两次：比例与位置都不同
+        let mut sheet = Sheet::new("一层平面", "建施-01", SheetFormat::A2);
+        sheet.place(Placement::new(view_id, DVec2::new(150.0, 150.0)).with_scale(100));
+        sheet.place(Placement::new(view_id, DVec2::new(450.0, 150.0)).with_scale(50));
+        let flat = sheet_to_2d(&drawing, &sheet).unwrap();
+
+        // 几何：1:100 → half=5 → 标签 (145,141)；1:50 → half=10 → 标签 (440,136)
+        let label100 = flat
+            .texts
+            .iter()
+            .find(|t| t.content == "一层平面图 1:100")
+            .expect("1:100 布置应有自己的标签");
+        let label50 = flat
+            .texts
+            .iter()
+            .find(|t| t.content == "一层平面图 1:50")
+            .expect("1:50 布置应有自己的标签");
+        assert!(
+            (label100.at[0] - 145.0).abs() < 1e-9 && (label100.at[1] - 141.0).abs() < 1e-9,
+            "1:100 标签位置不对，实际 {:?}",
+            label100.at
+        );
+        assert!(
+            (label50.at[0] - 440.0).abs() < 1e-9 && (label50.at[1] - 136.0).abs() < 1e-9,
+            "1:50 标签位置不对，实际 {:?}",
+            label50.at
+        );
+        assert!(
+            label50.at[1] < label100.at[1],
+            "1:50 画得更大 → 标签应更低，实际 {} vs {}",
+            label50.at[1],
+            label100.at[1]
+        );
+    }
+
+    #[test]
+    fn sheet_export_labels_empty_views_below_the_placement() {
+        let s = standard();
+        let mut drawing = Drawing::with_standard(s.clone());
+        let v = View::new("空视图", ViewKind::Drafting);
+        let view_id = drawing.add_view(v);
+
+        let mut sheet = Sheet::new("一层平面", "建施-01", SheetFormat::A2);
+        sheet.place(Placement::new(view_id, DVec2::new(200.0, 150.0)).with_scale(100));
+        let flat = sheet_to_2d(&drawing, &sheet).unwrap();
+
+        // 空视图没有内容包围盒 → half 取 0，标签落在布置点正下方 4 mm
+        let label = flat
+            .texts
+            .iter()
+            .find(|t| t.content == "空视图 1:100")
+            .expect("空视图也应有标签");
+        assert!((label.at[0] - 200.0).abs() < 1e-9, "实际 {}", label.at[0]);
+        assert!(
+            (label.at[1] - 146.0).abs() < 1e-9,
+            "应在布置点(150)正下方 4 mm，实际 {}",
+            label.at[1]
+        );
+    }
+
+    #[test]
     fn exporting_a_missing_sheet_is_reported() {
         let drawing = Drawing::new();
         let svc = InteropService::new();
@@ -1498,7 +1662,12 @@ mod tests {
             1,
             "超尺寸标题栏应跳过：只应剩图框这一个矩形"
         );
-        assert!(flat.texts.is_empty(), "跳过标题栏时不应有字段文字");
+        // 视图标签属于布置输出（G6-M4），跳过标题栏只影响字段文字——标签照旧
+        assert!(
+            flat.texts.iter().all(|t| t.content == "一层 1:100"),
+            "跳过标题栏时不应有字段文字（视图标签照旧），实得 {:?}",
+            flat.texts.iter().map(|t| &t.content).collect::<Vec<_>>()
+        );
     }
 
     /// B5.4 钉子 ⑦：非右下角标题栏 → 只画图框（本模型仅实现右下角）。
@@ -1516,7 +1685,12 @@ mod tests {
             quads(&flat)
         );
         assert_eq!(quads(&flat).len(), 1, "非右下角标题栏应跳过：只应剩图框");
-        assert!(flat.texts.is_empty(), "跳过标题栏时不应有字段文字");
+        // 视图标签属于布置输出（G6-M4），跳过标题栏只影响字段文字——标签照旧
+        assert!(
+            flat.texts.iter().all(|t| t.content == "一层 1:100"),
+            "跳过标题栏时不应有字段文字（视图标签照旧），实得 {:?}",
+            flat.texts.iter().map(|t| &t.content).collect::<Vec<_>>()
+        );
     }
 
     /// B5.4 钉子 ⑧：图框只属于**图纸**——单视图导出不得带图框 / 标题栏。

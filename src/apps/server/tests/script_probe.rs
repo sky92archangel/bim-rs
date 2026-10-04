@@ -1,10 +1,10 @@
-//! # rhai 脚本引擎集成探针（G6-M9）
+//! # rhai 脚本引擎集成探针（G6-M9；G6-M11 门面补全扩展）
 //!
 //! 跑**真实二进制**（`env!("CARGO_BIN_EXE_bim-server")`）的 `script` 子命令——
 //! 照 cli_probe / http_probe 同款口径：断言退出码与 stdout/stderr，
 //! 临时文件（脚本 / .bimdoc）用进程 id 隔离，跑完清理。
 //!
-//! ## 探针清单（3 个）
+//! ## 探针清单（5 个）
 //!
 //! 1. `script_models_and_saves_end_to_end`——脚本建模全流（造构件 → 建几何 →
 //!    建视图/图纸 → 布置 → 保存）：exit 0 + 摘要输出 + `.bimdoc` 真落盘非空。
@@ -12,6 +12,11 @@
 //!    失败前缀与算子 id（错误响亮、带行号，绝不静默）。
 //! 3. `script_opens_an_existing_document`——先 `new --save` 落盘，脚本
 //!    `open_session` 打开：exit 0 + 摘要含恢复的元素。
+//! 4. `script_edits_and_deletes_end_to_end`（G6-M11）——删改流：
+//!    remove_placement → rebuild_geometry → delete_element → 清单对账。
+//! 5. `script_lists_and_updates_properties`（G6-M11）——清单 + 属性更新 +
+//!    视图重投：list_elements（Map 数组访问）/ update_element_properties /
+//!    regenerate_view 全链。
 //!
 //! ## Windows 路径转义（实测发现）
 //!
@@ -142,4 +147,77 @@ fn script_opens_an_existing_document() {
 
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&doc);
+}
+
+/// 探针 4（G6-M11）：脚本删改流——建视图/图纸/布置 → remove_placement →
+/// rebuild_geometry（新参数）→ delete_element → 清单对账（元素清零、图纸保留）。
+#[test]
+fn script_edits_and_deletes_end_to_end() {
+    let script = temp_path("edit", "rhai");
+    std::fs::write(
+        &script,
+        "let s = new_session();\n\
+         let e = s.create_element(\"BEAM\", \"脚本梁\");\n\
+         s.build_geometry(e, \"example.beam.rect\");\n\
+         let v = s.create_view(\"俯视\");\n\
+         let sh = s.create_sheet(\"一层平面\", \"建施-01\", \"A2\");\n\
+         s.place_view_on_sheet(sh, v, 297.0, 210.0, 100);\n\
+         let gone = s.remove_placement(sh, 0);\n\
+         print(\"removed: \" + gone);\n\
+         let pm = new_property_map(\"example.beam\");\n\
+         pm.set(\"width\", 450.0);\n\
+         print(s.rebuild_geometry(e, \"example.beam.rect\", pm));\n\
+         print(s.delete_element(e));\n\
+         let els = s.list_elements();\n\
+         if els.len() != 0 { throw(\"删除后元素清单应为空：\" + els.len()); }\n\
+         let sheets = s.list_sheets();\n\
+         if sheets.len() != 1 { throw(\"图纸应保留 1 张：\" + sheets.len()); }\n\
+         if s.can_undo() == false { throw(\"删除后应可撤销\"); }\n",
+    )
+    .unwrap_or_else(|e| panic!("写脚本失败：{e}"));
+
+    let (code, stdout, stderr) = run_server(&["script", "--path", &script.display().to_string()]);
+    assert_eq!(code, 0, "应成功。stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("removed: "),
+        "应输出移除的视图 id：{stdout}"
+    );
+    assert!(stdout.contains("已重建"), "应输出重建报告：{stdout}");
+    assert!(stdout.contains("已删元素"), "应输出删除报告：{stdout}");
+
+    let _ = std::fs::remove_file(&script);
+}
+
+/// 探针 5（G6-M11）：清单 + 属性更新 + 视图重投——list_elements 的 Map
+/// 数组访问（el.name / el.visible）/ update_element_properties（float 与
+/// string 两种路由）/ regenerate_view 全链。
+#[test]
+fn script_lists_and_updates_properties() {
+    let script = temp_path("list", "rhai");
+    std::fs::write(
+        &script,
+        "let s = new_session();\n\
+         let e = s.create_element(\"BEAM\", \"脚本梁\");\n\
+         s.build_geometry(e, \"example.beam.rect\");\n\
+         let v = s.create_view(\"俯视\");\n\
+         let pm = new_property_map(\"example.beam\");\n\
+         pm.set(\"width\", 500.0);\n\
+         pm.set(\"material\", \"C50\");\n\
+         s.update_element_properties(e, pm);\n\
+         let els = s.list_elements();\n\
+         if els.len() != 1 { throw(\"元素清单应为 1：\" + els.len()); }\n\
+         print(\"name: \" + els[0].name);\n\
+         print(\"visible: \" + els[0].visible);\n\
+         print(s.regenerate_view(v));\n\
+         print(\"undo_depth: \" + s.undo_depth());\n",
+    )
+    .unwrap_or_else(|e| panic!("写脚本失败：{e}"));
+
+    let (code, stdout, stderr) = run_server(&["script", "--path", &script.display().to_string()]);
+    assert_eq!(code, 0, "应成功。stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("name: 脚本梁"), "清单应含构件名：{stdout}");
+    assert!(stdout.contains("visible: true"), "默认可见：{stdout}");
+    assert!(stdout.contains("重投"), "应输出重投报告：{stdout}");
+
+    let _ = std::fs::remove_file(&script);
 }

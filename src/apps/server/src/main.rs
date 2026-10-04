@@ -31,13 +31,18 @@
 //! 暴露 CoreSession **会话态门面**（多步工作流：建会话 → 造构件 → 建几何 →
 //! 建视图/图纸 → 布置 → 保存/导出 → 撤销/重做）——端点清单见 [`crate::http`] 模块文档。
 //!
-//! ## rhai 脚本引擎（G6-M9，外部调用形态第三期）
+//! ## rhai 脚本引擎（G6-M9 第三期 + G6-M11 门面补全）
 //!
 //! `bim-server script --path build.rhai` 执行 rhai 脚本——脚本直接驱动
 //! CoreSession（`new_session()` / `open_session(path)` 返回会话对象，
 //! 方法调用建模式：`s.create_element(...)` / `s.build_geometry(...)` /
-//! `s.save(...)`）。函数清单与错误语义见 [`crate::script`] 模块文档——
-//! 外部调用形态三期全落地：CLI（一次性批处理）+ HTTP（常驻 REST）+ rhai（脚本编排）。
+//! `s.save(...)`）。G6-M11 门面补全到 **31 函数**：删改流
+//! （delete_element / update_element_properties / rebuild_geometry）、出图
+//! （remove_placement / remove_sheet / regenerate_view）、清单查询
+//! （list_elements / list_views / list_sheets / list_schemas，rhai Map 数组）、
+//! 历史状态（can_undo / undo_depth 等）。函数清单与错误语义见
+//! [`crate::script`] 模块文档——外部调用形态三期全落地：CLI（一次性批处理）
+//! + HTTP（常驻 REST）+ rhai（脚本编排）。
 
 use std::path::PathBuf;
 use std::process::ExitCode;

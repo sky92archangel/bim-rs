@@ -94,7 +94,7 @@ use glam::DVec3;
 
 use cable_tunnel::{
     CATEGORY as TUNNEL_CATEGORY, CableTunnel, GEOMETRY_OP_ID_DUCTBANK as OP_TUNNEL_DUCTBANK,
-    GEOMETRY_OP_ID_RECT as OP_TUNNEL_RECT,
+    GEOMETRY_OP_ID_RECT as OP_TUNNEL_RECT, GEOMETRY_OP_ID_TWIN as OP_TUNNEL_TWIN,
 };
 use core_app::CoreSession;
 use core_doc::{
@@ -105,11 +105,11 @@ use core_model::{ElementId, FieldDef, FieldType, PropertyMap, ShapeId, SheetId, 
 use core_sdk::{BuildOp, Module, ParamDef, ParamDefault, ParamKind};
 use example_beam::{
     CATEGORY as BEAM_CATEGORY, ExampleBeam, GEOMETRY_OP_ID as OP_BEAM_RECT,
-    GEOMETRY_OP_ID_HOLE as OP_BEAM_HOLE,
+    GEOMETRY_OP_ID_HOLE as OP_BEAM_HOLE, GEOMETRY_OP_ID_TEE as OP_BEAM_TEE,
 };
 use hvac_duct::{
-    CATEGORY as DUCT_CATEGORY, GEOMETRY_OP_ID_RECT as OP_DUCT_RECT,
-    GEOMETRY_OP_ID_TRANSITION as OP_DUCT_TRANSITION, HvacDuct,
+    CATEGORY as DUCT_CATEGORY, GEOMETRY_OP_ID_ELBOW as OP_DUCT_ELBOW,
+    GEOMETRY_OP_ID_RECT as OP_DUCT_RECT, GEOMETRY_OP_ID_TRANSITION as OP_DUCT_TRANSITION, HvacDuct,
 };
 
 use crate::sketch_editor::SketchEntry;
@@ -263,7 +263,8 @@ struct OpButton {
     label: &'static str,
 }
 
-/// 六条算子按钮：三个模块 × 各自可用算子（mock 腿不支持的算子点击后日志响亮报错）。
+/// 九条算子按钮：三个模块 × 各自算子（G6-M12 起 6→9；mock 腿不支持的算子
+/// 点击后日志响亮报错）。
 fn op_buttons() -> Vec<OpButton> {
     vec![
         OpButton {
@@ -277,6 +278,11 @@ fn op_buttons() -> Vec<OpButton> {
             label: "梁·圆孔板",
         },
         OpButton {
+            category: BEAM_CATEGORY,
+            op_id: OP_BEAM_TEE,
+            label: "梁·T 形截面（Extrude）",
+        },
+        OpButton {
             category: DUCT_CATEGORY,
             op_id: OP_DUCT_RECT,
             label: "风管·矩形段",
@@ -287,6 +293,11 @@ fn op_buttons() -> Vec<OpButton> {
             label: "风管·变径管（Loft）",
         },
         OpButton {
+            category: DUCT_CATEGORY,
+            op_id: OP_DUCT_ELBOW,
+            label: "风管·90°弯头（Pipe）",
+        },
+        OpButton {
             category: TUNNEL_CATEGORY,
             op_id: OP_TUNNEL_RECT,
             label: "隧道段·矩形",
@@ -295,6 +306,11 @@ fn op_buttons() -> Vec<OpButton> {
             category: TUNNEL_CATEGORY,
             op_id: OP_TUNNEL_DUCTBANK,
             label: "排管段·线束（Pipe）",
+        },
+        OpButton {
+            category: TUNNEL_CATEGORY,
+            op_id: OP_TUNNEL_TWIN,
+            label: "隧道段·双仓（Fuse）",
         },
     ]
 }
@@ -1564,8 +1580,8 @@ impl BimApp {
         ui.separator();
     }
 
-    /// 模块配方面板（计划 §5.1：六条配方按钮——mock 腿不支持的算子点击后
-    /// 日志响亮报错）。
+    /// 模块配方面板（计划 §5.1：G6-M12 起九条配方按钮——mock 腿不支持的
+    /// 算子点击后日志响亮报错）。
     fn ribbon_recipes(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
         ui.vertical(|ui| {

@@ -21,7 +21,7 @@
 //! | 品类 | `BEAM`（混凝土梁） |
 //! | 属性模式 | 宽 / 高 / 长 / 强度等级 |
 //! | 元素工厂 | [`BeamFactory`]（只造语义元素，不建几何） |
-//! | 几何算子 | [`BeamGeometryOp`]（长方体 + 平移配方）、[`BeamHoleOp`]（毛坯 → 圆柱 → Cut → 平移配方，M7b） |
+//! | 几何算子 | [`BeamGeometryOp`]（长方体 + 平移配方）、[`BeamHoleOp`]（毛坯 → 圆柱 → Cut → 平移配方，M7b）、[`BeamTeeOp`]（T 形截面拉伸配方，G6-M12） |
 //! | 标注规则 | [`BeamLengthRule`]（线性尺寸，0 位小数） |
 //! | 专业图层 | `BEAM-梁` / `BEAM-钢筋` |
 
@@ -45,6 +45,9 @@ pub const GEOMETRY_OP_ID: &str = "example.beam.rect";
 /// 开孔梁几何算子 id（M7b：模块从 SDK 增量生长的第二算子）。
 pub const GEOMETRY_OP_ID_HOLE: &str = "example.beam.hole";
 
+/// T 形梁几何算子 id（G6-M12：模块从 SDK 增量生长的第三算子）。
+pub const GEOMETRY_OP_ID_TEE: &str = "example.beam.tee";
+
 /// 标注规则 id。
 pub const ANNOTATION_RULE_ID: &str = "example.beam.length";
 
@@ -58,6 +61,12 @@ pub const DEFAULT_LENGTH_MM: f64 = 6000.0;
 pub const DEFAULT_HOLE_RADIUS_MM: f64 = 50.0;
 /// 默认孔长（mm，圆柱刀具的高）。
 pub const DEFAULT_HOLE_LENGTH_MM: f64 = 200.0;
+/// 默认翼缘宽（mm）。
+pub const DEFAULT_FLANGE_WIDTH_MM: f64 = 400.0;
+/// 默认翼缘厚（mm）。
+pub const DEFAULT_FLANGE_THICKNESS_MM: f64 = 100.0;
+/// 默认腹板厚（mm）。
+pub const DEFAULT_WEB_THICKNESS_MM: f64 = 200.0;
 
 // =============================================================================
 // 属性模式
@@ -276,6 +285,111 @@ impl GeometryOp for BeamHoleOp {
     }
 }
 
+/// T 形截面梁的几何算子（G6-M12：example.beam.tee）。
+///
+/// 它返回的是**十一步行之有效的配方**（`MakeLineEdge×8` → `MakeWire`（T 截面）
+/// → `Extrude` → `Translate`），不是内核调用。执行配方的是 `core-app`（模块
+/// 看不到内核）。
+///
+/// 与 [`BeamGeometryOp`] 的差异：截面不是矩形而是 **T 形**——T 截面由 8 条直边
+/// 组成（翼缘宽 `flange_width` / 翼缘厚 `flange_thickness` / 腹板厚
+/// `web_thickness` / 总高 `height`），在 x=0 平面内逆时针闭合，`Extrude`
+/// （拉伸）沿 +X 拉伸 `length`。这是配方世界首个用 **`Extrude`** 的模块算子
+/// ——此前没有任何模块用过它。注意 T 截面**必须真 T**：腹板须窄于翼缘
+/// （`web_thickness < flange_width`）、翼缘须薄于总高（`flange_thickness <
+/// height`），否则截面退化成矩形，响亮拒绝（BadParameter）。
+pub struct BeamTeeOp;
+
+impl GeometryOp for BeamTeeOp {
+    fn id(&self) -> &str {
+        GEOMETRY_OP_ID_TEE
+    }
+
+    fn display_name(&self) -> &str {
+        "T 形截面梁"
+    }
+
+    fn description(&self) -> &str {
+        "由 T 形截面沿梁长方向拉伸成体，再按定位点放置"
+    }
+
+    fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
+        let flange_width = input.f64_or("flange_width", DEFAULT_FLANGE_WIDTH_MM);
+        let flange_thickness = input.f64_or("flange_thickness", DEFAULT_FLANGE_THICKNESS_MM);
+        let web_thickness = input.f64_or("web_thickness", DEFAULT_WEB_THICKNESS_MM);
+        let height = input.f64_or("height", DEFAULT_HEIGHT_MM);
+        let length = input.f64_or("length", DEFAULT_LENGTH_MM);
+
+        if flange_width <= 0.0
+            || flange_thickness <= 0.0
+            || web_thickness <= 0.0
+            || height <= 0.0
+            || length <= 0.0
+        {
+            return Err(SdkError::BadParameter(
+                "梁的翼缘宽/厚、腹板厚、梁高与梁长必须为正数（单位 mm）".to_string(),
+            ));
+        }
+        if web_thickness >= flange_width {
+            return Err(SdkError::BadParameter(
+                "腹板厚必须小于翼缘宽（否则截面退化为矩形，不是 T 形）".to_string(),
+            ));
+        }
+        if flange_thickness >= height {
+            return Err(SdkError::BadParameter(
+                "翼缘厚必须小于梁高（否则腹板高度为零，不是 T 形）".to_string(),
+            ));
+        }
+
+        let [x, y, z] = input.anchor;
+        let section_edge = |(by, bz): (f64, f64), (ey, ez): (f64, f64)| {
+            BuildStep::new(BuildOp::MakeLineEdge)
+                .with_f64("x1", 0.0)
+                .with_f64("y1", by)
+                .with_f64("z1", bz)
+                .with_f64("x2", 0.0)
+                .with_f64("y2", ey)
+                .with_f64("z2", ez)
+        };
+
+        // T 截面（x=0 平面，腹板居中 y=0、底 z=0，逆时针闭合）。
+        let (bf, hf, tw, h) = (flange_width, flange_thickness, web_thickness, height);
+        let e0 = section_edge((-bf / 2.0, 0.0), (bf / 2.0, 0.0)).with_note("翼缘底边");
+        let e1 = section_edge((bf / 2.0, 0.0), (bf / 2.0, hf)).with_note("翼缘右边");
+        let e2 = section_edge((bf / 2.0, hf), (tw / 2.0, hf)).with_note("翼缘顶右段");
+        let e3 = section_edge((tw / 2.0, hf), (tw / 2.0, h)).with_note("腹板右边");
+        let e4 = section_edge((tw / 2.0, h), (-tw / 2.0, h)).with_note("腹板顶边");
+        let e5 = section_edge((-tw / 2.0, h), (-tw / 2.0, hf)).with_note("腹板左边");
+        let e6 = section_edge((-tw / 2.0, hf), (-bf / 2.0, hf)).with_note("翼缘顶左段");
+        let e7 = section_edge((-bf / 2.0, hf), (-bf / 2.0, 0.0)).with_note("翼缘闭合边");
+        let profile = BuildStep::new(BuildOp::MakeWire)
+            .from_steps(vec![0, 1, 2, 3, 4, 5, 6, 7])
+            .with_note("T 形截面 wire");
+
+        // 沿 +X 拉伸梁长，再按定位点放置。
+        let extruded = BuildStep::new(BuildOp::Extrude)
+            .from_steps(vec![8])
+            .with_f64("dx", length)
+            .with_f64("dy", 0.0)
+            .with_f64("dz", 0.0)
+            .with_note("沿梁长方向拉伸");
+        let placed = BuildStep::new(BuildOp::Translate)
+            .from_steps(vec![9])
+            .with_f64("x", x)
+            .with_f64("y", y)
+            .with_f64("z", z)
+            .with_note("按定位点放置");
+
+        let mut out = OpOutput::of(vec![
+            e0, e1, e2, e3, e4, e5, e6, e7, profile, extruded, placed,
+        ]);
+        if length > 12_000.0 {
+            out = out.with_warning("梁长超过 12m，请确认是否需要设置施工缝或后浇带");
+        }
+        Ok(out)
+    }
+}
+
 // =============================================================================
 // 标注规则
 // =============================================================================
@@ -344,6 +458,7 @@ impl Module for ExampleBeam {
         registry.register_factory(Box::new(BeamFactory))?;
         registry.register_geometry_op(Box::new(BeamGeometryOp))?;
         registry.register_geometry_op(Box::new(BeamHoleOp))?;
+        registry.register_geometry_op(Box::new(BeamTeeOp))?;
         registry.register_annotation_rule(Box::new(BeamLengthRule))?;
         for layer in beam_layers() {
             registry.register_layer(layer)?;
@@ -372,6 +487,9 @@ impl Module for ExampleBeam {
         }
         if registry.geometry_op(GEOMETRY_OP_ID_HOLE).is_none() {
             missing.push(format!("几何算子 {GEOMETRY_OP_ID_HOLE}"));
+        }
+        if registry.geometry_op(GEOMETRY_OP_ID_TEE).is_none() {
+            missing.push(format!("几何算子 {GEOMETRY_OP_ID_TEE}"));
         }
         if !registry.annotation_rule_ids().contains(&ANNOTATION_RULE_ID) {
             missing.push(format!("标注规则 {ANNOTATION_RULE_ID}"));
@@ -422,7 +540,8 @@ mod tests {
         assert_eq!(s.factories, 1);
         // M7b 起模块注册 2 个几何算子（BeamGeometryOp + BeamHoleOp）——
         // 与注册行为同步的期望值更新（非弱化：断言仍逐桶精确匹配）。
-        assert_eq!(s.geometry_ops, 2);
+        // G6-M12 起注册 3 个（+ BeamTeeOp）。
+        assert_eq!(s.geometry_ops, 3);
         assert_eq!(s.annotation_rules, 1);
         assert_eq!(s.layers, 2);
     }
@@ -602,6 +721,112 @@ mod tests {
         )
         .at([10.0, 20.0, 30.0]);
         let out = BeamHoleOp.apply(&input).unwrap();
+
+        let text = serde_json::to_string(&out).expect("配方应可序列化");
+        let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");
+        assert_eq!(back, out, "JSON 往返后配方应逐字段相等");
+    }
+
+    // ---------- G6-M12-1：BeamTeeOp 第三算子（example.beam.tee，Extrude）----------
+
+    #[test]
+    fn tee_op_emits_an_eleven_step_recipe() {
+        let input = OpInput::new(
+            PropertyMap::new(CATEGORY)
+                .with("flange_width", Value::Float(500.0))
+                .with("length", Value::Float(9000.0)),
+        )
+        .at([1000.0, 0.0, 3000.0]);
+        let out = BeamTeeOp.apply(&input).unwrap();
+
+        // 11 步：MakeLineEdge×8 → MakeWire(T 截面) → Extrude → Translate
+        assert_eq!(out.step_count(), 11);
+        for i in 0..8 {
+            assert_eq!(out.steps[i].op, BuildOp::MakeLineEdge, "第 {i} 步应为直边");
+        }
+        assert_eq!(out.steps[8].op, BuildOp::MakeWire, "T 形截面 wire");
+        assert_eq!(out.steps[9].op, BuildOp::Extrude);
+        assert_eq!(out.steps[10].op, BuildOp::Translate);
+
+        // MakeWire 吃 8 条边（T 截面闭合）；Extrude 沿 +X 拉伸梁长；Translate 吃拉伸结果。
+        assert_eq!(out.steps[8].inputs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(out.steps[9].inputs, vec![8]);
+        assert_eq!(out.steps[9].arg_f64("dx"), Some(9000.0));
+        assert_eq!(out.steps[9].arg_f64("dy"), Some(0.0));
+        assert_eq!(out.steps[9].arg_f64("dz"), Some(0.0));
+        assert_eq!(out.steps[10].inputs, vec![9]);
+        assert_eq!(out.steps[10].arg_f64("x"), Some(1000.0));
+
+        // 缺省沿用常量体系 + G6-M12 新常量（截面在 y=0 居中、z=0 起）。
+        assert_eq!(out.steps[0].arg_f64("y1"), Some(-250.0)); // -flange_width/2
+        assert_eq!(out.steps[0].arg_f64("z1"), Some(0.0));
+        assert_eq!(out.steps[1].arg_f64("y2"), Some(250.0)); // +flange_width/2
+        assert_eq!(out.steps[1].arg_f64("z2"), Some(100.0)); // 翼缘厚
+        assert_eq!(out.steps[3].arg_f64("y1"), Some(100.0)); // +web_thickness/2
+        assert_eq!(out.steps[4].arg_f64("z1"), Some(600.0)); // 默认梁高
+
+        assert!(out.is_well_ordered());
+        for step in &out.steps {
+            assert!(step.validate_arity().is_ok());
+        }
+    }
+
+    #[test]
+    fn tee_op_rejects_degenerate_and_non_positive_parameters() {
+        // 退化 T（腹板 ≥ 翼缘宽 / 翼缘厚 ≥ 梁高）必须响亮拒绝——否则截面是矩形。
+        for (key, value) in [
+            ("web_thickness", 400.0),    // == flange_width（默认）→ 矩形
+            ("web_thickness", 500.0),    // > flange_width
+            ("flange_thickness", 600.0), // == height（默认）→ 零腹板
+            ("flange_thickness", 700.0), // > height
+        ] {
+            let input = OpInput::new(PropertyMap::new(CATEGORY).with(key, Value::Float(value)));
+            assert!(
+                matches!(BeamTeeOp.apply(&input), Err(SdkError::BadParameter(_))),
+                "退化参数 {key}={value} 必须被响亮拒绝（BadParameter）"
+            );
+        }
+        // 非正数沿用同款拒绝。
+        for (key, value) in [
+            ("flange_width", 0.0),
+            ("flange_thickness", -100.0),
+            ("web_thickness", 0.0),
+            ("height", 0.0),
+            ("length", -6000.0),
+        ] {
+            let input = OpInput::new(PropertyMap::new(CATEGORY).with(key, Value::Float(value)));
+            assert!(
+                matches!(BeamTeeOp.apply(&input), Err(SdkError::BadParameter(_))),
+                "参数 {key}={value} 必须被响亮拒绝（BadParameter）"
+            );
+        }
+    }
+
+    #[test]
+    fn tee_op_honours_user_parameters() {
+        let input = OpInput::new(
+            PropertyMap::new(CATEGORY)
+                .with("flange_width", Value::Float(600.0))
+                .with("flange_thickness", Value::Float(120.0))
+                .with("web_thickness", Value::Float(250.0))
+                .with("height", Value::Float(800.0)),
+        );
+        let out = BeamTeeOp.apply(&input).unwrap();
+        assert_eq!(out.steps[0].arg_f64("y1"), Some(-300.0)); // -flange_width/2
+        assert_eq!(out.steps[1].arg_f64("z2"), Some(120.0)); // 翼缘厚
+        assert_eq!(out.steps[3].arg_f64("y1"), Some(125.0)); // +web_thickness/2
+        assert_eq!(out.steps[4].arg_f64("z1"), Some(800.0)); // 梁高
+    }
+
+    #[test]
+    fn tee_op_recipe_roundtrips_through_json() {
+        let input = OpInput::new(
+            PropertyMap::new(CATEGORY)
+                .with("flange_width", Value::Float(500.0))
+                .with("length", Value::Float(9000.0)),
+        )
+        .at([10.0, 20.0, 30.0]);
+        let out = BeamTeeOp.apply(&input).unwrap();
 
         let text = serde_json::to_string(&out).expect("配方应可序列化");
         let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");

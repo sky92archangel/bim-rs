@@ -20,7 +20,7 @@
 //! | 品类 | `CABLE_TUNNEL`（电缆隧道） |
 //! | 属性模式 | 净宽 / 净高 / 延米长度 / 覆土深度 / 衬砌厚度 |
 //! | 元素工厂 | [`TunnelFactory`]（只造语义元素，不建几何） |
-//! | 几何算子 | [`TunnelRectOp`]（毛坯 → 圆柱 → Cut → 平移配方）、[`TunnelDuctbankOp`]（矩形断面沿脊线 Pipe 配方） |
+//! | 几何算子 | [`TunnelRectOp`]（毛坯 → 圆柱 → Cut → 平移配方）、[`TunnelDuctbankOp`]（矩形断面沿脊线 Pipe 配方）、[`TunnelTwinOp`]（双仓：两毛坯 → Fuse → 平移配方，G6-M12） |
 //! | 标注规则 | [`TunnelClearWidthRule`]（线性尺寸，0 位小数） |
 //! | 专业图层 | `TUNNEL-隧道` / `TUNNEL-电缆支架` |
 //!
@@ -54,6 +54,9 @@ pub const GEOMETRY_OP_ID_RECT: &str = "power.tunnel.rect";
 /// 电缆排管段几何算子 id。
 pub const GEOMETRY_OP_ID_DUCTBANK: &str = "power.tunnel.ductbank";
 
+/// 双仓隧道段几何算子 id（G6-M12：第三个算子）。
+pub const GEOMETRY_OP_ID_TWIN: &str = "power.tunnel.twin";
+
 /// 标注规则 id。
 pub const ANNOTATION_RULE_ID: &str = "power.tunnel.clear_width";
 
@@ -71,6 +74,8 @@ pub const DEFAULT_LINING_THICKNESS_MM: f64 = 250.0;
 pub const DEFAULT_DUCT_RADIUS_MM: f64 = 75.0;
 /// 默认排管孔深（mm，圆柱刀具的高）。
 pub const DEFAULT_DUCT_LENGTH_MM: f64 = 300.0;
+/// 默认中隔墙厚（mm）。
+pub const DEFAULT_WALL_THICKNESS_MM: f64 = 300.0;
 
 /// 净宽警告阈值（mm）：超过即提示确认断面分孔布置（承接遗留 #6 的可观测警告）。
 pub const CLEAR_WIDTH_WARN_LIMIT_MM: f64 = 3000.0;
@@ -351,6 +356,84 @@ impl GeometryOp for TunnelDuctbankOp {
     }
 }
 
+/// 双仓隧道段的几何算子（power.tunnel.twin，G6-M12：第三个算子）。
+///
+/// 它返回的是**五步行之有效的配方**：
+///
+/// ```text
+/// MakeBox(左仓) → MakeBox(右仓) → Translate(右仓让位) → Fuse → Translate(定位)
+/// ```
+///
+/// 两仓都是净断面毛坯（`MakeBox`，dx=净宽、dy=净高、dz=延米）；右仓沿 +X
+/// 让位 `净宽 + 中隔墙厚`（`Translate`）；`Fuse`（布尔并）把两仓并成**双仓
+/// 断面**——这是配方世界首个用 **`Fuse`** 的模块算子，也正是 [`TunnelRectOp`]
+/// 超宽警告（"请确认断面分孔布置或采用双仓断面"）给出的对策。两仓不相接
+/// （中隔墙厚 > 0），并集是两个不相连实体的复合体。
+///
+/// **不新增任何 args key**：`MakeBox` 用 `dx/dy/dz`，`Translate` 用 `x/y/z`，
+/// `Fuse` 无 args——全部是设计文档 §5.1 权威 key（铁律 5）。
+pub struct TunnelTwinOp;
+
+impl GeometryOp for TunnelTwinOp {
+    fn id(&self) -> &str {
+        GEOMETRY_OP_ID_TWIN
+    }
+
+    fn display_name(&self) -> &str {
+        "双仓隧道段"
+    }
+
+    fn description(&self) -> &str {
+        "由 两个单仓毛坯沿 +X 并排（中隔墙厚让位）布尔并成双仓断面，再按定位点放置"
+    }
+
+    fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
+        let width = input.f64_or("clear_width", DEFAULT_CLEAR_WIDTH_MM);
+        let height = input.f64_or("clear_height", DEFAULT_CLEAR_HEIGHT_MM);
+        let length = input.f64_or("length", DEFAULT_LENGTH_MM);
+        let wall = input.f64_or("wall_thickness", DEFAULT_WALL_THICKNESS_MM);
+
+        if width <= 0.0 || height <= 0.0 || length <= 0.0 || wall <= 0.0 {
+            return Err(SdkError::BadParameter(
+                "隧道的净宽/净高/延米与中隔墙厚必须为正数（单位 mm）".to_string(),
+            ));
+        }
+
+        let [x, y, z] = input.anchor;
+        let left = BuildStep::new(BuildOp::MakeBox)
+            .with_f64("dx", width)
+            .with_f64("dy", height)
+            .with_f64("dz", length)
+            .with_note("左仓毛坯");
+        let right = BuildStep::new(BuildOp::MakeBox)
+            .with_f64("dx", width)
+            .with_f64("dy", height)
+            .with_f64("dz", length)
+            .with_note("右仓毛坯");
+        let shifted = BuildStep::new(BuildOp::Translate)
+            .from_steps(vec![1])
+            .with_f64("x", width + wall)
+            .with_f64("y", 0.0)
+            .with_f64("z", 0.0)
+            .with_note("右仓沿 +X 让位（中隔墙厚）");
+        let fused = BuildStep::new(BuildOp::Fuse)
+            .from_steps(vec![0, 2])
+            .with_note("并成双仓断面");
+        let placed = BuildStep::new(BuildOp::Translate)
+            .from_steps(vec![3])
+            .with_f64("x", x)
+            .with_f64("y", y)
+            .with_f64("z", z)
+            .with_note("按定位点放置");
+
+        let mut out = OpOutput::of(vec![left, right, shifted, fused, placed]);
+        if width > CLEAR_WIDTH_WARN_LIMIT_MM {
+            out = out.with_warning("单仓净宽超过 3m，双仓断面的单仓宜控制在 3m 以内");
+        }
+        Ok(out)
+    }
+}
+
 // =============================================================================
 // 标注规则
 // =============================================================================
@@ -419,6 +502,7 @@ impl Module for CableTunnel {
         registry.register_factory(Box::new(TunnelFactory))?;
         registry.register_geometry_op(Box::new(TunnelRectOp))?;
         registry.register_geometry_op(Box::new(TunnelDuctbankOp))?;
+        registry.register_geometry_op(Box::new(TunnelTwinOp))?;
         registry.register_annotation_rule(Box::new(TunnelClearWidthRule))?;
         for layer in tunnel_layers() {
             registry.register_layer(layer)?;
@@ -447,6 +531,9 @@ impl Module for CableTunnel {
         }
         if registry.geometry_op(GEOMETRY_OP_ID_DUCTBANK).is_none() {
             missing.push(format!("几何算子 {GEOMETRY_OP_ID_DUCTBANK}"));
+        }
+        if registry.geometry_op(GEOMETRY_OP_ID_TWIN).is_none() {
+            missing.push(format!("几何算子 {GEOMETRY_OP_ID_TWIN}"));
         }
         if !registry.annotation_rule_ids().contains(&ANNOTATION_RULE_ID) {
             missing.push(format!("标注规则 {ANNOTATION_RULE_ID}"));
@@ -533,7 +620,7 @@ mod tests {
         assert_eq!(s.categories, 1);
         assert_eq!(s.schemas, 1);
         assert_eq!(s.factories, 1);
-        assert_eq!(s.geometry_ops, 2, "rect + ductbank 两个几何算子");
+        assert_eq!(s.geometry_ops, 3, "rect + ductbank + twin 三个几何算子");
         assert_eq!(s.annotation_rules, 1);
         assert_eq!(s.layers, 2);
     }
@@ -741,6 +828,92 @@ mod tests {
         // 脊线：anchor → anchor + 9000 沿 x
         assert_eq!(out.steps[5].arg_f64("x1"), Some(100.0));
         assert_eq!(out.steps[5].arg_f64("x2"), Some(9100.0));
+    }
+
+    // ---------- tunnel.twin：Fuse 双仓配方（G6-M12）----------
+
+    #[test]
+    fn twin_op_emits_a_five_step_recipe() {
+        let input = OpInput::new(
+            PropertyMap::new(CATEGORY)
+                .with("clear_width", Value::Float(2000.0))
+                .with("wall_thickness", Value::Float(300.0)),
+        )
+        .at([1000.0, 0.0, 3000.0]);
+        let out = TunnelTwinOp.apply(&input).unwrap();
+
+        // 5 步：MakeBox(左) → MakeBox(右) → Translate(让位) → Fuse → Translate(定位)
+        assert_eq!(out.step_count(), 5);
+        assert_eq!(out.steps[0].op, BuildOp::MakeBox);
+        assert_eq!(out.steps[1].op, BuildOp::MakeBox);
+        assert_eq!(out.steps[2].op, BuildOp::Translate);
+        assert_eq!(out.steps[3].op, BuildOp::Fuse);
+        assert_eq!(out.steps[4].op, BuildOp::Translate);
+
+        // 右仓沿 +X 让位 净宽 + 中隔墙厚 = 2300；Fuse 吃 [左仓, 让位后的右仓]；
+        // 定位 Translate 吃 Fuse 结果。
+        assert_eq!(out.steps[2].inputs, vec![1]);
+        assert_eq!(out.steps[2].arg_f64("x"), Some(2300.0));
+        assert_eq!(out.steps[3].inputs, vec![0, 2]);
+        assert_eq!(out.steps[4].inputs, vec![3]);
+        assert_eq!(out.steps[4].arg_f64("x"), Some(1000.0));
+        assert_eq!(out.steps[4].arg_f64("z"), Some(3000.0));
+
+        // 「可用」尺子（静态侧）：inputs 只引用前序步骤、args 只用 §5.1 权威 key。
+        assert!(out.is_well_ordered());
+        for (i, step) in out.steps.iter().enumerate() {
+            assert!(step.validate_arity().is_ok(), "第 {i} 步元数应合法");
+            for key in step.args.keys() {
+                assert!(
+                    AUTHORITATIVE_KEYS.contains(&key.as_str()),
+                    "第 {i} 步参数 key `{key}` 不在设计文档 §5.1 权威集内"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn twin_op_rejects_non_positive_parameters() {
+        for (key, value) in [
+            ("clear_width", 0.0),
+            ("clear_height", -2100.0),
+            ("length", 0.0),
+            ("wall_thickness", -300.0),
+        ] {
+            let input = OpInput::new(PropertyMap::new(CATEGORY).with(key, Value::Float(value)));
+            assert!(
+                matches!(TunnelTwinOp.apply(&input), Err(SdkError::BadParameter(_))),
+                "参数 {key}={value} 必须被响亮拒绝（BadParameter）"
+            );
+        }
+    }
+
+    #[test]
+    fn twin_op_warns_when_single_cell_exceeds_3m() {
+        // 单仓净宽超 3m：双仓正是 rect 算子超宽警告的对策，但单仓自身超限仍要提示。
+        let wide =
+            OpInput::new(PropertyMap::new(CATEGORY).with("clear_width", Value::Float(3600.0)));
+        let out = TunnelTwinOp.apply(&wide).unwrap();
+        assert_eq!(out.step_count(), 5);
+        assert_eq!(out.warnings.len(), 1, "单仓净宽超过 3m 必须落 1 条警告");
+        assert!(out.is_well_ordered(), "警告不阻断，配方仍应合法");
+
+        // 常规宽（默认 2000）：无警告。
+        let normal = OpInput::new(PropertyMap::new(CATEGORY));
+        let out = TunnelTwinOp.apply(&normal).unwrap();
+        assert!(out.warnings.is_empty(), "常规单仓净宽不应产生警告");
+    }
+
+    #[test]
+    fn twin_op_recipe_roundtrips_through_json() {
+        let input =
+            OpInput::new(PropertyMap::new(CATEGORY).with("wall_thickness", Value::Float(250.0)))
+                .at([10.0, 20.0, 30.0]);
+        let out = TunnelTwinOp.apply(&input).unwrap();
+
+        let text = serde_json::to_string(&out).expect("配方应可序列化");
+        let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");
+        assert_eq!(back, out, "JSON 往返后配方应逐字段相等");
     }
 
     // ---------- 标注 / 图层 / 边界 ----------

@@ -30,7 +30,7 @@
 //! | 品类 | `HVAC_DUCT`（暖通风管） |
 //! | 属性模式 | 风管宽 / 风管高 / 延米长度 / 材质 |
 //! | 元素工厂 | [`DuctFactory`]（只造语义元素，不建几何） |
-//! | 几何算子 | [`DuctRectOp`]（矩形风管段：`MakeBox` → `Translate` 配方）、[`DuctTransitionOp`]（变径管：两截面 wire → `Loft` 配方） |
+//! | 几何算子 | [`DuctRectOp`]（矩形风管段：`MakeBox` → `Translate` 配方）、[`DuctTransitionOp`]（变径管：两截面 wire → `Loft` 配方）、[`DuctElbowOp`]（90° 弯头：弧脊线 → `Pipe` 配方，G6-M12） |
 //! | 标注规则 | [`DuctWidthRule`]（线性尺寸，0 位小数） |
 //! | 专业图层 | `HVAC-风管` / `HVAC-附件` |
 //!
@@ -40,7 +40,10 @@
 //!   支持的算子），apps/desktop 的 `e2e_hvac.rs` 在**默认腿**走五环断言；
 //! - [`DuctTransitionOp`]：`MakeLineEdge×4 → MakeWire(起端) → MakeLineEdge×4 →
 //!   MakeWire(末端) → Loft`——`Loft` 为真实内核专属（占位后端响亮拒绝），
-//!   `e2e_hvac_occt.rs` 在 occt 腿走**真实 execute + 棱台体积精确 oracle**。
+//!   `e2e_hvac_occt.rs` 在 occt 腿走**真实 execute + 棱台体积精确 oracle**；
+//! - [`DuctElbowOp`]：`MakeArcEdge(弧脊线) → Pipe`——`Pipe` 同为真实内核专属
+//!   （同 Loft 模式），单测走**配方静态断言**（G6-M12：三点弧坐标 / Pipe
+//!   inputs 顺序 / 权威 key 对账）。
 //!
 //! 两者的配方坐标（截面角点 / 定位点）都在 [`GeometryOp::apply`] 时由参数计算，
 //! **不新增任何 args key**（铁律 5：key 权威来源 = 设计文档 §5.1）。
@@ -65,6 +68,9 @@ pub const GEOMETRY_OP_ID_RECT: &str = "hvac.duct.rect";
 /// 风管变径管几何算子 id。
 pub const GEOMETRY_OP_ID_TRANSITION: &str = "hvac.duct.transition";
 
+/// 风管 90° 弯头几何算子 id（G6-M12：第三个算子）。
+pub const GEOMETRY_OP_ID_ELBOW: &str = "hvac.duct.elbow";
+
 /// 标注规则 id。
 pub const ANNOTATION_RULE_ID: &str = "hvac.duct.width";
 
@@ -84,6 +90,8 @@ pub const DEFAULT_START_HEIGHT_MM: f64 = 320.0;
 pub const DEFAULT_END_WIDTH_MM: f64 = 800.0;
 /// 变径管默认末端高（mm）。
 pub const DEFAULT_END_HEIGHT_MM: f64 = 320.0;
+/// 弯头默认转弯半径（mm）。
+pub const DEFAULT_TURN_RADIUS_MM: f64 = 600.0;
 
 /// 风管宽警告阈值（mm）：超过即提示确认加固与分段（承接 cable-tunnel 的
 /// 可观测警告口径：超限**不阻断**，但用户要看得到）。
@@ -345,6 +353,102 @@ impl GeometryOp for DuctTransitionOp {
     }
 }
 
+/// 风管 90° 弯头的几何算子（hvac.duct.elbow，G6-M12：第三个算子）。
+///
+/// 它返回的是**八步行之有效的配方**：
+///
+/// ```text
+/// MakeLineEdge×4 → MakeWire(矩形断面) → MakeArcEdge(弧脊线) → MakeWire → Pipe
+/// ```
+///
+/// 断面是**矩形 wire**（`MakeLineEdge×4 + MakeWire`），在 x=0 平面**绕定位点
+/// 居中**（即脊线起端切向 +X 的法平面）；脊线是**三点弧**（`MakeArcEdge`，
+/// 起 (0,0,0) / 中 (R(1−1/√2), 0, R·1/√2) / 终 (R, 0, R)）——四分之一圆弧把
+/// 风管从 +X 方向转到 +Z 方向；`Pipe` 把断面沿弧脊线扫成弯头实体。
+///
+/// 转弯半径小于风管宽时落**配方警告**（不阻断，用户要看得到——弯头局部
+/// 阻力大，宜加大半径或加导流片）。
+///
+/// **不新增任何 args key**：`MakeLineEdge` 用 `x1/y1/z1/x2/y2/z2`，
+/// `MakeArcEdge` 用 `x1..z3` 九坐标键，`MakeWire` / `Pipe` 无 args——全部是
+/// 设计文档 §5.1 权威 key（铁律 5）。
+pub struct DuctElbowOp;
+
+impl GeometryOp for DuctElbowOp {
+    fn id(&self) -> &str {
+        GEOMETRY_OP_ID_ELBOW
+    }
+
+    fn display_name(&self) -> &str {
+        "风管 90° 弯头"
+    }
+
+    fn description(&self) -> &str {
+        "由 矩形断面沿四分之一圆弧脊线扫成 90° 弯头（Pipe），定位点为断面中心"
+    }
+
+    fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
+        let width = input.f64_or("width", DEFAULT_WIDTH_MM);
+        let height = input.f64_or("height", DEFAULT_HEIGHT_MM);
+        let turn_radius = input.f64_or("turn_radius", DEFAULT_TURN_RADIUS_MM);
+
+        if width <= 0.0 || height <= 0.0 || turn_radius <= 0.0 {
+            return Err(SdkError::BadParameter(
+                "弯头的宽/高/转弯半径必须为正数（单位 mm）".to_string(),
+            ));
+        }
+
+        // 断面（x=0 平面，绕定位点居中，逆时针闭合）。
+        let (hw, hh) = (width / 2.0, height / 2.0);
+        let section_edge = |(ay, az): (f64, f64), (by, bz): (f64, f64)| {
+            BuildStep::new(BuildOp::MakeLineEdge)
+                .with_f64("x1", 0.0)
+                .with_f64("y1", ay)
+                .with_f64("z1", az)
+                .with_f64("x2", 0.0)
+                .with_f64("y2", by)
+                .with_f64("z2", bz)
+        };
+        let s0 = section_edge((-hw, -hh), (hw, -hh)).with_note("断面底边");
+        let s1 = section_edge((hw, -hh), (hw, hh)).with_note("断面右边");
+        let s2 = section_edge((hw, hh), (-hw, hh)).with_note("断面顶边");
+        let s3 = section_edge((-hw, hh), (-hw, -hh)).with_note("断面闭合边");
+        let section_wire = BuildStep::new(BuildOp::MakeWire)
+            .from_steps(vec![0, 1, 2, 3])
+            .with_note("断面 wire");
+
+        // 弧脊线（三点式四分之一圆弧：起 → 45° 中点 → 终，从 +X 转到 +Z）。
+        let r = turn_radius;
+        let s45 = std::f64::consts::FRAC_1_SQRT_2;
+        let arc = BuildStep::new(BuildOp::MakeArcEdge)
+            .with_f64("x1", 0.0)
+            .with_f64("y1", 0.0)
+            .with_f64("z1", 0.0)
+            .with_f64("x2", r * (1.0 - s45))
+            .with_f64("y2", 0.0)
+            .with_f64("z2", r * s45)
+            .with_f64("x3", r)
+            .with_f64("y3", 0.0)
+            .with_f64("z3", r)
+            .with_note("四分之一圆弧脊线");
+        let spine_wire = BuildStep::new(BuildOp::MakeWire)
+            .from_steps(vec![5])
+            .with_note("脊线 wire");
+
+        // Pipe 的 inputs 顺序恒为 [profile, spine]（几何服务 Pipe 派发臂口径）。
+        let elbow = BuildStep::new(BuildOp::Pipe)
+            .from_steps(vec![4, 6])
+            .with_note("扫成 90° 弯头");
+
+        let mut out = OpOutput::of(vec![s0, s1, s2, s3, section_wire, arc, spine_wire, elbow]);
+        if turn_radius < width {
+            out =
+                out.with_warning("弯头转弯半径小于风管宽度，局部阻力较大，建议加大半径或加导流片");
+        }
+        Ok(out)
+    }
+}
+
 // =============================================================================
 // 标注规则
 // =============================================================================
@@ -413,6 +517,7 @@ impl Module for HvacDuct {
         registry.register_factory(Box::new(DuctFactory))?;
         registry.register_geometry_op(Box::new(DuctRectOp))?;
         registry.register_geometry_op(Box::new(DuctTransitionOp))?;
+        registry.register_geometry_op(Box::new(DuctElbowOp))?;
         registry.register_annotation_rule(Box::new(DuctWidthRule))?;
         for layer in duct_layers() {
             registry.register_layer(layer)?;
@@ -441,6 +546,9 @@ impl Module for HvacDuct {
         }
         if registry.geometry_op(GEOMETRY_OP_ID_TRANSITION).is_none() {
             missing.push(format!("几何算子 {GEOMETRY_OP_ID_TRANSITION}"));
+        }
+        if registry.geometry_op(GEOMETRY_OP_ID_ELBOW).is_none() {
+            missing.push(format!("几何算子 {GEOMETRY_OP_ID_ELBOW}"));
         }
         if !registry.annotation_rule_ids().contains(&ANNOTATION_RULE_ID) {
             missing.push(format!("标注规则 {ANNOTATION_RULE_ID}"));
@@ -526,7 +634,7 @@ mod tests {
         assert_eq!(s.categories, 1);
         assert_eq!(s.schemas, 1);
         assert_eq!(s.factories, 1);
-        assert_eq!(s.geometry_ops, 2, "rect + transition 两个几何算子");
+        assert_eq!(s.geometry_ops, 3, "rect + transition + elbow 三个几何算子");
         assert_eq!(s.annotation_rules, 1);
         assert_eq!(s.layers, 2);
     }
@@ -751,6 +859,103 @@ mod tests {
         )
         .at([10.0, 20.0, 30.0]);
         let out = DuctTransitionOp.apply(&input).unwrap();
+
+        let text = serde_json::to_string(&out).expect("配方应可序列化");
+        let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");
+        assert_eq!(back, out, "JSON 往返后配方应逐字段相等");
+    }
+
+    // ---------- duct.elbow：三点弧脊线 Pipe 配方（G6-M12）----------
+
+    #[test]
+    fn elbow_op_emits_an_eight_step_recipe() {
+        let input = OpInput::new(
+            PropertyMap::new(CATEGORY)
+                .with("width", Value::Float(1000.0))
+                .with("turn_radius", Value::Float(1200.0)),
+        )
+        .at([1000.0, 0.0, 3000.0]);
+        let out = DuctElbowOp.apply(&input).unwrap();
+
+        // 8 步：MakeLineEdge×4 → MakeWire(断面) → MakeArcEdge → MakeWire(脊线) → Pipe
+        assert_eq!(out.step_count(), 8);
+        for i in [0usize, 1, 2, 3] {
+            assert_eq!(out.steps[i].op, BuildOp::MakeLineEdge, "第 {i} 步应为直边");
+        }
+        assert_eq!(out.steps[4].op, BuildOp::MakeWire, "断面 wire");
+        assert_eq!(out.steps[5].op, BuildOp::MakeArcEdge, "弧脊线");
+        assert_eq!(out.steps[6].op, BuildOp::MakeWire, "脊线 wire");
+        assert_eq!(out.steps[7].op, BuildOp::Pipe);
+
+        // Pipe 的 inputs 顺序恒为 [profile, spine]；断面 wire 吃 4 条边；脊线 wire 吃弧。
+        assert_eq!(out.steps[7].inputs, vec![4, 6]);
+        assert_eq!(out.steps[6].inputs, vec![5]);
+        assert_eq!(out.steps[4].inputs, vec![0, 1, 2, 3]);
+
+        // 三点弧：起 (0,0,0) → 中 45° → 终 (R,0,R)（R = 1200）。
+        let s45 = std::f64::consts::FRAC_1_SQRT_2;
+        assert_eq!(out.steps[5].arg_f64("x1"), Some(0.0));
+        assert_eq!(out.steps[5].arg_f64("x2"), Some(1200.0 * (1.0 - s45)));
+        assert_eq!(out.steps[5].arg_f64("z2"), Some(1200.0 * s45));
+        assert_eq!(out.steps[5].arg_f64("x3"), Some(1200.0));
+        assert_eq!(out.steps[5].arg_f64("z3"), Some(1200.0));
+
+        // 断面绕定位点居中（宽 1000 / 高默认 320）。
+        assert_eq!(out.steps[0].arg_f64("y1"), Some(-500.0));
+        assert_eq!(out.steps[0].arg_f64("z1"), Some(-160.0));
+
+        // 「可用」尺子（静态侧）：inputs 只引用前序步骤、args 只用 §5.1 权威 key。
+        assert!(out.is_well_ordered());
+        for (i, step) in out.steps.iter().enumerate() {
+            assert!(step.validate_arity().is_ok(), "第 {i} 步元数应合法");
+            for key in step.args.keys() {
+                assert!(
+                    AUTHORITATIVE_KEYS.contains(&key.as_str()),
+                    "第 {i} 步参数 key `{key}` 不在设计文档 §5.1 权威集内"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elbow_op_rejects_non_positive_parameters() {
+        for (key, value) in [("width", 0.0), ("height", -320.0), ("turn_radius", 0.0)] {
+            let input = OpInput::new(PropertyMap::new(CATEGORY).with(key, Value::Float(value)));
+            assert!(
+                matches!(DuctElbowOp.apply(&input), Err(SdkError::BadParameter(_))),
+                "参数 {key}={value} 必须被响亮拒绝（BadParameter）"
+            );
+        }
+    }
+
+    #[test]
+    fn elbow_op_warns_when_radius_below_width() {
+        // 转弯半径 < 风管宽：配方仍合法可建，但 warnings 落配方（不阻断）。
+        let tight = OpInput::new(
+            PropertyMap::new(CATEGORY)
+                .with("width", Value::Float(1000.0))
+                .with("turn_radius", Value::Float(600.0)),
+        );
+        let out = DuctElbowOp.apply(&tight).unwrap();
+        assert_eq!(out.step_count(), 8);
+        assert_eq!(out.warnings.len(), 1, "转弯半径小于宽度必须落 1 条警告");
+        assert!(out.is_well_ordered(), "警告不阻断，配方仍应合法");
+
+        // 常规（默认宽 500 ≤ 默认半径 600）：无警告。
+        let roomy = OpInput::new(PropertyMap::new(CATEGORY));
+        let out = DuctElbowOp.apply(&roomy).unwrap();
+        assert!(
+            out.warnings.is_empty(),
+            "默认半径（600 ≥ 宽 500）不应产生警告"
+        );
+    }
+
+    #[test]
+    fn elbow_op_recipe_roundtrips_through_json() {
+        let input =
+            OpInput::new(PropertyMap::new(CATEGORY).with("turn_radius", Value::Float(900.0)))
+                .at([10.0, 20.0, 30.0]);
+        let out = DuctElbowOp.apply(&input).unwrap();
 
         let text = serde_json::to_string(&out).expect("配方应可序列化");
         let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");

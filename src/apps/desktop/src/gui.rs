@@ -6,8 +6,7 @@
 //! ┌────────────────────────────────────────────────────────────┐
 //! │ 菜单栏: 文件 编辑 视图 帮助                                  │
 //! ├────────────────────────────────────────────────────────────┤
-//! │ 工具栏: 构建(基本体/线框/扫掠放样/布尔/变换/修饰/修复) 模块配方 │
-//! │         适配 清选 | 拾取:面/边/顶点 | 基线 | 日志开关          │
+//! │ Ribbon: [建模][草图][视图] 页签 + 分组面板（按钮堆叠+小标题）  │
 //! ├────────────┬─────────────────────────────┬─────────────────┤
 //! │ 元素│类型   │                             │ 属性│视图│图纸    │
 //! │ (可停靠)    │        三维视口              │  (可停靠)        │
@@ -24,9 +23,18 @@
 //! 每个面板是 [`DockTab`]，用户可拖动重排、拖出为独立窗口、关闭；
 //! 菜单栏「视图 · 重置布局」恢复默认五区布局。视口不可关闭（closeable=false）——
 //! 它是 3D 主体；其余面板关闭后可从重置布局找回。
+//!
+//! ## Ribbon（G6-M8：Revit 风格页签化工具区）
+//!
+//! 单行工具栏升级为三页签 Ribbon：**建模**（构建七组 + 模块配方）/ **草图**
+//! （放样路径先行四入口）/ **视图**（适配 / 清选 / 拾取三态 / 基线 / 日志）。
+//! 页签行 + 内容行：分组面板按钮竖排堆叠 + 底部小标题 + 竖分隔线。
+//! 数据/渲染分离：`RibbonTab` + `RIBBON_TABS` + `build_groups()`（构建分组
+//! 清单）供测试断言；`ribbon*` 系列函数只做渲染。
+//!
 //! ## 构建链路（G3：原生算子门面 + 参数表单）
 //!
-//! 工具栏七组（基本体 / 线框 / 扫掠放样 / 布尔 / 变换 / 修饰 / 修复，计划
+//! Ribbon 建模页签七组（基本体 / 线框 / 扫掠放样 / 布尔 / 变换 / 修饰 / 修复，计划
 //! §5.1）+ 模块配方分组：点算子 → **参数表单浮窗**（[`ParamKind`] 路由控件，
 //! `core_sdk::BuildOp::param_defs` 单一事实源）→ 确定 → 按元数路由执行：
 //!
@@ -350,6 +358,93 @@ enum DockTab {
     Logs,
 }
 
+/// Ribbon 页签（G6-M8）：Revit 风格工具区的三大页——数据与渲染分离，
+/// 页签清单 [`RIBBON_TABS`] 与分组数据 [`build_groups`] 供测试断言。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum RibbonTab {
+    /// 建模：构建七组 + 模块配方
+    #[default]
+    Model,
+    /// 草图：四入口（通用 / 拉伸 / 旋转扫掠 / 放样）
+    Sketch,
+    /// 视图：适配 / 清选 / 拾取三态 / 基线 / 日志
+    View,
+}
+
+impl RibbonTab {
+    /// 页签显示名。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Model => "建模",
+            Self::Sketch => "草图",
+            Self::View => "视图",
+        }
+    }
+}
+
+/// Ribbon 页签清单（G6-M8：从左到右）。
+const RIBBON_TABS: [RibbonTab; 3] = [RibbonTab::Model, RibbonTab::Sketch, RibbonTab::View];
+
+/// 建模页签的构建分组清单（G3 七组——照旧单行工具栏的分组原样迁移，
+/// 数据与渲染分离：Ribbon 面板与测试共用一份）。
+fn build_groups() -> Vec<(&'static str, &'static str, Vec<BuildOp>)> {
+    use egui_phosphor::regular as ph;
+    vec![
+        (
+            ph::CUBE,
+            "基本体",
+            vec![
+                BuildOp::MakeBox,
+                BuildOp::MakeCylinder,
+                BuildOp::MakeSphere,
+                BuildOp::MakeCone,
+                BuildOp::MakeTorus,
+            ],
+        ),
+        (
+            ph::SHAPES,
+            "线框",
+            vec![BuildOp::MakeLineEdge, BuildOp::MakeArcEdge],
+        ),
+        (
+            ph::PATH,
+            "扫掠放样",
+            vec![BuildOp::Extrude, BuildOp::Revolve],
+        ),
+        (
+            ph::UNITE,
+            "布尔",
+            vec![BuildOp::Fuse, BuildOp::Cut, BuildOp::Common],
+        ),
+        (
+            ph::ARROWS_OUT_LINE_HORIZONTAL,
+            "变换",
+            vec![BuildOp::Translate, BuildOp::Rotate],
+        ),
+        (
+            ph::MAGIC_WAND,
+            "修饰",
+            vec![
+                BuildOp::Fillet,
+                BuildOp::Chamfer,
+                BuildOp::Shell,
+                BuildOp::Offset,
+                BuildOp::Thicken,
+            ],
+        ),
+        (
+            ph::WRENCH,
+            "修复",
+            vec![
+                BuildOp::Sew,
+                BuildOp::SewAndSolidify,
+                BuildOp::FixShape,
+                BuildOp::UnifySameDomain,
+            ],
+        ),
+    ]
+}
+
 /// 默认停靠布局（G6-M5）：照五区语义——
 /// 左栏（元素/类型叠 tab）15% → 右栏（属性/视图/图纸叠 tab）22% → 底部日志 20%，
 /// 剩余为中央视口。两处构造（[`BimApp::new`] / [`BimApp::open_document`]）与
@@ -488,6 +583,8 @@ struct BimApp {
     types_edit: Option<TypesEdit>,
     /// 元素树折叠的品类（G5-M21：默认全展开；集合内 = 折叠）
     collapsed_groups: BTreeSet<String>,
+    /// Ribbon 当前页签（G6-M8：建模 / 草图 / 视图三页，默认建模）
+    ribbon_tab: RibbonTab,
 }
 
 /// 原生算子参数表单状态（G3：确认时换算成 PropertyMap → build/modify/combine_native）。
@@ -665,6 +762,7 @@ impl BimApp {
             sketch: None,
             types_edit: None,
             collapsed_groups: BTreeSet::new(),
+            ribbon_tab: RibbonTab::Model,
         })
     }
 
@@ -728,6 +826,7 @@ impl BimApp {
             sketch: None,
             types_edit: None,
             collapsed_groups: BTreeSet::new(),
+            ribbon_tab: RibbonTab::Model,
         })
     }
 
@@ -1246,115 +1345,95 @@ impl BimApp {
         });
     }
 
-    /// 工具栏（G2/G3：构建七组 + 模块配方 / 适配 / 清选 / 拾取模式 / 性能基线 /
-    /// 日志开关——计划 §5.1 的七组算子按钮落这里）。
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        use egui_phosphor::regular as ph;
+    /// Ribbon（G6-M8）：Revit 风格页签化工具区——页签行（建模/草图/视图）+
+    /// 内容行（分组面板：按钮堆叠 + 底部小标题 + 竖分隔线）。替换 G2 单行 toolbar。
+    fn ribbon(&mut self, ui: &mut egui::Ui) {
+        // 页签行
         ui.horizontal(|ui| {
-            // —— 构建七组（G3：0 输入 → 新构件；1 输入 → 选中构件；2 输入 →
-            //    主选 + 副选；变长 Loft / MakeWire 走 G4 草图流程占位）——
-            self.build_group(
-                ui,
-                ph::CUBE,
-                "基本体",
-                &[
-                    BuildOp::MakeBox,
-                    BuildOp::MakeCylinder,
-                    BuildOp::MakeSphere,
-                    BuildOp::MakeCone,
-                    BuildOp::MakeTorus,
-                ],
-            );
-            self.build_group(
-                ui,
-                ph::SHAPES,
-                "线框",
-                &[BuildOp::MakeLineEdge, BuildOp::MakeArcEdge],
-            );
-            // 拉伸 / 旋转扫掠 / 放样三入口的完整流程（草图 → 特征）在 G4；
-            // 单输入的 Extrude / Revolve 先经选中构件直接操作。
-            self.build_group(
-                ui,
-                ph::PATH,
-                "扫掠放样",
-                &[BuildOp::Extrude, BuildOp::Revolve],
-            );
-            self.build_group(
-                ui,
-                ph::UNITE,
-                "布尔",
-                &[BuildOp::Fuse, BuildOp::Cut, BuildOp::Common],
-            );
-            self.build_group(
-                ui,
-                ph::ARROWS_OUT_LINE_HORIZONTAL,
-                "变换",
-                &[BuildOp::Translate, BuildOp::Rotate],
-            );
-            self.build_group(
-                ui,
-                ph::MAGIC_WAND,
-                "修饰",
-                &[
-                    BuildOp::Fillet,
-                    BuildOp::Chamfer,
-                    BuildOp::Shell,
-                    BuildOp::Offset,
-                    BuildOp::Thicken,
-                ],
-            );
-            self.build_group(
-                ui,
-                ph::WRENCH,
-                "修复",
-                &[
-                    BuildOp::Sew,
-                    BuildOp::SewAndSolidify,
-                    BuildOp::FixShape,
-                    BuildOp::UnifySameDomain,
-                ],
-            );
-            // —— 模块配方（现有 6 条按钮移入工具栏，计划 §5.1）——
-            ui.menu_button(format!("{} 模块配方", ph::PACKAGE), |ui| {
-                for btn in op_buttons() {
-                    if ui.button(btn.label).clicked() {
-                        self.build_op(btn.category, btn.op_id, btn.label);
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.separator();
-            if ui
-                .button(format!("{} 适配", ph::ARROWS_OUT))
-                .on_hover_text("适配视图")
-                .clicked()
-            {
-                self.fit_view();
-            }
-            if ui
-                .button(format!("{} 清选", ph::BROOM))
-                .on_hover_text("清空选择（含副选）")
-                .clicked()
-            {
-                self.selected = None;
-                self.picked = None;
-                self.secondary = None;
-            }
-            ui.separator();
-            // —— 拾取模式（M12：面 / 边 / 顶点三态单选）——
-            ui.label("拾取：");
-            for mode in [PickMode::Face, PickMode::Edge, PickMode::Vertex] {
+            ui.add_space(4.0);
+            for tab in RIBBON_TABS {
                 if ui
-                    .selectable_label(self.pick_mode == mode, mode.label())
+                    .selectable_label(self.ribbon_tab == tab, tab.label())
                     .clicked()
                 {
-                    self.pick_mode = mode;
+                    self.ribbon_tab = tab;
                 }
             }
-            ui.separator();
-            // —— 草图四入口（G4-M15 共用编辑器；G4-M18 接特征链路：入口决定
-            //    「完成」落盘语义——通用 wire 元素 / 拉伸 / 旋转扫掠 / 放样扫掠
-            //    特征，§5.6）——
+        });
+        ui.separator();
+        // 内容行（分组面板）
+        ui.horizontal(|ui| match self.ribbon_tab {
+            RibbonTab::Model => {
+                for (icon, name, ops) in build_groups() {
+                    self.ribbon_build_group(ui, icon, name, &ops);
+                }
+                self.ribbon_recipes(ui);
+            }
+            RibbonTab::Sketch => self.ribbon_sketch_entries(ui),
+            RibbonTab::View => self.ribbon_view_group(ui),
+        });
+    }
+
+    /// 一个 Ribbon 构建分组面板：算子按钮竖排堆叠（元数启用——0 输入恒可用；
+    /// 1 输入需选中构件；2 输入需主选 + 副选；变长禁用说明，绝不静默）+
+    /// 底部小标题；点击开参数表单浮窗。照旧工具栏时期的元数口径，
+    /// 菜单下拉改为面板直铺。
+    fn ribbon_build_group(&mut self, ui: &mut egui::Ui, icon: &str, name: &str, ops: &[BuildOp]) {
+        ui.vertical(|ui| {
+            ui.set_min_width(92.0);
+            for &op in ops {
+                let (ready, tip) = if op.is_variadic() {
+                    (false, "变长输入：草图流程接入后可用")
+                } else {
+                    match op.arity() {
+                        0 => (true, ""),
+                        1 => (
+                            self.selected.is_some(),
+                            "先选中一个构件（视口单击或元素列表）",
+                        ),
+                        2 => (
+                            self.selected.is_some() && self.secondary.is_some(),
+                            "先选主选构件，再 Ctrl+单击 副选构件",
+                        ),
+                        _ => (false, "不支持的元数"),
+                    }
+                };
+                if ui
+                    .add_enabled(ready, egui::Button::new(format!("{icon} {}", op.label())))
+                    .on_disabled_hover_text(tip)
+                    .clicked()
+                {
+                    self.open_op_form(op);
+                }
+            }
+            ui.vertical_centered(|ui| ui.weak(name));
+        });
+        ui.separator();
+    }
+
+    /// 模块配方面板（计划 §5.1：六条配方按钮——mock 腿不支持的算子点击后
+    /// 日志响亮报错）。
+    fn ribbon_recipes(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        ui.vertical(|ui| {
+            ui.set_min_width(128.0);
+            for btn in op_buttons() {
+                if ui
+                    .button(format!("{} {}", ph::PACKAGE, btn.label))
+                    .clicked()
+                {
+                    self.build_op(btn.category, btn.op_id, btn.label);
+                }
+            }
+            ui.vertical_centered(|ui| ui.weak("模块配方"));
+        });
+    }
+
+    /// 草图四入口面板（G4-M15 共用编辑器；G4-M18 特征链路——入口决定「完成」
+    /// 落盘语义；放样路径先行：先选中路径构件再打开放样草图）。
+    fn ribbon_sketch_entries(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        ui.vertical(|ui| {
             for (name, icon, entry) in [
                 ("通用草图", ph::VECTOR_THREE, SketchEntry::Profile),
                 ("拉伸草图", ph::FRAME_CORNERS, SketchEntry::Extrude),
@@ -1409,61 +1488,54 @@ impl BimApp {
                     }
                 }
             }
-            ui.separator();
-            // —— 性能基线（M12：日志可见，不写死阈值）——
-            if ui
-                .button(format!("{} 基线", ph::TIMER))
-                .on_hover_text("性能基线计时")
-                .clicked()
-            {
-                self.run_perf_baseline();
-            }
-            ui.separator();
-            // —— 日志面板快捷开关（G2 → G6-M5 聚焦语义）——
-            if ui
-                .button(format!("{} 日志", ph::CARET_DOUBLE_DOWN))
-                .on_hover_text("聚焦日志面板（关闭后点此恢复）")
-                .clicked()
-            {
-                self.focus_or_restore_tab(DockTab::Logs);
-            }
+            ui.vertical_centered(|ui| ui.weak("草图入口"));
         });
     }
 
-    // ---- 构建链路（G3：原生算子门面 + 参数表单） ----
-
-    /// 一个构建分组菜单（G3）：算子项按元数启用——0 输入恒可用；1 输入需选中
-    /// 构件；2 输入需主选 + 副选（Ctrl+单击）；变长（Loft / MakeWire）G4 草图
-    /// 流程接入前禁用（tooltip 说明，绝不静默）。
-    fn build_group(&mut self, ui: &mut egui::Ui, icon: &str, name: &str, ops: &[BuildOp]) {
-        ui.menu_button(format!("{icon} {name}"), |ui| {
-            for &op in ops {
-                let (ready, tip) = if op.is_variadic() {
-                    (false, "变长输入：G4 草图流程接入后可用")
-                } else {
-                    match op.arity() {
-                        0 => (true, ""),
-                        1 => (
-                            self.selected.is_some(),
-                            "先选中一个构件（视口单击或元素列表）",
-                        ),
-                        2 => (
-                            self.selected.is_some() && self.secondary.is_some(),
-                            "先选主选构件，再 Ctrl+单击 副选构件",
-                        ),
-                        _ => (false, "不支持的元数"),
-                    }
-                };
-                if ui
-                    .add_enabled(ready, egui::Button::new(op.label()))
-                    .on_disabled_hover_text(tip)
-                    .clicked()
-                {
-                    self.open_op_form(op);
-                    ui.close_menu();
-                }
+    /// 视图页签：适配 / 清选 / 拾取三态 / 性能基线 / 日志聚焦（横向排布）。
+    fn ribbon_view_group(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as ph;
+        if ui
+            .button(format!("{} 适配", ph::ARROWS_OUT))
+            .on_hover_text("适配视图")
+            .clicked()
+        {
+            self.fit_view();
+        }
+        if ui
+            .button(format!("{} 清选", ph::BROOM))
+            .on_hover_text("清空选择（含副选）")
+            .clicked()
+        {
+            self.selected = None;
+            self.picked = None;
+            self.secondary = None;
+        }
+        ui.separator();
+        ui.label("拾取：");
+        for mode in [PickMode::Face, PickMode::Edge, PickMode::Vertex] {
+            if ui
+                .selectable_label(self.pick_mode == mode, mode.label())
+                .clicked()
+            {
+                self.pick_mode = mode;
             }
-        });
+        }
+        ui.separator();
+        if ui
+            .button(format!("{} 基线", ph::TIMER))
+            .on_hover_text("性能基线计时")
+            .clicked()
+        {
+            self.run_perf_baseline();
+        }
+        if ui
+            .button(format!("{} 日志", ph::CARET_DOUBLE_DOWN))
+            .on_hover_text("聚焦日志面板（关闭后点此恢复）")
+            .clicked()
+        {
+            self.focus_or_restore_tab(DockTab::Logs);
+        }
     }
 
     /// 打开参数表单浮窗：按 [`BuildOp::param_defs`] 的 default 预填（G3 单一
@@ -3254,10 +3326,10 @@ impl eframe::App for BimApp {
         }
 
         self.refresh_meshes();
-        // G6-M5 可停靠面板：菜单栏 → 工具栏 → dock（面板区：元素/类型/属性/视图/
-        // 图纸/日志/视口，用户可拖动重排 / 拖出窗口 / 关闭）→ 状态栏 → 浮窗。
+        // G6-M5 可停靠面板 + G6-M8 Ribbon：菜单栏 → Ribbon → dock（面板区：元素/
+        // 类型/属性/视图/图纸/日志/视口，用户可拖动重排 / 拖出窗口 / 关闭）→ 状态栏 → 浮窗。
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| self.menu_bar(ui));
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+        egui::TopBottomPanel::top("ribbon").show(ctx, |ui| self.ribbon(ui));
         // bottom 面板先 show 的贴底：状态栏最底。
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(26.0)
@@ -3392,6 +3464,49 @@ mod tests {
                 main_surface_node_of(&b, tab),
                 "两次构造的 {tab:?} 布局应一致"
             );
+        }
+    }
+
+    /// Ribbon 钉 1：默认建模页签 + 三页签顺序与 label（建模/草图/视图）。
+    #[test]
+    fn ribbon_tabs_default_model_with_labels() {
+        assert_eq!(RibbonTab::default(), RibbonTab::Model);
+        let labels: Vec<&str> = RIBBON_TABS.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, ["建模", "草图", "视图"]);
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+    }
+
+    /// Ribbon 钉 2：构建分组 7 组齐全、合计 23 算子，图标/组名/算子全非空。
+    #[test]
+    fn ribbon_build_groups_complete() {
+        let groups = build_groups();
+        assert_eq!(
+            groups.len(),
+            7,
+            "构建七组：基本体/线框/扫掠放样/布尔/变换/修饰/修复"
+        );
+        let total: usize = groups.iter().map(|(_, _, ops)| ops.len()).sum();
+        assert_eq!(total, 23, "七组合计 23 个算子");
+        for (icon, name, ops) in &groups {
+            assert!(!icon.is_empty(), "分组 {name} 图标非空");
+            assert!(!name.is_empty());
+            assert!(!ops.is_empty(), "分组 {name} 不应为空");
+        }
+    }
+
+    /// Ribbon 钉 3：算子无重复——同一 BuildOp 不出现在两个分组。
+    #[test]
+    fn ribbon_build_ops_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, name, ops) in build_groups() {
+            for op in ops {
+                assert!(
+                    seen.insert(format!("{op:?}")),
+                    "算子 {op:?} 在分组 {name} 重复出现"
+                );
+            }
         }
     }
 }

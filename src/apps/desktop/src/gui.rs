@@ -6,6 +6,8 @@
 //! ┌────────────────────────────────────────────────────────────┐
 //! │ 菜单栏: 文件 编辑 视图 帮助                                  │
 //! ├────────────────────────────────────────────────────────────┤
+//! │ 文档页签: [未命名 *][xxx.bimdoc ×]（G6-M10 多文档，点击切换）  │
+//! ├────────────────────────────────────────────────────────────┤
 //! │ Ribbon: [建模][草图][视图] 页签 + 分组面板（按钮堆叠+小标题）  │
 //! ├────────────┬─────────────────────────────┬─────────────────┤
 //! │ 元素│类型   │                             │ 属性│视图│图纸    │
@@ -31,6 +33,18 @@
 //! 页签行 + 内容行：分组面板按钮竖排堆叠 + 底部小标题 + 竖分隔线。
 //! 数据/渲染分离：`RibbonTab` + `RIBBON_TABS` + `build_groups()`（构建分组
 //! 清单）供测试断言；`ribbon*` 系列函数只做渲染。
+//!
+//! ## 多文档页签（G6-M10：DocumentSession 会话池）
+//!
+//! per-document 状态（会话/相机/渲染缓存/选中/编辑态/图纸暂存 23 字段）打包进
+//! [`DocumentSession`]，`BimApp` 只持全局状态（documents/active/logs/dock/
+//! pick_mode/编辑态浮窗/ribbon_tab）。菜单栏与 Ribbon 之间是文档页签条：
+//! 每打开文档一个页签（文件名 + 脏标记 `*`），点击切换活跃文档；最后一个
+//! 文档不可关（面板全借 `documents[active]`——空会 panic）。新建/打开**追加**
+//! 文档并激活；切换/关闭时清跨文档残留编辑态（参数表单/草图/类型编辑）；
+//! 停靠布局与日志全局共享、内容随活跃文档切换。借用拆分依据：`Index` 调用
+//! 的借用面是整个 `documents`，同表达式嵌套字段访问会冲突——需嵌套访问处
+//! 先提取 `&mut DocumentSession` 再走字段投影（见 do_pick / 新建图纸）。
 //!
 //! ## 构建链路（G3：原生算子门面 + 参数表单）
 //!
@@ -447,8 +461,8 @@ fn build_groups() -> Vec<(&'static str, &'static str, Vec<BuildOp>)> {
 
 /// 默认停靠布局（G6-M5）：照五区语义——
 /// 左栏（元素/类型叠 tab）15% → 右栏（属性/视图/图纸叠 tab）22% → 底部日志 20%，
-/// 剩余为中央视口。两处构造（[`BimApp::new`] / [`BimApp::open_document`]）与
-/// 菜单栏「重置布局」共用。
+/// 剩余为中央视口。一处构造（[`BimApp::new`]）与菜单栏「重置布局」共用
+/// （G6-M10：布局全局共享，切换/关闭文档不重置）。
 ///
 /// split 语义（egui_dock 0.14 实现为准）：`split_left(parent, f, tabs)` 把
 /// **tabs 放左侧占 f**、原内容（old）在右占 1−f；`split_right` / `split_below` 同理
@@ -516,10 +530,9 @@ impl egui_dock::TabViewer for BimTabViewer<'_> {
     }
 }
 
-/// GUI 应用状态。
-/// 面板区由 [`egui_dock::DockState`] 管理可停靠页签（G6-M5），
-/// 菜单栏 / 工具栏 / 状态栏仍是固定 TopBottomPanel。
-struct BimApp {
+/// 一个打开的文档（G6-M10）：会话 + 该文档的 GUI 状态。多文档页签每个页签
+/// 一份——切换页签时随文档一起切换（选中/相机/渲染缓存/编辑态/表单全保留）。
+struct DocumentSession {
     session: CoreSession,
     camera: OrbitCamera,
     /// 渲染缓存：ShapeId → 网格 + 基色（几何变化后重建）
@@ -528,18 +541,12 @@ struct BimApp {
     selected: Option<ElementId>,
     /// 最近一次拾取结果
     picked: Option<PickResult>,
-    /// 操作日志（底栏显示，新消息在底部）
-    logs: Vec<String>,
     /// 几何脏标记：置位后下一帧重建全部网格
     dirty: bool,
     /// 待自动适配视图（首帧或新几何后）
     fit_pending: bool,
-    /// 是否真内核（occt feature）：mock 占位内核无真面拓扑，拾取命中后精算必然失败。
-    real_kernel: bool,
     /// 当前文档路径（M9 文件链路：None = 未保存过的新文档）
     file_path: Option<PathBuf>,
-    /// 上次同步到窗口标题的文字（避免每帧重复 SetWindowText）
-    last_title: Option<String>,
     /// 参数编辑暂存（选中构件时快照；"应用并重建"提交，M10）
     edit: Option<ParamEdit>,
     /// ElementId → 建几何用的算子 id（rebuild 需要同款算子；build_op / new 时记录，M10）
@@ -566,22 +573,39 @@ struct BimApp {
     place_x_mm: f64,
     /// 放置视图表单：位置 Y 暂存（mm，G6-M3）
     place_y_mm: f64,
-    /// 拾取模式（面 / 边 / 顶点；M12）
-    pick_mode: PickMode,
     /// 增量重建集（M12）：None = 全量重建，Some = 只重建这些形状。
     dirty_shapes: Option<HashSet<ShapeId>>,
-    /// 可停靠面板布局（G6-M5：egui_dock——面板选中态/关闭/重排由它管理；
-    /// 默认五区布局见 [`default_dock`]）
-    dock: egui_dock::DockState<DockTab>,
-    /// 待确认的原生算子参数表单（G3：点工具栏算子项 → 表单浮窗 → 确认执行）
-    op_form: Option<OpForm>,
     /// 副选构件（G3：布尔 / 扫掠类第二输入；元素列表 / 视口 Ctrl+单击设置）
     secondary: Option<ElementId>,
-    /// 草图编辑器状态（G4-M15：Some = 草图浮窗开着；三入口共用一个编辑器）
+}
+
+/// GUI 应用状态。
+/// 多文档（G6-M10）：文档池 + 活跃下标——面板/浮窗全部操作 `documents[active]`；
+/// 面板区由 [`egui_dock::DockState`] 管理可停靠页签（G6-M5，布局全局共享、
+/// 内容随活跃文档切换），菜单栏 / 文档页签条 / Ribbon / 状态栏是固定 TopBottomPanel。
+struct BimApp {
+    /// 打开的文档池（多文档页签：每页签一份 DocumentSession）
+    documents: Vec<DocumentSession>,
+    /// 活跃文档下标（面板/浮窗的会话操作对象）
+    active: usize,
+    /// 操作日志（全局共享：底栏显示，新消息在底部）
+    logs: Vec<String>,
+    /// 是否真内核（occt feature）：mock 占位内核无真面拓扑，拾取命中后精算必然失败。
+    real_kernel: bool,
+    /// 上次同步到窗口标题的文字（显示活跃文档，避免每帧重复 SetWindowText）
+    last_title: Option<String>,
+    /// 拾取模式（面 / 边 / 顶点；全局工具选择，M12）
+    pick_mode: PickMode,
+    /// 可停靠面板布局（G6-M5：egui_dock——面板选中态/关闭/重排由它管理，
+    /// 默认五区布局见 [`default_dock`]；布局全局共享，内容随活跃文档）
+    dock: egui_dock::DockState<DockTab>,
+    /// 待确认的原生算子参数表单（G3；编辑态跨文档残留——切换/关闭文档时清）
+    op_form: Option<OpForm>,
+    /// 草图编辑器状态（G4-M15：Some = 草图浮窗开着；切换/关闭文档时清）
     sketch: Option<crate::sketch_editor::SketchEditorState>,
-    /// 类型编辑器状态（G5-M20：Some = Types 页编辑中——新建 / 编辑 PropertySchema）
+    /// 类型编辑器状态（G5-M20：Some = Types 页编辑中；切换/关闭文档时清）
     types_edit: Option<TypesEdit>,
-    /// 元素树折叠的品类（G5-M21：默认全展开；集合内 = 折叠）
+    /// 元素树折叠的品类（G5-M21：全局 UI 偏好；集合内 = 折叠）
     collapsed_groups: BTreeSet<String>,
     /// Ribbon 当前页签（G6-M8：建模 / 草图 / 视图三页，默认建模）
     ribbon_tab: RibbonTab,
@@ -700,21 +724,18 @@ fn install_modules(session: &mut CoreSession, logs: &mut Vec<String>) {
     ));
 }
 
-impl BimApp {
-    fn new() -> Result<Self, String> {
+impl DocumentSession {
+    /// 新建一份文档（会话 + 该文档的 GUI 状态；G6-M10 从 BimApp::new 拆出——
+    /// 多文档页签每个页签走同一份装配）。
+    fn new_document(logs: &mut Vec<String>) -> Result<Self, String> {
         // 与 e2e 双腿同款：默认占位内核，occt feature 时真内核（绝不静默降级）。
         #[cfg(feature = "occt")]
         let picked_session = CoreSession::with_real_kernel();
         #[cfg(not(feature = "occt"))]
         let picked_session = CoreSession::new();
         let mut session = picked_session.map_err(|e| format!("会话装配失败：{e}"))?;
-        #[cfg(feature = "occt")]
-        let real_kernel = true;
-        #[cfg(not(feature = "occt"))]
-        let real_kernel = false;
 
-        let mut logs: Vec<String> = Vec::new();
-        install_modules(&mut session, &mut logs);
+        install_modules(&mut session, logs);
         let mut op_by_element: HashMap<ElementId, String> = HashMap::new();
 
         // 起手造一根梁，让视口不空。
@@ -735,12 +756,9 @@ impl BimApp {
             meshes: HashMap::new(),
             selected: None,
             picked: None,
-            logs,
             dirty: true,
             fit_pending: true,
-            real_kernel,
             file_path: None,
-            last_title: None,
             edit: None,
             op_by_element,
             selected_view: None,
@@ -754,36 +772,26 @@ impl BimApp {
             place_scale: 100,
             place_x_mm: 100.0,
             place_y_mm: 100.0,
-            pick_mode: PickMode::Face,
             dirty_shapes: None,
-            dock: default_dock(),
-            op_form: None,
             secondary: None,
-            sketch: None,
-            types_edit: None,
-            collapsed_groups: BTreeSet::new(),
-            ribbon_tab: RibbonTab::Model,
         })
     }
 
-    /// 打开一个 `.bimdoc` 并包成 GUI 应用（模块重装；打开后渲染缓存/选中态归零）。
+    /// 打开一个 `.bimdoc` 包成文档状态（G6-M10 从 BimApp::open_document 拆出；
+    /// 模块重装；打开后渲染缓存/选中态归零）。
     ///
-    /// feature 路由与 [`Self::new`] 一致：occt 腿走 [`CoreSession::open_real`]
-    /// （真实内核，重开后 rebuild / 投影走真几何），否则 [`CoreSession::open`]
-    /// （占位内核，重开后拾取不可用——mock 能力边界，与 M8 口径一致）。
-    fn open_document(path: &Path) -> Result<Self, String> {
+    /// feature 路由与 [`DocumentSession::new_document`] 一致：occt 腿走
+    /// [`CoreSession::open_real`]（真实内核，重开后 rebuild / 投影走真几何），
+    /// 否则 [`CoreSession::open`]（占位内核，重开后拾取不可用——mock 能力边界，
+    /// 与 M8 口径一致）。
+    fn open_document(path: &Path, logs: &mut Vec<String>) -> Result<Self, String> {
         #[cfg(feature = "occt")]
         let picked_session = CoreSession::open_real(path);
         #[cfg(not(feature = "occt"))]
         let picked_session = CoreSession::open(path);
         let mut session = picked_session.map_err(|e| format!("打开失败：{e}"))?;
-        #[cfg(feature = "occt")]
-        let real_kernel = true;
-        #[cfg(not(feature = "occt"))]
-        let real_kernel = false;
 
-        let mut logs: Vec<String> = Vec::new();
-        install_modules(&mut session, &mut logs);
+        install_modules(&mut session, logs);
         logs.push(format!(
             "✓ 已打开：{}（{} 个构件 / {} 条几何）",
             path.display(),
@@ -797,12 +805,9 @@ impl BimApp {
             meshes: HashMap::new(),
             selected: None,
             picked: None,
-            logs,
             dirty: true,
             fit_pending: true,
-            real_kernel,
             file_path: Some(path.to_path_buf()),
-            last_title: None,
             edit: None,
             // 打开的文档无算子记录（build_op 只在本次会话记录）——
             // 这些构件参数只读、不可重建，GUI 里如实提示。
@@ -818,11 +823,43 @@ impl BimApp {
             place_scale: 100,
             place_x_mm: 100.0,
             place_y_mm: 100.0,
-            pick_mode: PickMode::Face,
             dirty_shapes: None,
+            secondary: None,
+        })
+    }
+
+    /// 文档页签标题（文件名 + 脏标记 `*`；未保存过的新文档显示"未命名"）。
+    fn tab_title(&self) -> String {
+        let name = match &self.file_path {
+            Some(p) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string()),
+            None => "未命名".to_string(),
+        };
+        if self.dirty {
+            format!("{name} *")
+        } else {
+            name
+        }
+    }
+}
+
+impl BimApp {
+    /// 全新应用：一份初始文档（G6-M10：BimApp 只持全局状态，per-document 状态
+    /// 打包进 [`DocumentSession`]，见 [`DocumentSession::new_document`]）。
+    fn new() -> Result<Self, String> {
+        let mut logs = Vec::new();
+        let doc = DocumentSession::new_document(&mut logs)?;
+        Ok(Self {
+            documents: vec![doc],
+            active: 0,
+            logs,
+            real_kernel: cfg!(feature = "occt"),
+            last_title: None,
+            pick_mode: PickMode::Face,
             dock: default_dock(),
             op_form: None,
-            secondary: None,
             sketch: None,
             types_edit: None,
             collapsed_groups: BTreeSet::new(),
@@ -840,19 +877,24 @@ impl BimApp {
 
     // ---- 文件链路（M9：新建 / 打开 / 保存 / 另存） ----
 
-    /// 新建文档：全新会话 + 重装模块（未确认丢弃提示由日志记录，不做模态弹窗）。
+    /// 新建文档：追加一份新文档并激活（G6-M10 多文档页签——旧文档保留在池中）。
     fn do_new(&mut self) {
-        match Self::new() {
-            Ok(mut app) => {
-                app.logs
-                    .insert(0, "✓ 已新建文档（未保存更改已丢弃）".to_string());
-                *self = app;
+        match DocumentSession::new_document(&mut self.logs) {
+            Ok(doc) => {
+                self.documents.push(doc);
+                self.active = self.documents.len() - 1;
+                // 跨文档残留编辑态清掉（表单/草图/类型编辑绑定的是旧文档）。
+                self.op_form = None;
+                self.sketch = None;
+                self.types_edit = None;
+                self.log(format!("✓ 已新建文档（共 {} 个）", self.documents.len()));
             }
             Err(e) => self.log(format!("✗ 新建失败：{e}")),
         }
     }
 
-    /// 打开文档：rfd 原生对话框选路径 → [`Self::open_document`] 整体替换。
+    /// 打开文档：rfd 原生对话框选路径 → 追加文档并激活
+    /// （[`DocumentSession::open_document`]，G6-M10 多文档页签）。
     fn do_open(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("BIM 文档", &["bimdoc"])
@@ -861,15 +903,80 @@ impl BimApp {
             self.log("· 打开已取消".to_string());
             return;
         };
-        match Self::open_document(&path) {
-            Ok(app) => *self = app,
+        match DocumentSession::open_document(&path, &mut self.logs) {
+            Ok(doc) => {
+                self.documents.push(doc);
+                self.active = self.documents.len() - 1;
+                self.op_form = None;
+                self.sketch = None;
+                self.types_edit = None;
+            }
             Err(e) => self.log(e),
+        }
+    }
+
+    // ---- 多文档页签（G6-M10：DocumentSession 会话池） ----
+
+    /// 文档页签条（menu_bar 与 ribbon 之间）：每打开文档一个页签
+    /// （文件名 + 脏标记 `*`），点击切换活跃文档；最后一个文档不可关。
+    fn document_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for i in 0..self.documents.len() {
+                let title = self.documents[i].tab_title();
+                if ui.selectable_label(i == self.active, title).clicked() {
+                    self.switch_to(i);
+                }
+                if self.documents.len() > 1 && ui.small_button("×").clicked() {
+                    self.close_document(i);
+                }
+            }
+        });
+    }
+
+    /// 切换活跃文档（G6-M10）：清跨文档残留编辑态（参数表单/草图/类型编辑
+    /// 绑定的是旧文档）；停靠布局与日志全局共享不动。
+    fn switch_to(&mut self, index: usize) {
+        if index >= self.documents.len() || index == self.active {
+            return;
+        }
+        self.active = index;
+        self.op_form = None;
+        self.sketch = None;
+        self.types_edit = None;
+        self.log(format!("✓ 已切换到文档 {}", index + 1));
+    }
+
+    /// 关闭文档（G6-M10）：最后一个不可关（面板全借 `documents[active]`——
+    /// 空会 panic）；未保存修改直接丢弃（提示走日志，不做模态）。
+    fn close_document(&mut self, index: usize) {
+        if index >= self.documents.len() {
+            return;
+        }
+        if self.documents.len() <= 1 {
+            self.log("· 至少保留一个文档（最后一个不可关）");
+            return;
+        }
+        let path = self.documents[index].file_path.clone();
+        self.documents.remove(index);
+        // 活跃下标修正：关活跃文档 → 指向相邻（后一个顶上来 / 关末尾则前移）；
+        // 关更早的 → active 减一；关更晚的 → 不变。
+        if index == self.active {
+            self.active = index.min(self.documents.len() - 1);
+        } else if index < self.active {
+            self.active -= 1;
+        }
+        self.op_form = None;
+        self.sketch = None;
+        self.types_edit = None;
+        match path {
+            Some(p) => self.log(format!("✓ 已关闭文档：{}（未保存修改已丢弃）", p.display())),
+            None => self.log("✓ 已关闭未命名文档（未保存修改已丢弃）"),
         }
     }
 
     /// 保存（Ctrl+S）：已有路径直接存；从未保存过 → 转另存。
     fn do_save(&mut self) {
-        let Some(path) = self.file_path.clone() else {
+        let Some(path) = self.documents[self.active].file_path.clone() else {
             self.do_save_as();
             return;
         };
@@ -891,9 +998,9 @@ impl BimApp {
 
     /// 存盘到指定路径（成功记住路径，失败写日志不 panic）。
     fn save_to(&mut self, path: &Path) {
-        match self.session.save(path) {
+        match self.documents[self.active].session.save(path) {
             Ok(()) => {
-                self.file_path = Some(path.to_path_buf());
+                self.documents[self.active].file_path = Some(path.to_path_buf());
                 self.log(format!("✓ 已保存：{}", path.display()));
             }
             Err(e) => self.log(format!("✗ 保存失败：{e}")),
@@ -912,7 +1019,7 @@ impl BimApp {
     ///   即可按原算子编辑）；ElementId 只增不复用，残留无语义风险；
     /// - 不自动适配视图（撤销是精细操作，自动 fit 会让视口跳变）。
     fn do_undo(&mut self) {
-        if !self.session.undo() {
+        if !self.documents[self.active].session.undo() {
             return;
         }
         self.after_history_jump("撤销");
@@ -920,7 +1027,7 @@ impl BimApp {
 
     /// 重做一步（G6-M1）：语义同 [`Self::do_undo`]，方向相反。
     fn do_redo(&mut self) {
-        if !self.session.redo() {
+        if !self.documents[self.active].session.redo() {
             return;
         }
         self.after_history_jump("重做");
@@ -928,50 +1035,57 @@ impl BimApp {
 
     /// 撤销 / 重做共用的状态清理（历史移动后文档与图纸都变了）。
     fn after_history_jump(&mut self, action: &str) {
-        self.dirty = true;
+        self.documents[self.active].dirty = true;
         // —— 清理决策（文档 / 图纸只读借用圈在块内；先决策后改状态）——
         let (selected_gone, secondary_gone, edit_gone, picked_gone, view_gone) = {
-            let svc = self.session.document();
+            let svc = self.documents[self.active].session.document();
             let doc = svc.doc();
             let drawing = svc.drawing();
             (
-                self.selected.is_some_and(|id| doc.element(id).is_none()),
-                self.secondary.is_some_and(|id| doc.element(id).is_none()),
-                self.edit
+                self.documents[self.active]
+                    .selected
+                    .is_some_and(|id| doc.element(id).is_none()),
+                self.documents[self.active]
+                    .secondary
+                    .is_some_and(|id| doc.element(id).is_none()),
+                self.documents[self.active]
+                    .edit
                     .as_ref()
                     .is_some_and(|e| doc.element(e.element).is_none()),
-                self.picked
+                self.documents[self.active]
+                    .picked
                     .as_ref()
                     .is_some_and(|p| doc.element(p.element).is_none()),
-                self.selected_view
+                self.documents[self.active]
+                    .selected_view
                     .is_some_and(|v| drawing.view(v).is_none()),
             )
         };
         if selected_gone {
-            self.selected = None;
+            self.documents[self.active].selected = None;
         }
         if secondary_gone {
-            self.secondary = None;
+            self.documents[self.active].secondary = None;
         }
         if edit_gone {
-            self.edit = None;
+            self.documents[self.active].edit = None;
         }
         if picked_gone {
-            self.picked = None;
+            self.documents[self.active].picked = None;
         }
         if view_gone {
-            self.selected_view = None;
+            self.documents[self.active].selected_view = None;
         }
         self.log(format!(
             "✓ 已{action}（可再撤销 {} 步 / 可重做 {} 步）",
-            self.session.undo_depth(),
-            self.session.redo_depth()
+            self.documents[self.active].session.undo_depth(),
+            self.documents[self.active].session.redo_depth()
         ));
     }
 
     /// 把当前文档状态同步到窗口标题栏（有路径显示路径，否则"未命名"）。
     fn sync_title(&mut self, ctx: &egui::Context) {
-        let title = match &self.file_path {
+        let title = match &self.documents[self.active].file_path {
             Some(p) => format!("轻量化 BIM 内核平台 —— {}", p.display()),
             None => "轻量化 BIM 内核平台 —— 未命名".to_string(),
         };
@@ -992,7 +1106,7 @@ impl BimApp {
     /// ③ rebuild：走 `rebuild_geometry`（M6 关联更新首链在 GUI 生效）——
     ///    网格重建（dirty）+ 定向重投 + stale 视图标脏；警告逐条入日志，不被吞。
     fn apply_rebuild(&mut self) {
-        let Some(edit) = self.edit.clone() else {
+        let Some(edit) = self.documents[self.active].edit.clone() else {
             return;
         };
         let mut params = PropertyMap::new(edit.schema.clone());
@@ -1000,17 +1114,21 @@ impl BimApp {
             params.set(k.clone(), v.clone());
         }
         // ① validate（schema 已注册时；未注册模式跳过——参数自由，照 M10 现状）
-        let registered = self
+        let registered = self.documents[self.active]
             .session
             .list_schemas()
             .iter()
             .any(|s| s.type_name == edit.schema);
-        if registered && let Err(e) = self.session.validate_map(&edit.schema, &params) {
+        if registered
+            && let Err(e) = self.documents[self.active]
+                .session
+                .validate_map(&edit.schema, &params)
+        {
             self.log(format!("✗ 非法值已拦截：{e}（修正后再点\"应用并重建\"）"));
             return;
         }
         // ② set：新值回写元素 properties（属性与几何一致）
-        if let Err(e) = self
+        if let Err(e) = self.documents[self.active]
             .session
             .update_element_properties(edit.element, params.clone())
         {
@@ -1018,15 +1136,17 @@ impl BimApp {
             return;
         }
         // ③ rebuild（M6 关联更新首链在 GUI 生效）
-        match self
-            .session
-            .rebuild_geometry(edit.element, &edit.op_id, params)
-        {
+        match self.documents[self.active].session.rebuild_geometry(
+            edit.element,
+            &edit.op_id,
+            params,
+        ) {
             Ok(report) => {
-                self.dirty = true;
+                self.documents[self.active].dirty = true;
                 // M12 增量重建：只网格化本次被改的形状。
                 if !report.changed_shapes.is_empty() {
-                    self.dirty_shapes = Some(report.changed_shapes.iter().copied().collect());
+                    self.documents[self.active].dirty_shapes =
+                        Some(report.changed_shapes.iter().copied().collect());
                 }
                 self.log(format!(
                     "✓ 关联更新：演化直连 {} + 指纹回退 {}，重投 {} 图元、重算 {} 标注、{} 视图已标脏",
@@ -1040,7 +1160,7 @@ impl BimApp {
                     self.log(format!("⚠ {w}"));
                 }
                 // 重建后重新快照（内核可能归一参数；选中不变）。
-                self.edit = None;
+                self.documents[self.active].edit = None;
             }
             Err(e) => self.log(format!("✗ 关联更新失败：{e}")),
         }
@@ -1053,7 +1173,7 @@ impl BimApp {
     /// **只测量、不断言**：性能边界随机器 / 内核腿（mock / occt）变化，
     /// 硬阈值必然假红；实测数字进日志 + README 记录，回归靠人眼比对量级。
     fn run_perf_baseline(&mut self) {
-        let shapes: Vec<ShapeId> = self
+        let shapes: Vec<ShapeId> = self.documents[self.active]
             .session
             .document()
             .doc()
@@ -1069,7 +1189,7 @@ impl BimApp {
         let t0 = std::time::Instant::now();
         let mut ok = 0usize;
         for s in &shapes {
-            if self
+            if self.documents[self.active]
                 .session
                 .tessellate(*s, VIEW_LINEAR, VIEW_ANGULAR)
                 .is_ok()
@@ -1080,15 +1200,18 @@ impl BimApp {
         let tess_ms = t0.elapsed().as_millis();
         // ② 拾取 ×5（视口中心 ± 横向偏移，覆盖命中与未命中两类路径；
         //    M12 缓存后第 2 次起走 pick_meshes，量的是"缓存热"的拾取代价）。
-        let (cx, cy, _) = self.camera.viewport;
+        let (cx, cy, _) = self.documents[self.active].camera.viewport;
         let t1 = std::time::Instant::now();
         let mut hits = 0usize;
+        // 借用拆分（G6-M10）：index 借用面是整个 documents，session 与 camera
+        // 嵌套访问会冲突——先提取一份 &mut DocumentSession 再走字段投影。
+        let ds = &mut self.documents[self.active];
         for i in 0..5i32 {
             let off = (i - 2) * 30;
             let screen = ((cx + off as f64) as f32, cy as f32);
-            if let Ok(Some(_)) =
-                self.session
-                    .pick_at(screen, &self.camera, PickFilter::faces_only())
+            if let Ok(Some(_)) = ds
+                .session
+                .pick_at(screen, &ds.camera, PickFilter::faces_only())
             {
                 hits += 1;
             }
@@ -1102,14 +1225,14 @@ impl BimApp {
 
     /// 脏标记置位时重建网格（M12：有增量集只重建集合内形状，否则全量）。
     fn refresh_meshes(&mut self) {
-        if !self.dirty {
+        if !self.documents[self.active].dirty {
             return;
         }
-        match self.dirty_shapes.take() {
+        match self.documents[self.active].dirty_shapes.take() {
             // 全量重建（首帧 / 打开文档 / 增量集未登记时）。
             None => {
-                self.meshes.clear();
-                let entries: Vec<(ShapeId, [u8; 3])> = self
+                self.documents[self.active].meshes.clear();
+                let entries: Vec<(ShapeId, [u8; 3])> = self.documents[self.active]
                     .session
                     .document()
                     .doc()
@@ -1124,7 +1247,7 @@ impl BimApp {
             // 增量重建：只碰登记过的形状（其余缓存一动不动）。
             Some(shapes) => {
                 for shape in &shapes {
-                    let Some(elem) = self
+                    let Some(elem) = self.documents[self.active]
                         .session
                         .document()
                         .doc()
@@ -1134,25 +1257,28 @@ impl BimApp {
                         .cloned()
                     else {
                         // 形状已无元素引用（被删）→ 顺带清渲染缓存。
-                        self.meshes.remove(shape);
+                        self.documents[self.active].meshes.remove(shape);
                         continue;
                     };
                     self.tessellate_into_cache(*shape, base_color(elem.category.as_str()));
                 }
             }
         }
-        self.dirty = false;
-        if self.fit_pending {
+        self.documents[self.active].dirty = false;
+        if self.documents[self.active].fit_pending {
             self.fit_view();
-            self.fit_pending = false;
+            self.documents[self.active].fit_pending = false;
         }
     }
 
     /// 网格化一个形状并写进渲染缓存（失败写日志，不 panic）。
     fn tessellate_into_cache(&mut self, shape: ShapeId, base: [u8; 3]) {
-        match self.session.tessellate(shape, VIEW_LINEAR, VIEW_ANGULAR) {
+        match self.documents[self.active]
+            .session
+            .tessellate(shape, VIEW_LINEAR, VIEW_ANGULAR)
+        {
             Ok(mesh) => {
-                self.meshes.insert(
+                self.documents[self.active].meshes.insert(
                     shape,
                     ShapeMesh {
                         mesh,
@@ -1169,7 +1295,7 @@ impl BimApp {
         let mut min = [f64::INFINITY; 3];
         let mut max = [f64::NEG_INFINITY; 3];
         let mut any = false;
-        for sm in self.meshes.values() {
+        for sm in self.documents[self.active].meshes.values() {
             for p in &sm.mesh.positions {
                 any = true;
                 for i in 0..3 {
@@ -1181,28 +1307,36 @@ impl BimApp {
         if !any {
             return;
         }
-        self.camera.target = DVec3::new(
+        self.documents[self.active].camera.target = DVec3::new(
             (min[0] + max[0]) / 2.0,
             (min[1] + max[1]) / 2.0,
             (min[2] + max[2]) / 2.0,
         );
         let diag = DVec3::new(max[0] - min[0], max[1] - min[1], max[2] - min[2]).length();
-        self.camera.distance = (diag * 1.8).max(500.0);
+        self.documents[self.active].camera.distance = (diag * 1.8).max(500.0);
     }
 
     /// 新建构件 + 造几何（失败写日志，不 panic）。
     fn build_op(&mut self, category: &str, op_id: &str, label: &str) {
-        match self.session.create_element(category, "") {
-            Ok(elem) => match self.session.build_geometry(elem, op_id) {
+        match self.documents[self.active]
+            .session
+            .create_element(category, "")
+        {
+            Ok(elem) => match self.documents[self.active]
+                .session
+                .build_geometry(elem, op_id)
+            {
                 Ok(shape) => {
-                    self.selected = Some(elem);
-                    self.picked = None;
-                    self.dirty = true;
+                    self.documents[self.active].selected = Some(elem);
+                    self.documents[self.active].picked = None;
+                    self.documents[self.active].dirty = true;
                     // M12 增量重建：只网格化新建的形状。
-                    self.dirty_shapes = Some([shape].into_iter().collect());
-                    self.fit_pending = true;
+                    self.documents[self.active].dirty_shapes = Some([shape].into_iter().collect());
+                    self.documents[self.active].fit_pending = true;
                     // 记录算子（M10：rebuild 需要同款算子）。
-                    self.op_by_element.insert(elem, op_id.to_string());
+                    self.documents[self.active]
+                        .op_by_element
+                        .insert(elem, op_id.to_string());
                     self.log(format!("✓ {label}：{op_id} 已建几何（ShapeId {shape}）"));
                 }
                 Err(e) => self.log(format!("✗ {label}：{op_id} 建几何失败：{e}")),
@@ -1215,14 +1349,17 @@ impl BimApp {
     ///
     /// Ctrl+单击 = 设**副选**（G3：布尔 / 扫掠类第二输入）；普通单击 = 主选。
     fn do_pick(&mut self, screen: (f32, f32), ctrl: bool) {
-        let camera = &self.camera;
+        // 借用拆分（G6-M10）：index 借用面是整个 documents，嵌套字段访问会冲突——
+        // 先提取一份 &mut DocumentSession，后续走字段投影精确拆分。
+        let ds = &mut self.documents[self.active];
+        let camera = &ds.camera;
         let filter = self.pick_mode.filter();
-        match self.session.pick_at(screen, camera, filter) {
+        match ds.session.pick_at(screen, camera, filter) {
             Ok(Some(hit)) => {
                 if ctrl {
-                    self.secondary = Some(hit.element);
+                    ds.secondary = Some(hit.element);
                 } else {
-                    self.selected = Some(hit.element);
+                    ds.selected = Some(hit.element);
                 }
                 let p = hit.world_point;
                 let kind = match hit.kind {
@@ -1230,18 +1367,18 @@ impl BimApp {
                     PickKind::Edge => "边",
                     PickKind::Vertex => "顶点",
                 };
+                ds.picked = Some(hit);
                 self.log(format!(
                     "✓ 拾取{kind}：命中点 ({:.0}, {:.0}, {:.0})",
                     p.x, p.y, p.z
                 ));
-                self.picked = Some(hit);
             }
             Ok(None) => {
-                self.picked = None;
+                ds.picked = None;
                 self.log("· 未命中任何构件面".to_string());
             }
             Err(e) => {
-                self.picked = None;
+                ds.picked = None;
                 if self.real_kernel {
                     self.log(format!("✗ 拾取失败：{e}"));
                 } else {
@@ -1283,25 +1420,37 @@ impl BimApp {
             ui.menu_button("编辑", |ui| {
                 // 撤销 / 重做（G6-M1：双侧快照回滚——文档与图纸一起；深度入文案，
                 // 不可用时置灰）。语义见 do_undo / do_redo。
-                let undo_label = if self.session.can_undo() {
-                    format!("撤销（{} 步）", self.session.undo_depth())
+                let undo_label = if self.documents[self.active].session.can_undo() {
+                    format!(
+                        "撤销（{} 步）",
+                        self.documents[self.active].session.undo_depth()
+                    )
                 } else {
                     "撤销".to_string()
                 };
                 if ui
-                    .add_enabled(self.session.can_undo(), egui::Button::new(undo_label))
+                    .add_enabled(
+                        self.documents[self.active].session.can_undo(),
+                        egui::Button::new(undo_label),
+                    )
                     .clicked()
                 {
                     self.do_undo();
                     ui.close_menu();
                 }
-                let redo_label = if self.session.can_redo() {
-                    format!("重做（{} 步）", self.session.redo_depth())
+                let redo_label = if self.documents[self.active].session.can_redo() {
+                    format!(
+                        "重做（{} 步）",
+                        self.documents[self.active].session.redo_depth()
+                    )
                 } else {
                     "重做".to_string()
                 };
                 if ui
-                    .add_enabled(self.session.can_redo(), egui::Button::new(redo_label))
+                    .add_enabled(
+                        self.documents[self.active].session.can_redo(),
+                        egui::Button::new(redo_label),
+                    )
                     .clicked()
                 {
                     self.do_redo();
@@ -1309,9 +1458,9 @@ impl BimApp {
                 }
                 ui.separator();
                 if ui.button("清空选择").clicked() {
-                    self.selected = None;
-                    self.picked = None;
-                    self.secondary = None;
+                    self.documents[self.active].selected = None;
+                    self.documents[self.active].picked = None;
+                    self.documents[self.active].secondary = None;
                     ui.close_menu();
                 }
             });
@@ -1337,7 +1486,10 @@ impl BimApp {
                     self.log(format!(
                         "轻量化 BIM 内核平台 v{}（内核：{}）",
                         env!("CARGO_PKG_VERSION"),
-                        self.session.geometry().backend_name()
+                        self.documents[self.active]
+                            .session
+                            .geometry()
+                            .backend_name()
                     ));
                     ui.close_menu();
                 }
@@ -1388,11 +1540,12 @@ impl BimApp {
                     match op.arity() {
                         0 => (true, ""),
                         1 => (
-                            self.selected.is_some(),
+                            self.documents[self.active].selected.is_some(),
                             "先选中一个构件（视口单击或元素列表）",
                         ),
                         2 => (
-                            self.selected.is_some() && self.secondary.is_some(),
+                            self.documents[self.active].selected.is_some()
+                                && self.documents[self.active].secondary.is_some(),
                             "先选主选构件，再 Ctrl+单击 副选构件",
                         ),
                         _ => (false, "不支持的元数"),
@@ -1462,9 +1615,9 @@ impl BimApp {
                         // 放样路径先行（§5.6 ①指定路径 → ②草图）：须先选中
                         // 路径构件（样条 / 线状）。
                         let sweep_path = if entry == SketchEntry::Sweep {
-                            match self.selected {
+                            match self.documents[self.active].selected {
                                 Some(id) => {
-                                    let path_name = self
+                                    let path_name = self.documents[self.active]
                                         .session
                                         .document()
                                         .doc()
@@ -1507,9 +1660,9 @@ impl BimApp {
             .on_hover_text("清空选择（含副选）")
             .clicked()
         {
-            self.selected = None;
-            self.picked = None;
-            self.secondary = None;
+            self.documents[self.active].selected = None;
+            self.documents[self.active].picked = None;
+            self.documents[self.active].secondary = None;
         }
         ui.separator();
         ui.label("拾取：");
@@ -1685,8 +1838,14 @@ impl BimApp {
     /// （新构件收几何；失败写日志，不 panic）。
     fn do_native_build(&mut self, op: BuildOp, args: PropertyMap) -> bool {
         let name = op.label();
-        match self.session.create_generic_element(name) {
-            Ok(id) => match self.session.build_native(id, op, &args) {
+        match self.documents[self.active]
+            .session
+            .create_generic_element(name)
+        {
+            Ok(id) => match self.documents[self.active]
+                .session
+                .build_native(id, op, &args)
+            {
                 Ok(out) => {
                     self.after_geometry_change(id, out.shape);
                     self.log(format!("✓ {name}：新构件已建几何（ShapeId {}）", out.shape));
@@ -1710,15 +1869,19 @@ impl BimApp {
     /// 1 输入算子（G3）：[`CoreSession::modify_native`] 替换选中构件几何
     /// （复用 ShapeId + 关联更新，图纸跟着动）。
     fn do_native_modify(&mut self, op: BuildOp, args: PropertyMap) -> bool {
-        let Some(id) = self.selected else {
+        let Some(id) = self.documents[self.active].selected else {
             return false; // 菜单按选中态启用，正常到不了这里
         };
-        match self.session.modify_native(id, op, &args) {
+        match self.documents[self.active]
+            .session
+            .modify_native(id, op, &args)
+        {
             Ok(report) => {
-                self.dirty = true;
+                self.documents[self.active].dirty = true;
                 // M12 增量重建：只网格化本次被改的形状（modify 复用原 ShapeId）。
                 if !report.changed_shapes.is_empty() {
-                    self.dirty_shapes = Some(report.changed_shapes.iter().copied().collect());
+                    self.documents[self.active].dirty_shapes =
+                        Some(report.changed_shapes.iter().copied().collect());
                 }
                 self.log(format!(
                     "✓ {}:关联更新：演化直连 {} + 指纹回退 {}，重投 {} 图元、重算 {} 标注、{} 视图已标脏",
@@ -1744,14 +1907,20 @@ impl BimApp {
     /// 2 输入算子（G3）：[`CoreSession::combine_native`] 主选 + 副选 →
     /// 新构件收结果（不动原有两构件；布尔消费语义 G6+ 撤销引擎后完善）。
     fn do_native_combine(&mut self, op: BuildOp, args: PropertyMap) -> bool {
-        let (Some(primary), Some(sec)) = (self.selected, self.secondary) else {
+        let (Some(primary), Some(sec)) = (
+            self.documents[self.active].selected,
+            self.documents[self.active].secondary,
+        ) else {
             return false; // 菜单按选中态启用，正常到不了这里
         };
-        match self.session.combine_native(primary, sec, op, &args) {
+        match self.documents[self.active]
+            .session
+            .combine_native(primary, sec, op, &args)
+        {
             Ok(out) => {
                 self.after_geometry_change(out.element, out.shape);
                 // 布尔完成，副选清空（下一次组合需重新 Ctrl+单击）。
-                self.secondary = None;
+                self.documents[self.active].secondary = None;
                 self.log(format!(
                     "✓ {}：新构件已收结果（ShapeId {}，原两构件不动）",
                     op.label(),
@@ -1772,12 +1941,12 @@ impl BimApp {
     /// 几何变化后的 GUI 状态收尾（build / combine 共用）：选中新构件、
     /// 增量网格化新形状、下一帧适配视图。
     fn after_geometry_change(&mut self, element: ElementId, shape: ShapeId) {
-        self.selected = Some(element);
-        self.picked = None;
-        self.dirty = true;
+        self.documents[self.active].selected = Some(element);
+        self.documents[self.active].picked = None;
+        self.documents[self.active].dirty = true;
         // M12 增量重建：只网格化新建的形状。
-        self.dirty_shapes = Some([shape].into_iter().collect());
-        self.fit_pending = true;
+        self.documents[self.active].dirty_shapes = Some([shape].into_iter().collect());
+        self.documents[self.active].fit_pending = true;
     }
 
     /// 草图编辑器浮窗（G4-M15）：take 状态机跑一帧，按结果放回 / 收尾 / 丢弃。
@@ -1789,8 +1958,12 @@ impl BimApp {
         let Some(mut st) = self.sketch.take() else {
             return;
         };
-        let frame =
-            crate::sketch_editor::run_editor(&mut st, &mut self.session, &mut self.logs, ctx);
+        let frame = crate::sketch_editor::run_editor(
+            &mut st,
+            &mut self.documents[self.active].session,
+            &mut self.logs,
+            ctx,
+        );
         match frame {
             crate::sketch_editor::EditorFrame::KeepOpen => self.sketch = Some(st),
             // 提交成功：run_editor 已写日志并关窗——这里只做渲染收尾。
@@ -1808,7 +1981,7 @@ impl BimApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
         ui.horizontal(|ui| {
-            let name = self
+            let name = self.documents[self.active]
                 .file_path
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -1818,7 +1991,7 @@ impl BimApp {
                 self.do_save_as();
             }
             ui.separator();
-            match &self.picked {
+            match &self.documents[self.active].picked {
                 Some(pk) => {
                     let p = pk.world_point;
                     ui.monospace(format!(
@@ -1836,9 +2009,15 @@ impl BimApp {
             ui.separator();
             ui.label(format!("拾取：{}", self.pick_mode.label()));
             ui.separator();
-            ui.monospace(format!("内核：{}", self.session.geometry().backend_name()));
+            ui.monospace(format!(
+                "内核：{}",
+                self.documents[self.active]
+                    .session
+                    .geometry()
+                    .backend_name()
+            ));
             ui.separator();
-            let sum = self.session.summary();
+            let sum = self.documents[self.active].session.summary();
             ui.label(format!(
                 "构件 {} · 几何 {} · 模块 {}",
                 sum.elements, sum.geometry, sum.modules
@@ -1869,7 +2048,12 @@ impl BimApp {
         ui.separator();
         // 先收集再交互（避免边遍历文档边改状态）：按品类分组（BTreeMap 天然有序）。
         let mut groups: BTreeMap<String, Vec<(ElementId, String, bool, bool)>> = BTreeMap::new();
-        for (id, e) in self.session.document().doc().elements() {
+        for (id, e) in self.documents[self.active]
+            .session
+            .document()
+            .doc()
+            .elements()
+        {
             groups
                 .entry(e.category.as_str().to_string())
                 .or_default()
@@ -1910,16 +2094,17 @@ impl BimApp {
                         (false, _) => format!("{name}（无几何）"),
                     };
                     // 副选构件同高亮（G3：布尔 / 扫掠类的第二输入）。
-                    let is_sel = self.selected == Some(*id) || self.secondary == Some(*id);
+                    let is_sel = self.documents[self.active].selected == Some(*id)
+                        || self.documents[self.active].secondary == Some(*id);
                     ui.horizontal(|ui| {
                         if ui.selectable_label(is_sel, text).clicked() {
                             // Ctrl+单击 = 设副选；普通单击 = 主选（与视口 do_pick 同语义）。
                             if ui.input(|i| i.modifiers.ctrl) {
-                                self.secondary = Some(*id);
+                                self.documents[self.active].secondary = Some(*id);
                                 self.log(format!("✓ 已设副选：{name}"));
                             } else {
-                                self.selected = Some(*id);
-                                self.picked = None;
+                                self.documents[self.active].selected = Some(*id);
+                                self.documents[self.active].picked = None;
                             }
                         }
                         // 可见性眼睛（G6-M2：文档级显隐，撤销步；动作收集）
@@ -1941,9 +2126,12 @@ impl BimApp {
         });
         // —— 动作段（文档遍历借用已结束）——
         if let Some((id, visible, name)) = toggle_visible {
-            match self.session.set_element_visibility(id, visible) {
+            match self.documents[self.active]
+                .session
+                .set_element_visibility(id, visible)
+            {
                 Ok(()) => {
-                    self.dirty = true; // 视口过滤按 visible 重算
+                    self.documents[self.active].dirty = true; // 视口过滤按 visible 重算
                     self.log(if visible {
                         format!("✓ 已显示「{name}」（撤销可回滚）")
                     } else {
@@ -1954,30 +2142,30 @@ impl BimApp {
             }
         }
         if let Some((id, name)) = delete {
-            let shape = self
+            let shape = self.documents[self.active]
                 .session
                 .document()
                 .doc()
                 .element(id)
                 .and_then(|e| e.geometry_ref);
-            match self.session.delete_element(id) {
+            match self.documents[self.active].session.delete_element(id) {
                 Ok(report) => {
                     if let Some(s) = shape {
-                        self.meshes.remove(&s);
+                        self.documents[self.active].meshes.remove(&s);
                     }
                     // 选中态清理（删的是选中 / 副选 / 编辑中 → 归零）
-                    if self.selected == Some(id) {
-                        self.selected = None;
-                        self.picked = None;
+                    if self.documents[self.active].selected == Some(id) {
+                        self.documents[self.active].selected = None;
+                        self.documents[self.active].picked = None;
                     }
-                    if self.secondary == Some(id) {
-                        self.secondary = None;
+                    if self.documents[self.active].secondary == Some(id) {
+                        self.documents[self.active].secondary = None;
                     }
-                    if self.edit.as_ref().map(|e| e.element) == Some(id) {
-                        self.edit = None;
+                    if self.documents[self.active].edit.as_ref().map(|e| e.element) == Some(id) {
+                        self.documents[self.active].edit = None;
                     }
-                    self.op_by_element.remove(&id);
-                    self.dirty = true;
+                    self.documents[self.active].op_by_element.remove(&id);
+                    self.documents[self.active].dirty = true;
                     self.log(format!(
                         "✓ 已删除构件「{name}」（元素 + 级联关系 + 几何记录；撤销可整体回滚）"
                     ));
@@ -2010,7 +2198,7 @@ impl BimApp {
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             // —— 类型列表（按名有序；M19 list_schemas）——
-            let schemas = self.session.list_schemas();
+            let schemas = self.documents[self.active].session.list_schemas();
             if schemas.is_empty() {
                 ui.label("（无已注册类型）");
             }
@@ -2143,7 +2331,7 @@ impl BimApp {
                                 let name = schema.type_name.clone();
                                 let count = schema.fields.len();
                                 // 新建模式重名校验（编辑模式覆盖语义——upsert 直接落库）
-                                let exists = self
+                                let exists = self.documents[self.active]
                                     .session
                                     .list_schemas()
                                     .iter()
@@ -2151,7 +2339,8 @@ impl BimApp {
                                 if e.is_new && exists {
                                     Err(format!("类型名已存在：{name}"))
                                 } else {
-                                    match self.session.upsert_schema(schema) {
+                                    match self.documents[self.active].session.upsert_schema(schema)
+                                    {
                                         Ok(()) => Ok(Some((name, count))),
                                         Err(err) => Err(err.to_string()),
                                     }
@@ -2178,15 +2367,21 @@ impl BimApp {
     }
 
     fn props_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(id) = self.selected else {
+        let Some(id) = self.documents[self.active].selected else {
             ui.label("未选中构件");
             ui.label("（列表单击，或视口内单击拾取）");
-            self.edit = None;
+            self.documents[self.active].edit = None;
             return;
         };
-        let Some(elem) = self.session.document().doc().element(id).cloned() else {
+        let Some(elem) = self.documents[self.active]
+            .session
+            .document()
+            .doc()
+            .element(id)
+            .cloned()
+        else {
             ui.label("构件不存在");
-            self.edit = None;
+            self.documents[self.active].edit = None;
             return;
         };
         egui::Grid::new("props_grid").striped(true).show(ui, |ui| {
@@ -2211,28 +2406,31 @@ impl BimApp {
         ui.heading("参数");
         // —— M10：选中变化时重置编辑暂存（快照当前参数 + 该构件的算子）——
         // G5-M21：一并快照模式定义（fields，渲染路由用；未注册模式为空）。
-        if self.edit.as_ref().map(|e| e.element) != Some(id) {
-            let schemas = self.session.list_schemas();
-            self.edit = self.op_by_element.get(&id).map(|op| {
-                let schema = elem.properties.schema.clone();
-                let fields = schemas
-                    .iter()
-                    .find(|s| s.type_name == schema)
-                    .map(|s| s.fields.clone())
-                    .unwrap_or_default();
-                ParamEdit {
-                    element: id,
-                    op_id: op.clone(),
-                    schema,
-                    fields,
-                    values: elem.properties.values.clone(),
-                }
-            });
+        if self.documents[self.active].edit.as_ref().map(|e| e.element) != Some(id) {
+            let schemas = self.documents[self.active].session.list_schemas();
+            self.documents[self.active].edit = self.documents[self.active]
+                .op_by_element
+                .get(&id)
+                .map(|op| {
+                    let schema = elem.properties.schema.clone();
+                    let fields = schemas
+                        .iter()
+                        .find(|s| s.type_name == schema)
+                        .map(|s| s.fields.clone())
+                        .unwrap_or_default();
+                    ParamEdit {
+                        element: id,
+                        op_id: op.clone(),
+                        schema,
+                        fields,
+                        values: elem.properties.values.clone(),
+                    }
+                });
         }
         // 渲染收集动作（edit 可变借用只圈在渲染段；动作在借用结束后执行）。
         let mut apply_clicked = false;
         let mut revert_clicked = false;
-        match self.edit.as_mut() {
+        match self.documents[self.active].edit.as_mut() {
             // 无算子记录（打开的文档构件 / 无几何构件）：参数只读展示。
             None => {
                 if elem.properties.is_empty() {
@@ -2390,13 +2588,13 @@ impl BimApp {
         if apply_clicked {
             self.apply_rebuild();
         }
-        if revert_clicked && let Some(e) = self.edit.as_mut() {
+        if revert_clicked && let Some(e) = self.documents[self.active].edit.as_mut() {
             e.values = elem.properties.values.clone();
         }
 
         ui.separator();
         ui.heading("拾取信息");
-        match &self.picked {
+        match &self.documents[self.active].picked {
             None => {
                 ui.label("（单击视口拾取）");
             }
@@ -2439,7 +2637,10 @@ impl BimApp {
 
         ui.separator();
         ui.heading("网格统计");
-        match elem.geometry_ref.and_then(|s| self.meshes.get(&s)) {
+        match elem
+            .geometry_ref
+            .and_then(|s| self.documents[self.active].meshes.get(&s))
+        {
             None => {
                 ui.label("（未网格化）");
             }
@@ -2484,9 +2685,12 @@ impl BimApp {
         ui.horizontal_wrapped(|ui| {
             for p in &presets {
                 if ui.small_button(p.label).clicked() {
-                    match self.session.create_view(p.label, p.orientation) {
+                    match self.documents[self.active]
+                        .session
+                        .create_view(p.label, p.orientation)
+                    {
                         Ok(vid) => {
-                            self.selected_view = Some(vid);
+                            self.documents[self.active].selected_view = Some(vid);
                             self.log(format!("✓ 视图已创建：{}（ViewId {vid}）", p.label));
                         }
                         Err(e) => self.log(format!("✗ 创建视图失败：{e}")),
@@ -2496,7 +2700,7 @@ impl BimApp {
         });
         ui.separator();
         // 视图列表（先收集再交互，避免边遍历边改状态）。
-        let items: Vec<(ViewId, String, bool, usize)> = self
+        let items: Vec<(ViewId, String, bool, usize)> = self.documents[self.active]
             .session
             .document()
             .drawing()
@@ -2516,13 +2720,13 @@ impl BimApp {
                     format!("{name} ⚠过期")
                 };
                 if ui
-                    .selectable_label(self.selected_view == Some(id), text)
+                    .selectable_label(self.documents[self.active].selected_view == Some(id), text)
                     .clicked()
                 {
-                    self.selected_view = Some(id);
+                    self.documents[self.active].selected_view = Some(id);
                 }
                 // 选中视图的操作条（M10 stale 徽章 + 重新出图在这里落地）。
-                if self.selected_view == Some(id) {
+                if self.documents[self.active].selected_view == Some(id) {
                     ui.horizontal(|ui| {
                         if ui.small_button("重新出图").clicked() {
                             self.regenerate_selected();
@@ -2531,7 +2735,7 @@ impl BimApp {
                             self.export_dxf(id);
                         }
                         if ui.small_button("预览").clicked() {
-                            self.preview_open = true;
+                            self.documents[self.active].preview_open = true;
                         }
                     });
                     ui.label(format!("图元 {entity_count} 条"));
@@ -2543,11 +2747,19 @@ impl BimApp {
 
     /// "重新出图"：走 `regenerate_view`（写回 + up_to_date 翻回 true；警告逐条可见）。
     fn regenerate_selected(&mut self) {
-        let Some(vid) = self.selected_view else {
+        let Some(vid) = self.documents[self.active].selected_view else {
             return;
         };
-        let standard = self.session.document().drawing().standard.clone();
-        match self.session.regenerate_view(vid, &standard) {
+        let standard = self.documents[self.active]
+            .session
+            .document()
+            .drawing()
+            .standard
+            .clone();
+        match self.documents[self.active]
+            .session
+            .regenerate_view(vid, &standard)
+        {
             Ok((written, warnings)) => {
                 self.log(format!("✓ 重新出图：写入 {written} 图元"));
                 for w in warnings {
@@ -2568,16 +2780,27 @@ impl BimApp {
             self.log("· DXF 导出已取消".to_string());
             return;
         };
-        let Some(view) = self.session.document().drawing().view(vid).cloned() else {
+        let Some(view) = self.documents[self.active]
+            .session
+            .document()
+            .drawing()
+            .view(vid)
+            .cloned()
+        else {
             self.log("✗ 导出失败：视图不存在".to_string());
             return;
         };
-        let standard = self.session.document().drawing().standard.clone();
-        match self
+        let standard = self.documents[self.active]
             .session
-            .interop()
-            .export_view(Format::Dxf, &view, &standard)
-        {
+            .document()
+            .drawing()
+            .standard
+            .clone();
+        match self.documents[self.active].session.interop().export_view(
+            Format::Dxf,
+            &view,
+            &standard,
+        ) {
             Ok(out) => match std::fs::write(&path, &out.bytes) {
                 Ok(()) => self.log(format!(
                     "✓ DXF 已导出：{}（{} 字节）",
@@ -2602,14 +2825,20 @@ impl BimApp {
         ui.label("新建图纸：");
         ui.horizontal(|ui| {
             ui.label("名称");
-            ui.add(egui::TextEdit::singleline(&mut self.sheet_new_name).desired_width(110.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.documents[self.active].sheet_new_name)
+                    .desired_width(110.0),
+            );
             ui.label("图号");
-            ui.add(egui::TextEdit::singleline(&mut self.sheet_new_number).desired_width(80.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.documents[self.active].sheet_new_number)
+                    .desired_width(80.0),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("图幅");
             egui::ComboBox::from_id_salt("sheet_new_format")
-                .selected_text(self.sheet_new_format.code())
+                .selected_text(self.documents[self.active].sheet_new_format.code())
                 .show_ui(ui, |ui| {
                     for f in [
                         SheetFormat::A0,
@@ -2619,23 +2848,35 @@ impl BimApp {
                         SheetFormat::A4,
                         SheetFormat::A4Extended,
                     ] {
-                        ui.selectable_value(&mut self.sheet_new_format, f, f.code());
+                        ui.selectable_value(
+                            &mut self.documents[self.active].sheet_new_format,
+                            f,
+                            f.code(),
+                        );
                     }
                 });
             if ui.button("新建").clicked() {
-                let name = self.sheet_new_name.trim();
-                let number = self.sheet_new_number.trim();
-                let name = if name.is_empty() { "图纸" } else { name };
-                let number = if number.is_empty() { "G-01" } else { number };
-                match self
-                    .session
-                    .create_sheet(name, number, self.sheet_new_format)
-                {
-                    Ok(sid) => {
-                        self.selected_sheet = Some(sid);
+                // 借用拆分（G6-M10）：ds 的可变借用在块内结束——日志所需展示串
+                // 先落成 owned，log 走 self，借用不跨 activation。
+                let outcome = {
+                    let ds = &mut self.documents[self.active];
+                    let name = ds.sheet_new_name.trim();
+                    let number = ds.sheet_new_number.trim();
+                    let name = if name.is_empty() { "图纸" } else { name };
+                    let number = if number.is_empty() { "G-01" } else { number };
+                    let fmt_code = ds.sheet_new_format.code();
+                    match ds.session.create_sheet(name, number, ds.sheet_new_format) {
+                        Ok(sid) => {
+                            ds.selected_sheet = Some(sid);
+                            Ok((number.to_string(), name.to_string(), fmt_code))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+                match outcome {
+                    Ok((number, name, fmt_code)) => {
                         self.log(format!(
-                            "✓ 图纸已创建：{number} · {name}（{}，撤销可恢复）",
-                            self.sheet_new_format.code()
+                            "✓ 图纸已创建：{number} · {name}（{fmt_code}，撤销可恢复）"
                         ));
                     }
                     Err(e) => self.log(format!("✗ 创建图纸失败：{e}")),
@@ -2644,7 +2885,7 @@ impl BimApp {
         });
         ui.separator();
         // 图纸列表（先收集再交互，避免边遍历边改状态）。
-        let items: Vec<(SheetId, String, String, String, usize)> = self
+        let items: Vec<(SheetId, String, String, String, usize)> = self.documents[self.active]
             .session
             .document()
             .drawing()
@@ -2676,16 +2917,19 @@ impl BimApp {
                     format!("{number} · {name}（{fmt_code}，空图纸）")
                 };
                 if ui
-                    .selectable_label(self.selected_sheet == Some(id), &text)
+                    .selectable_label(
+                        self.documents[self.active].selected_sheet == Some(id),
+                        &text,
+                    )
                     .clicked()
                 {
-                    self.selected_sheet = Some(id);
+                    self.documents[self.active].selected_sheet = Some(id);
                 }
                 // 选中图纸的操作条 + 放置表单 + 布置列表
-                if self.selected_sheet == Some(id) {
+                if self.documents[self.active].selected_sheet == Some(id) {
                     ui.horizontal(|ui| {
                         if ui.small_button("整图预览").clicked() {
-                            self.sheet_preview_open = true;
+                            self.documents[self.active].sheet_preview_open = true;
                         }
                         if ui.small_button("导出 DXF").clicked() {
                             self.export_sheet_file(Format::Dxf, id);
@@ -2700,7 +2944,7 @@ impl BimApp {
                     // —— 放置视图表单（视图下拉 + 比例下拉 + 位置；都先克隆出快照，
                     //    避免 session 不可变借用与暂存字段可变借用并存）——
                     ui.label("放置视图：");
-                    let views: Vec<(ViewId, String)> = self
+                    let views: Vec<(ViewId, String)> = self.documents[self.active]
                         .session
                         .document()
                         .drawing()
@@ -2708,13 +2952,14 @@ impl BimApp {
                         .iter()
                         .map(|(vid, v)| (*vid, v.name.clone()))
                         .collect();
-                    if self
+                    if self.documents[self.active]
                         .place_view_id
                         .is_none_or(|vid| !views.iter().any(|(v, _)| *v == vid))
                     {
-                        self.place_view_id = views.first().map(|(vid, _)| *vid);
+                        self.documents[self.active].place_view_id =
+                            views.first().map(|(vid, _)| *vid);
                     }
-                    let scales = self
+                    let scales = self.documents[self.active]
                         .session
                         .document()
                         .drawing()
@@ -2722,7 +2967,7 @@ impl BimApp {
                         .scale_series
                         .clone();
                     ui.horizontal(|ui| {
-                        let pv = self
+                        let pv = self.documents[self.active]
                             .place_view_id
                             .and_then(|vid| views.iter().find(|(v, _)| *v == vid))
                             .map(|(_, n)| n.clone())
@@ -2731,16 +2976,20 @@ impl BimApp {
                             .selected_text(pv)
                             .show_ui(ui, |ui| {
                                 for (vid, vname) in &views {
-                                    ui.selectable_value(&mut self.place_view_id, Some(*vid), vname);
+                                    ui.selectable_value(
+                                        &mut self.documents[self.active].place_view_id,
+                                        Some(*vid),
+                                        vname,
+                                    );
                                 }
                             });
                         ui.label("比例");
                         egui::ComboBox::from_id_salt(format!("place_scale_{id}"))
-                            .selected_text(format!("1:{}", self.place_scale))
+                            .selected_text(format!("1:{}", self.documents[self.active].place_scale))
                             .show_ui(ui, |ui| {
                                 for d in &scales {
                                     ui.selectable_value(
-                                        &mut self.place_scale,
+                                        &mut self.documents[self.active].place_scale,
                                         *d,
                                         format!("1:{d}"),
                                     );
@@ -2750,31 +2999,35 @@ impl BimApp {
                     ui.horizontal(|ui| {
                         ui.label("位置");
                         ui.add(
-                            egui::DragValue::new(&mut self.place_x_mm)
+                            egui::DragValue::new(&mut self.documents[self.active].place_x_mm)
                                 .prefix("X ")
                                 .suffix(" mm")
                                 .speed(1.0),
                         );
                         ui.add(
-                            egui::DragValue::new(&mut self.place_y_mm)
+                            egui::DragValue::new(&mut self.documents[self.active].place_y_mm)
                                 .prefix("Y ")
                                 .suffix(" mm")
                                 .speed(1.0),
                         );
                         if ui.button("布置").clicked()
-                            && let Some(vid) = self.place_view_id
+                            && let Some(vid) = self.documents[self.active].place_view_id
                         {
                             do_place = Some((
                                 id,
                                 vid,
-                                glam::DVec2::new(self.place_x_mm, self.place_y_mm),
-                                self.place_scale,
+                                glam::DVec2::new(
+                                    self.documents[self.active].place_x_mm,
+                                    self.documents[self.active].place_y_mm,
+                                ),
+                                self.documents[self.active].place_scale,
                             ));
                         }
                     });
                     // —— 布置列表（快照 + 视图名解析）——
                     if count > 0 {
-                        let placements: Vec<(usize, ViewId, glam::DVec2, u32)> = self
+                        let placements: Vec<(usize, ViewId, glam::DVec2, u32)> = self.documents
+                            [self.active]
                             .session
                             .document()
                             .drawing()
@@ -2789,7 +3042,7 @@ impl BimApp {
                             .unwrap_or_default();
                         ui.label(format!("布置（{count}）："));
                         for (idx, pvid, at, scale) in placements {
-                            let pname = self
+                            let pname = self.documents[self.active]
                                 .session
                                 .document()
                                 .drawing()
@@ -2809,10 +3062,10 @@ impl BimApp {
             }
             // 动作段（渲染段的可变借用已结束）
             if let Some(sid) = do_remove_sheet {
-                match self.session.remove_sheet(sid) {
+                match self.documents[self.active].session.remove_sheet(sid) {
                     Ok(()) => {
-                        if self.selected_sheet == Some(sid) {
-                            self.selected_sheet = None;
+                        if self.documents[self.active].selected_sheet == Some(sid) {
+                            self.documents[self.active].selected_sheet = None;
                         }
                         self.log("✓ 图纸已删除（其引用的视图不动；撤销可恢复）".to_string());
                     }
@@ -2820,13 +3073,19 @@ impl BimApp {
                 }
             }
             if let Some((sid, idx)) = do_remove_pl {
-                match self.session.remove_placement(sid, idx) {
+                match self.documents[self.active]
+                    .session
+                    .remove_placement(sid, idx)
+                {
                     Ok(vid) => self.log(format!("✓ 布置已移除（ViewId {vid}；撤销可恢复）")),
                     Err(e) => self.log(format!("✗ 移除布置失败：{e}")),
                 }
             }
             if let Some((sid, vid, at, scale)) = do_place {
-                match self.session.place_view_on_sheet(sid, vid, at, scale) {
+                match self.documents[self.active]
+                    .session
+                    .place_view_on_sheet(sid, vid, at, scale)
+                {
                     Ok(()) => self.log(format!("✓ 视图已布置到图纸（1:{scale}，撤销可恢复）")),
                     Err(e) => self.log(format!("✗ 布置失败：{e}")),
                 }
@@ -2848,8 +3107,16 @@ impl BimApp {
             self.log(format!("· {label} 导出已取消"));
             return;
         };
-        let drawing = self.session.document().drawing().clone();
-        match self.session.interop().export_sheet(format, &drawing, sid) {
+        let drawing = self.documents[self.active]
+            .session
+            .document()
+            .drawing()
+            .clone();
+        match self.documents[self.active]
+            .session
+            .interop()
+            .export_sheet(format, &drawing, sid)
+        {
             Ok(out) => match std::fs::write(&path, &out.bytes) {
                 Ok(()) => self.log(format!(
                     "✓ {label} 已导出：{}（{} 字节）",
@@ -2865,24 +3132,34 @@ impl BimApp {
     /// 浮动"整图预览"窗口（G6-M3）：把选中图纸摊平成 Drawing2D 后用 egui 画
     /// （图幅 / 图框 / 标题栏 / 全部布置一起画，`sheet_to_2d` 既有链路）。
     fn sheet_preview_window(&mut self, ctx: &egui::Context) {
-        if !self.sheet_preview_open {
+        if !self.documents[self.active].sheet_preview_open {
             return;
         }
-        let mut open = self.sheet_preview_open;
+        let mut open = self.documents[self.active].sheet_preview_open;
         egui::Window::new("整图预览")
             .open(&mut open)
             .default_width(820.0)
             .default_height(600.0)
             .show(ctx, |ui| {
-                let Some(sid) = self.selected_sheet else {
+                let Some(sid) = self.documents[self.active].selected_sheet else {
                     ui.label("（图纸页未选中图纸）");
                     return;
                 };
-                let Some(sheet) = self.session.document().drawing().sheet(sid).cloned() else {
+                let Some(sheet) = self.documents[self.active]
+                    .session
+                    .document()
+                    .drawing()
+                    .sheet(sid)
+                    .cloned()
+                else {
                     ui.label("图纸不存在");
                     return;
                 };
-                let drawing = self.session.document().drawing().clone();
+                let drawing = self.documents[self.active]
+                    .session
+                    .document()
+                    .drawing()
+                    .clone();
                 match core_app::interop_service::sheet_to_2d(&drawing, &sheet) {
                     Ok(d2) => {
                         let title = format!("{}（{}）", sheet.number, sheet.name);
@@ -2893,29 +3170,40 @@ impl BimApp {
                     }
                 }
             });
-        self.sheet_preview_open = open;
+        self.documents[self.active].sheet_preview_open = open;
     }
 
     /// 浮动"图纸预览"窗口：把选中视图摊平成 Drawing2D 后用 egui 画。
     fn drawing_preview_window(&mut self, ctx: &egui::Context) {
-        if !self.preview_open {
+        if !self.documents[self.active].preview_open {
             return;
         }
-        let mut open = self.preview_open;
+        let mut open = self.documents[self.active].preview_open;
         egui::Window::new("图纸预览")
             .open(&mut open)
             .default_width(720.0)
             .default_height(520.0)
             .show(ctx, |ui| {
-                let Some(vid) = self.selected_view else {
+                let Some(vid) = self.documents[self.active].selected_view else {
                     ui.label("（图纸面板未选中视图）");
                     return;
                 };
-                let Some(view) = self.session.document().drawing().view(vid).cloned() else {
+                let Some(view) = self.documents[self.active]
+                    .session
+                    .document()
+                    .drawing()
+                    .view(vid)
+                    .cloned()
+                else {
                     ui.label("视图不存在");
                     return;
                 };
-                let standard = self.session.document().drawing().standard.clone();
+                let standard = self.documents[self.active]
+                    .session
+                    .document()
+                    .drawing()
+                    .standard
+                    .clone();
                 match core_app::interop_service::view_to_2d(&view, &standard) {
                     Ok(d2) => {
                         self.draw_drawing_2d(ui, &d2, view.name.clone());
@@ -2925,7 +3213,7 @@ impl BimApp {
                     }
                 }
             });
-        self.preview_open = open;
+        self.documents[self.active].preview_open = open;
     }
 
     /// 画一张 2D 图纸（Drawing2D → egui）。
@@ -3007,7 +3295,7 @@ impl BimApp {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         // 视口几何喂给相机（拾取射线换算用）。
-        self.camera.viewport = (
+        self.documents[self.active].camera.viewport = (
             rect.center().x as f64,
             rect.center().y as f64,
             rect.height() as f64,
@@ -3019,12 +3307,13 @@ impl BimApp {
         if response.dragged_by(egui::PointerButton::Primary) && !ui.input(|i| i.modifiers.shift) {
             let d = response.drag_delta();
             // 水平：拖右＝物体右转＝相机绕目标左移（yaw 取负）。
-            self.camera.yaw -= d.x as f64 * 0.01;
+            self.documents[self.active].camera.yaw -= d.x as f64 * 0.01;
             // 垂直：拖下＝相机降低（pitch 取负，与水平轴同语义：拖动方向与参数增量反号）。
             // 无限位——越过极点由 normalize_pitch 翻转参数化（画面无跳变），
             // pitch_drag_sign 在过极点后翻转，方向映射保持自洽。
-            self.camera.pitch -= self.camera.pitch_drag_sign * d.y as f64 * 0.01;
-            self.camera.normalize_pitch();
+            self.documents[self.active].camera.pitch -=
+                self.documents[self.active].camera.pitch_drag_sign * d.y as f64 * 0.01;
+            self.documents[self.active].camera.normalize_pitch();
         }
         // —— 平移（右键拖动 或 Shift+左键拖动，抓取世界语义）——
         if response.dragged_by(egui::PointerButton::Secondary)
@@ -3032,17 +3321,18 @@ impl BimApp {
                 && ui.input(|i| i.modifiers.shift))
         {
             let d = response.drag_delta();
-            let (_, r, u) = self.camera.basis();
-            let k = self.camera.distance * 0.0016;
-            self.camera.target -= r * (d.x as f64 * k);
-            self.camera.target += u * (d.y as f64 * k);
+            let (_, r, u) = self.documents[self.active].camera.basis();
+            let k = self.documents[self.active].camera.distance * 0.0016;
+            self.documents[self.active].camera.target -= r * (d.x as f64 * k);
+            self.documents[self.active].camera.target += u * (d.y as f64 * k);
         }
         // —— 缩放（滚轮）——
         if response.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y) as f64;
             if scroll != 0.0 {
-                self.camera.distance = (self.camera.distance * (-scroll * 0.0022).exp())
-                    .clamp(MIN_DISTANCE, MAX_DISTANCE);
+                self.documents[self.active].camera.distance =
+                    (self.documents[self.active].camera.distance * (-scroll * 0.0022).exp())
+                        .clamp(MIN_DISTANCE, MAX_DISTANCE);
             }
         }
         // —— 拾取（单击；Ctrl+单击 = 副选，G3）——
@@ -3054,9 +3344,10 @@ impl BimApp {
         }
 
         // —— 画：地面网格 → 实体（画家算法）——
-        draw_grid(&painter, &rect, &self.camera);
-        let selected_shape = self.selected.and_then(|id| {
-            self.session
+        draw_grid(&painter, &rect, &self.documents[self.active].camera);
+        let selected_shape = self.documents[self.active].selected.and_then(|id| {
+            self.documents[self.active]
+                .session
                 .document()
                 .doc()
                 .element(id)
@@ -3065,9 +3356,11 @@ impl BimApp {
         self.draw_shapes(&painter, &rect, selected_shape);
 
         // —— 拾取标记（M12：边 / 顶点命中画黄圈标记，与面高亮橙实色区分）——
-        if let Some(pk) = &self.picked
+        if let Some(pk) = &self.documents[self.active].picked
             && !matches!(pk.kind, PickKind::Face)
-            && let Some((sp, _)) = self.camera.project(pk.world_point, &rect)
+            && let Some((sp, _)) = self.documents[self.active]
+                .camera
+                .project(pk.world_point, &rect)
         {
             let marker = egui::Color32::from_rgb(0xff, 0xd5, 0x2e);
             painter.circle_stroke(sp, 7.0, egui::Stroke::new(2.0_f32, marker));
@@ -3090,7 +3383,7 @@ impl BimApp {
         rect: &egui::Rect,
         selected_shape: Option<ShapeId>,
     ) {
-        if self.meshes.is_empty() {
+        if self.documents[self.active].meshes.is_empty() {
             return;
         }
         let light = DVec3::new(0.45, -0.5, 0.85).normalize_or_zero();
@@ -3104,7 +3397,7 @@ impl BimApp {
         // 元素级显隐过滤（G6-M2 眼睛）：某形状的**全部**引用元素都隐藏时才不画
         // （多元素共享同一段几何按"任一可见即画"）。每帧从元素预计算一次，
         // O(元素数)——视口渲染本身就要遍历全部 mesh，代价可接受。
-        let visible_shapes: HashSet<ShapeId> = self
+        let visible_shapes: HashSet<ShapeId> = self.documents[self.active]
             .session
             .document()
             .doc()
@@ -3113,7 +3406,7 @@ impl BimApp {
             .filter(|e| e.visible)
             .filter_map(|e| e.geometry_ref)
             .collect();
-        for (shape_id, sm) in self.meshes.iter() {
+        for (shape_id, sm) in self.documents[self.active].meshes.iter() {
             if !visible_shapes.contains(shape_id) {
                 continue;
             }
@@ -3174,9 +3467,15 @@ impl BimApp {
                 };
                 // 任一顶点在近平面内 → 跳过该三角形（首版不做裁剪）。
                 let (Some(s0), Some(s1), Some(s2)) = (
-                    self.camera.project(DVec3::new(pa[0], pa[1], pa[2]), rect),
-                    self.camera.project(DVec3::new(pb[0], pb[1], pb[2]), rect),
-                    self.camera.project(DVec3::new(pc[0], pc[1], pc[2]), rect),
+                    self.documents[self.active]
+                        .camera
+                        .project(DVec3::new(pa[0], pa[1], pa[2]), rect),
+                    self.documents[self.active]
+                        .camera
+                        .project(DVec3::new(pb[0], pb[1], pb[2]), rect),
+                    self.documents[self.active]
+                        .camera
+                        .project(DVec3::new(pc[0], pc[1], pc[2]), rect),
                 ) else {
                     continue;
                 };
@@ -3192,7 +3491,7 @@ impl BimApp {
                 // 双面光照（|n·l|），避免背向面全黑。
                 let lit = 0.45 + 0.55 * n.dot(light).abs() as f32;
                 let picked_face = gi != usize::MAX
-                    && self
+                    && self.documents[self.active]
                         .picked
                         .as_ref()
                         .is_some_and(|pk| mesh.face_groups[gi].face_hash == pk.topo_hash);
@@ -3329,6 +3628,8 @@ impl eframe::App for BimApp {
         // G6-M5 可停靠面板 + G6-M8 Ribbon：菜单栏 → Ribbon → dock（面板区：元素/
         // 类型/属性/视图/图纸/日志/视口，用户可拖动重排 / 拖出窗口 / 关闭）→ 状态栏 → 浮窗。
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| self.menu_bar(ui));
+        // G6-M10 文档页签条：每打开文档一个页签，点击切换活跃文档（最后一个不可关）。
+        egui::TopBottomPanel::top("doc_tabs").show(ctx, |ui| self.document_tabs(ui));
         egui::TopBottomPanel::top("ribbon").show(ctx, |ui| self.ribbon(ui));
         // bottom 面板先 show 的贴底：状态栏最底。
         egui::TopBottomPanel::bottom("status_bar")
@@ -3508,5 +3809,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 多文档钉 1（G6-M10）：初始恰好一份文档、激活下标 0、
+    /// 页签标题带脏标记（未保存的新文档显示"未命名 *"）。
+    #[test]
+    fn new_app_starts_with_one_document() {
+        let app = BimApp::new().unwrap();
+        assert_eq!(app.documents.len(), 1, "初始应恰好一份文档");
+        assert_eq!(app.active, 0);
+        assert!(app.documents[0].dirty, "初始文档脏标记置位（触发首帧重建）");
+        assert_eq!(app.documents[0].tab_title(), "未命名 *");
+    }
+
+    /// 多文档钉 2：新建**追加**文档并激活（旧文档保留在池中），
+    /// 跨文档残留编辑态（参数表单/草图/类型编辑）被清。
+    #[test]
+    fn do_new_appends_and_activates() {
+        let mut app = BimApp::new().unwrap();
+        // 造一个编辑态残留（参数表单浮窗开着）。
+        app.op_form = Some(OpForm {
+            op: BuildOp::MakeBox,
+            values: BTreeMap::new(),
+        });
+        app.do_new();
+        assert_eq!(app.documents.len(), 2, "新建应追加而非替换");
+        assert_eq!(app.active, 1, "新建后激活新文档");
+        assert!(
+            app.op_form.is_none() && app.sketch.is_none() && app.types_edit.is_none(),
+            "切换文档应清跨文档残留编辑态"
+        );
+        assert!(app.documents[0].dirty, "旧文档保留（脏标记原样）");
+    }
+
+    /// 多文档钉 3：最后一个文档不可关——close_document 被拒绝，池不变。
+    #[test]
+    fn close_document_keeps_last_one() {
+        let mut app = BimApp::new().unwrap();
+        app.close_document(0);
+        assert_eq!(app.documents.len(), 1, "最后一个文档不可关");
+        assert_eq!(app.active, 0);
+    }
+
+    /// 多文档钉 4：关活跃文档后 active 指向相邻；旧文档的会话内容保留
+    /// （起手梁仍在，文档间互不串数据）。
+    #[test]
+    fn close_active_document_clamps_active() {
+        let mut app = BimApp::new().unwrap();
+        app.do_new(); // 2 个文档，active = 1
+        assert_eq!(app.active, 1);
+        let first_elements = app.documents[0].session.summary().elements;
+        app.close_document(1);
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.active, 0, "关活跃文档后 clamp 回相邻文档");
+        assert_eq!(
+            app.documents[0].session.summary().elements,
+            first_elements,
+            "保留文档的会话内容不变"
+        );
     }
 }

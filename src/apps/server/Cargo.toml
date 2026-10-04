@@ -28,3 +28,5 @@ core-model.workspace = true
 core-sdk.workspace = true
 example-beam.workspace = true
 glam.workspace = true
+# G6-M6：CLI 批处理驱动（子命令形态）
+clap.workspace = true

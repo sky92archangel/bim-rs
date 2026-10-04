@@ -24,6 +24,12 @@
 //! 模块装载：CLI 默认装载 [`ExampleBeam`]（本 crate 既有依赖）——
 //! 品类与算子的默认值直接引用模块导出常量 [`CATEGORY`] / [`GEOMETRY_OP_ID`]，
 //! 与桌面端 `apps/desktop` 同款，保持单一事实源。
+//!
+//! ## HTTP 桥（G6-M7，外部调用形态第二期）
+//!
+//! `bim-server serve --host 127.0.0.1 --port 8300` 启动 axum REST 服务，
+//! 暴露 CoreSession **会话态门面**（多步工作流：建会话 → 造构件 → 建几何 →
+//! 建视图/图纸 → 布置 → 保存/导出 → 撤销/重做）——端点清单见 [`crate::http`] 模块文档。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,6 +40,9 @@ use core_doc::DraftingStandard;
 use core_interop::Format;
 use core_model::SheetId;
 use example_beam::{CATEGORY, ExampleBeam, GEOMETRY_OP_ID};
+
+/// HTTP 桥（G6-M7）：axum REST 暴露 CoreSession 会话态门面。
+mod http;
 
 /// 既有骨架的模块装配（G6-M6 起服务侧命令共用）。
 mod setup {
@@ -119,6 +128,15 @@ enum Command {
         #[arg(long)]
         view: Option<String>,
     },
+    /// 启动 HTTP 服务（REST 桥，G6-M7）
+    Serve {
+        /// 监听地址（默认本机回环）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 端口（0 = OS 分配，探针从 stdout 解析实际地址）
+        #[arg(long, default_value_t = 8300)]
+        port: u16,
+    },
 }
 
 /// `--format` 的 CLI 层枚举：字符串 → [`Format`] 的映射薄壳。
@@ -161,6 +179,7 @@ fn main() -> ExitCode {
             sheet,
             view,
         } => export(&doc, format.into(), &out, sheet.as_deref(), view.as_deref()),
+        Command::Serve { host, port } => run_serve(&host, port),
     };
 
     match result {
@@ -170,6 +189,19 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `serve` 子命令的执行体：薄 runtime 阻塞 HTTP 服务（main 同步形态的 async 桥）。
+///
+/// # Errors
+/// 运行时创建或服务运行失败时返回错误文本。
+fn run_serve(host: &str, port: u16) -> Result<(), String> {
+    // 其余子命令都是同步的，main 保持同步形态——这里包一个薄 runtime 阻塞其上
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("运行时创建失败：{e}"))?;
+    rt.block_on(http::serve(host, port))
 }
 
 /// 端到端装配自检（骨架期既有行为，保留为 `demo` 子命令）。

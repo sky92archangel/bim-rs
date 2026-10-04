@@ -116,6 +116,15 @@ egui-phosphor = "0.7"
 # version = "0.29" 实证）；DockState/Tree/DockArea/TabViewer 见其 lib.rs。
 egui_dock = "0.14"
 
+# --- HTTP 服务（G6-M7，仅 apps/server 使用）----------------------------------
+# axum 0.8（MIT）：default features 自带 json + tokio（hyper 1.x 栈）；
+# 路径参数语法 0.8 起为 `/{id}`（0.7 的 `/:id` 已移除）。
+axum = "0.8"
+# tokio default 空——显式开 rt-multi-thread（多线程运行时）+ macros（#[tokio::main] /
+# #[tokio::test]）+ net（TcpListener）。axum 的 tokio feature 也会拉这些，
+# 但直接 use 的 crate 按惯例显式声明。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
 [workspace.lints.rust]
 unsafe_code = "deny"           # 内核适配层可局部 allow，但需评审
 

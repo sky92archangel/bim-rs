@@ -50,7 +50,13 @@ impl BackendKind {
 ///   供无 WASM 环境的开发与测试；
 /// - [`OcctBackend`](crate::OcctBackend)：真实 `occt-wasm` v4（[`BackendKind::Real`]，
 ///   M0 接入、M1 补齐持久化互操作）。
-pub trait KernelBackend {
+///
+/// **Send supertrait（G6-M7）**：`Kernel`（`Box<dyn KernelBackend>`）随
+/// `CoreSession` 进 HTTP 桥的共享会话表（`Mutex<HashMap<…>>`）——axum 的
+/// `State` 要求 `Send + Sync`，`Mutex<T>: Sync` 要求 `T: Send`，Send 断在此。
+/// 两个实现的 Send 已被现有代码实证：MockBackend 纯数据结构；OcctBackend
+/// 在 occt 腿的静态共享 `Mutex<OcctBackend>`（`occt.rs` SHARED_BACKEND）编译通过。
+pub trait KernelBackend: Send {
     /// 后端名称（用于日志与错误信息）。
     fn name(&self) -> &'static str;
 

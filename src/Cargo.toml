@@ -125,6 +125,12 @@ axum = "0.8"
 # 但直接 use 的 crate 按惯例显式声明。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 
+# --- 脚本引擎（G6-M9，仅 apps/server 使用）-----------------------------------
+# rhai 1.26（MIT OR Apache-2.0，rust-version 1.66 < 1.95）：嵌入式脚本语言，
+# Engine 单线程执行（CoreSession 同步门面天然匹配，无需 async）；
+# register_fn 支持返回 Result（Err 自动转 EvalAltResult 终止脚本）。
+rhai = "1.26"
+
 [workspace.lints.rust]
 unsafe_code = "deny"           # 内核适配层可局部 allow，但需评审
 

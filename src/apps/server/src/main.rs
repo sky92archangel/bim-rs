@@ -30,6 +30,14 @@
 //! `bim-server serve --host 127.0.0.1 --port 8300` 启动 axum REST 服务，
 //! 暴露 CoreSession **会话态门面**（多步工作流：建会话 → 造构件 → 建几何 →
 //! 建视图/图纸 → 布置 → 保存/导出 → 撤销/重做）——端点清单见 [`crate::http`] 模块文档。
+//!
+//! ## rhai 脚本引擎（G6-M9，外部调用形态第三期）
+//!
+//! `bim-server script --path build.rhai` 执行 rhai 脚本——脚本直接驱动
+//! CoreSession（`new_session()` / `open_session(path)` 返回会话对象，
+//! 方法调用建模式：`s.create_element(...)` / `s.build_geometry(...)` /
+//! `s.save(...)`）。函数清单与错误语义见 [`crate::script`] 模块文档——
+//! 外部调用形态三期全落地：CLI（一次性批处理）+ HTTP（常驻 REST）+ rhai（脚本编排）。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,6 +51,9 @@ use example_beam::{CATEGORY, ExampleBeam, GEOMETRY_OP_ID};
 
 /// HTTP 桥（G6-M7）：axum REST 暴露 CoreSession 会话态门面。
 mod http;
+
+/// rhai 脚本引擎（G6-M9）：脚本直接驱动 CoreSession。
+mod script;
 
 /// 既有骨架的模块装配（G6-M6 起服务侧命令共用）。
 mod setup {
@@ -137,6 +148,12 @@ enum Command {
         #[arg(long, default_value_t = 8300)]
         port: u16,
     },
+    /// 执行 rhai 脚本（脚本引擎，G6-M9）
+    Script {
+        /// 脚本路径（.rhai——脚本自管会话：new_session() / open_session(path)）
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 /// `--format` 的 CLI 层枚举：字符串 → [`Format`] 的映射薄壳。
@@ -180,6 +197,7 @@ fn main() -> ExitCode {
             view,
         } => export(&doc, format.into(), &out, sheet.as_deref(), view.as_deref()),
         Command::Serve { host, port } => run_serve(&host, port),
+        Command::Script { path } => script::run_script(&path),
     };
 
     match result {

@@ -36,3 +36,5 @@ clap.workspace = true
 # G6-M7：HTTP 桥（REST 暴露 CoreSession 门面）
 axum.workspace = true
 tokio.workspace = true
+# G6-M9：rhai 脚本引擎（脚本直接驱动 CoreSession）
+rhai.workspace = true

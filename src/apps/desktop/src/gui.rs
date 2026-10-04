@@ -627,9 +627,31 @@ struct BimApp {
     ribbon_tab: RibbonTab,
 }
 
-/// 原生算子参数表单状态（G3：确认时换算成 PropertyMap → build/modify/combine_native）。
+/// 参数表单的算子来源（G6-M13 双源：原生算子走 [`BuildOp::param_defs`]，
+/// 模块配方走 `GeometryOp::param_defs`——提交路由不同，表单渲染共用）。
+#[derive(Clone)]
+enum OpFormSource {
+    /// 原生算子（G3：确认时按元数路由 build / modify / combine_native）。
+    Native(BuildOp),
+    /// 模块配方算子（G6-M13：确认时 建构件 → 参数落属性 → build_geometry，
+    /// 失败回滚删除刚建构件）。
+    Recipe {
+        /// 品类（create_element 用）。
+        category: String,
+        /// 算子 id（build_geometry 用）。
+        op_id: String,
+        /// 界面显示名（窗口标题 / 日志）。
+        label: String,
+        /// 参数定义（打开时从注册表取好——窗口 / 确认阶段不再借 session）。
+        defs: Vec<ParamDef>,
+    },
+}
+
+/// 原生 / 模块配方共用参数表单状态（G3 + G6-M13 双源：确认时换算成
+/// PropertyMap，按来源路由执行链）。
 struct OpForm {
-    op: BuildOp,
+    /// 算子来源（决定提交路由与参数定义）。
+    source: OpFormSource,
     /// 编辑中的值（键 → 表单值；初始由 param_defs 的 default 预填）
     values: BTreeMap<&'static str, FormValue>,
 }
@@ -1332,32 +1354,69 @@ impl BimApp {
         self.documents[self.active].camera.distance = (diag * 1.8).max(500.0);
     }
 
-    /// 新建构件 + 造几何（失败写日志，不 panic）。
+    /// 新建构件 + 造几何（失败写日志 + **回滚删除刚建构件**，不 panic、
+    /// 不留无几何的孤儿元素——G6-M13 语义升级，原 G6-M12「失败元素留下」
+    /// 由用户手动删）。
     fn build_op(&mut self, category: &str, op_id: &str, label: &str) {
-        match self.documents[self.active]
-            .session
-            .create_element(category, "")
-        {
-            Ok(elem) => match self.documents[self.active]
-                .session
-                .build_geometry(elem, op_id)
-            {
-                Ok(shape) => {
-                    self.documents[self.active].selected = Some(elem);
-                    self.documents[self.active].picked = None;
-                    self.documents[self.active].dirty = true;
-                    // M12 增量重建：只网格化新建的形状。
-                    self.documents[self.active].dirty_shapes = Some([shape].into_iter().collect());
-                    self.documents[self.active].fit_pending = true;
-                    // 记录算子（M10：rebuild 需要同款算子）。
-                    self.documents[self.active]
-                        .op_by_element
-                        .insert(elem, op_id.to_string());
-                    self.log(format!("✓ {label}：{op_id} 已建几何（ShapeId {shape}）"));
+        self.build_op_with_params(category, op_id, label, None);
+    }
+
+    /// 带参数版（G6-M13）：`params = Some` 时参数**先落元素属性**（M10 语义：
+    /// 属性与几何同源——与 G5-M21 属性回写一致）再建几何（`build_geometry`
+    /// 从元素属性取参数构造 `OpInput`）；任何失败回滚删除刚建构件并写日志。
+    /// `None` 走既有无参链（元素属性为空，算子用内部缺省）。
+    ///
+    /// 返回是否成功（表单确认链用：成功才关表单，失败保持打开可重试）。
+    fn build_op_with_params(
+        &mut self,
+        category: &str,
+        op_id: &str,
+        label: &str,
+        params: Option<PropertyMap>,
+    ) -> bool {
+        // 借用拆分（G6-M10 同款）：ds 借 self.documents，日志走 self.logs
+        // 字段投影——两个不相交字段可同时借用（self.log() 方法需 &mut self
+        // 整体，会提前终止 ds 的借用，故本方法内不用）。
+        let ds = &mut self.documents[self.active];
+        match ds.session.create_element(category, "") {
+            Ok(elem) => {
+                // ① 参数落属性（M10 语义：属性与几何同源）。
+                if let Some(p) = params
+                    && let Err(e) = ds.session.update_element_properties(elem, p)
+                {
+                    self.logs
+                        .push(format!("✗ {label}：参数落属性失败：{e}（已回滚新建构件）"));
+                    let _ = ds.session.delete_element(elem);
+                    return false;
                 }
-                Err(e) => self.log(format!("✗ {label}：{op_id} 建几何失败：{e}")),
-            },
-            Err(e) => self.log(format!("✗ 创建 {category} 构件失败：{e}")),
+                // ② 造几何（build_geometry 从元素属性取参数）。
+                match ds.session.build_geometry(elem, op_id) {
+                    Ok(shape) => {
+                        ds.selected = Some(elem);
+                        ds.picked = None;
+                        ds.dirty = true;
+                        // M12 增量重建：只网格化新建的形状。
+                        ds.dirty_shapes = Some([shape].into_iter().collect());
+                        ds.fit_pending = true;
+                        // 记录算子（M10：rebuild 需要同款算子）。
+                        ds.op_by_element.insert(elem, op_id.to_string());
+                        self.logs
+                            .push(format!("✓ {label}：{op_id} 已建几何（ShapeId {shape}）"));
+                        true
+                    }
+                    Err(e) => {
+                        self.logs.push(format!(
+                            "✗ {label}：{op_id} 建几何失败：{e}（已回滚新建构件）"
+                        ));
+                        let _ = ds.session.delete_element(elem);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                self.logs.push(format!("✗ 创建 {category} 构件失败：{e}"));
+                false
+            }
         }
     }
 
@@ -1580,8 +1639,8 @@ impl BimApp {
         ui.separator();
     }
 
-    /// 模块配方面板（计划 §5.1：G6-M12 起九条配方按钮——mock 腿不支持的
-    /// 算子点击后日志响亮报错）。
+    /// 模块配方面板（计划 §5.1：G6-M12 起九条配方按钮——G6-M13 起算子有
+    /// 专业参数定义时**先弹参数表单**（确认才建），无定义直接建兜底）。
     fn ribbon_recipes(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
         ui.vertical(|ui| {
@@ -1591,11 +1650,28 @@ impl BimApp {
                     .button(format!("{} {}", ph::PACKAGE, btn.label))
                     .clicked()
                 {
-                    self.build_op(btn.category, btn.op_id, btn.label);
+                    self.recipe_button_clicked(&btn);
                 }
             }
             ui.vertical_centered(|ui| ui.weak("模块配方"));
         });
+    }
+
+    /// 配方按钮点击（G6-M13 共用入口，Ribbon 与元素树两处）：算子有专业
+    /// 参数定义（`param_defs` 非空）时打开配方参数表单；无定义（未覆写）
+    /// 直接建——照 G6-M12 现状。
+    fn recipe_button_clicked(&mut self, btn: &OpButton) {
+        let has_defs = self.documents[self.active]
+            .session
+            .modules()
+            .registry()
+            .geometry_op(btn.op_id)
+            .is_some_and(|op| !op.param_defs().is_empty());
+        if has_defs {
+            self.open_recipe_form(btn.category, btn.op_id, btn.label);
+        } else {
+            self.build_op(btn.category, btn.op_id, btn.label);
+        }
     }
 
     /// 草图四入口面板（G4-M15 共用编辑器；G4-M18 特征链路——入口决定「完成」
@@ -1714,7 +1790,38 @@ impl BimApp {
         for def in op.param_defs() {
             values.insert(def.key, form_value_from_default(&def));
         }
-        self.op_form = Some(OpForm { op, values });
+        self.op_form = Some(OpForm {
+            source: OpFormSource::Native(op),
+            values,
+        });
+    }
+
+    /// 打开模块配方参数表单（G6-M13）：参数定义从注册表算子的 `param_defs`
+    /// 取（单一事实源照原生先例——表单不另立参数表），default 预填。
+    fn open_recipe_form(&mut self, category: &str, op_id: &str, label: &str) {
+        let Some(op) = self.documents[self.active]
+            .session
+            .modules()
+            .registry()
+            .geometry_op(op_id)
+        else {
+            self.log(format!("✗ 未登记几何算子 `{op_id}`"));
+            return;
+        };
+        let defs = op.param_defs();
+        let mut values = BTreeMap::new();
+        for def in &defs {
+            values.insert(def.key, form_value_from_default(def));
+        }
+        self.op_form = Some(OpForm {
+            source: OpFormSource::Recipe {
+                category: category.to_string(),
+                op_id: op_id.to_string(),
+                label: label.to_string(),
+                defs,
+            },
+            values,
+        });
     }
 
     /// 参数表单浮窗（G3）：[`ParamKind`] 路由控件 + 确定提交。
@@ -1729,7 +1836,12 @@ impl BimApp {
         // 标题与参数定义先取出（窗口闭包内只借 self.op_form 的值槽）。
         let (title, defs) = {
             let form = self.op_form.as_ref().expect("checked above");
-            (format!("参数：{}", form.op.label()), form.op.param_defs())
+            match &form.source {
+                OpFormSource::Native(op) => (format!("参数：{}", op.label()), op.param_defs()),
+                OpFormSource::Recipe { label, defs, .. } => {
+                    (format!("参数：{label}"), defs.clone())
+                }
+            }
         };
         let mut open = true;
         let mut confirmed = false;
@@ -1790,20 +1902,30 @@ impl BimApp {
         }
     }
 
-    /// 提交参数表单（G3）：必填校验 → 表单值换算成 [`PropertyMap`]（角度度 →
-    /// 弧度）→ 按元数路由 [`Self::do_native_build`] / [`Self::do_native_modify`]
-    /// / [`Self::do_native_combine`]。
+    /// 提交参数表单（G3 + G6-M13 双源）：必填校验 → 表单值换算成
+    /// [`PropertyMap`]（角度度 → 弧度）→ 按来源路由——原生算子按元数走
+    /// [`Self::do_native_build`] / [`Self::do_native_modify`] /
+    /// [`Self::do_native_combine`]；模块配方走 [`Self::build_op_with_params`]
+    /// （建构件 → 参数落属性 → 建几何，失败回滚）。
     ///
     /// 校验失败（必填选择器空串）或执行失败：表单**保持打开**（用户可改后重试）；
     /// 成功才关闭。失败一律写日志，不吞错。
     fn confirm_op_form(&mut self) {
         // 校验 + 换算（借用圈在块内；路由在块外做可变调用）。
-        let (op, args) = {
+        let (source, args) = {
             let Some(form) = self.op_form.as_ref() else {
                 return;
             };
-            let mut args = PropertyMap::new(format!("native:{}", form.op.label()));
-            for def in form.op.param_defs() {
+            let defs: Vec<ParamDef> = match &form.source {
+                OpFormSource::Native(op) => op.param_defs(),
+                OpFormSource::Recipe { defs, .. } => defs.clone(),
+            };
+            let schema_name = match &form.source {
+                OpFormSource::Native(op) => format!("native:{}", op.label()),
+                OpFormSource::Recipe { category, .. } => category.clone(),
+            };
+            let mut args = PropertyMap::new(schema_name);
+            for def in &defs {
                 let Some(v) = form.values.get(def.key) else {
                     continue;
                 };
@@ -1814,7 +1936,10 @@ impl BimApp {
                 {
                     self.log(format!(
                         "✗ {}：{}（{}）为必填，请填选择器 JSON",
-                        form.op.label(),
+                        match &form.source {
+                            OpFormSource::Native(op) => op.label().to_string(),
+                            OpFormSource::Recipe { label, .. } => label.clone(),
+                        },
                         def.label,
                         def.key
                     ));
@@ -1833,17 +1958,25 @@ impl BimApp {
                 };
                 args.set(def.key.to_string(), converted);
             }
-            (form.op, args)
+            (form.source.clone(), args)
         };
-        // 按元数路由执行；成功关表单，失败保持打开（已写日志，可改后重试）。
-        let ok = match op.arity() {
-            0 => self.do_native_build(op, args),
-            1 => self.do_native_modify(op, args),
-            2 => self.do_native_combine(op, args),
-            _ => {
-                self.log(format!("· {} 是变长输入算子，G4 草图流程接入", op.label()));
-                false
-            }
+        // 按来源路由执行；成功关表单，失败保持打开（已写日志，可改后重试）。
+        let ok = match source {
+            OpFormSource::Native(op) => match op.arity() {
+                0 => self.do_native_build(op, args),
+                1 => self.do_native_modify(op, args),
+                2 => self.do_native_combine(op, args),
+                _ => {
+                    self.log(format!("· {} 是变长输入算子，G4 草图流程接入", op.label()));
+                    false
+                }
+            },
+            OpFormSource::Recipe {
+                category,
+                op_id,
+                label,
+                ..
+            } => self.build_op_with_params(&category, &op_id, &label, Some(args)),
         };
         if ok {
             self.op_form = None;
@@ -2052,12 +2185,12 @@ impl BimApp {
     /// ——`update_after_removal`，不再需要提示「重新生成」）。
     fn elements_panel(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
-        // —— 新建构件（模块算子按钮；mock 腿不支持的算子点击后日志响亮报错）——
+        // —— 新建构件（模块算子按钮；G6-M13 起有参数定义的算子先弹参数表单）——
         ui.label("新建构件：");
         ui.horizontal_wrapped(|ui| {
             for btn in op_buttons() {
                 if ui.small_button(btn.label).clicked() {
-                    self.build_op(btn.category, btn.op_id, btn.label);
+                    self.recipe_button_clicked(&btn);
                 }
             }
         });
@@ -3827,6 +3960,88 @@ mod tests {
         }
     }
 
+    /// G6-M13 钉 1：模块配方参数表单——open_recipe_form 从注册表取算子的
+    /// `param_defs` 预填缺省，提交后构件 + 几何建立（参数落属性，属性与
+    /// 几何同源），成功关表单。
+    #[test]
+    fn recipe_form_opens_prefilled_and_builds_on_confirm() {
+        let mut app = BimApp::new().unwrap();
+        let before = app.documents[0].session.summary().elements;
+
+        app.open_recipe_form(BEAM_CATEGORY, OP_BEAM_RECT, "梁·矩形截面");
+        let Some(form) = app.op_form.as_ref() else {
+            panic!("配方表单应打开");
+        };
+        assert!(
+            matches!(form.source, OpFormSource::Recipe { .. }),
+            "表单来源应为 Recipe"
+        );
+        assert!(!form.values.is_empty(), "param_defs 缺省应预填 values");
+
+        // 提交（values 已预填缺省）→ 建构件 + 建几何。
+        app.confirm_op_form();
+        assert!(app.op_form.is_none(), "成功应关表单");
+        assert_eq!(
+            app.documents[0].session.summary().elements,
+            before + 1,
+            "应恰好新建一个构件"
+        );
+        // 新构件带几何 + 参数落属性（属性与几何同源）。
+        let elem = app.documents[0].selected.expect("新构件应被选中");
+        let e = app.documents[0]
+            .session
+            .document()
+            .doc()
+            .element(elem)
+            .expect("新构件应存在");
+        assert!(e.has_geometry(), "新构件应带几何");
+        assert!(
+            e.properties.get_float("width").is_some(),
+            "表单参数应落元素属性"
+        );
+    }
+
+    /// G6-M13 钉 2：失败回滚——mock 腿 Pipe 不支持（弯头算子），提交后
+    /// 建几何失败 → 刚建构件被回滚删除 + 表单保持打开（可改后重试）。
+    #[test]
+    fn recipe_form_rolls_back_and_stays_open_on_failure() {
+        let mut app = BimApp::new().unwrap();
+        let before = app.documents[0].session.summary().elements;
+
+        app.open_recipe_form(DUCT_CATEGORY, OP_DUCT_ELBOW, "风管·90°弯头");
+        assert!(app.op_form.is_some(), "表单应打开");
+
+        app.confirm_op_form();
+        assert!(app.op_form.is_some(), "失败应保持表单打开（可改后重试）");
+        assert_eq!(
+            app.documents[0].session.summary().elements,
+            before,
+            "失败应回滚删除刚建构件（不留孤儿元素）"
+        );
+    }
+
+    /// G6-M13 钉 3：op_buttons 的九条算子全有专业参数定义（param_defs
+    /// 非空）——配方参数化全覆盖；后续新增算子未覆写 param_defs 时此钉提示。
+    #[test]
+    fn op_buttons_ops_all_have_param_defs() {
+        let app = BimApp::new().unwrap();
+        for btn in op_buttons() {
+            let defs = app.documents[0]
+                .session
+                .modules()
+                .registry()
+                .geometry_op(btn.op_id)
+                .unwrap_or_else(|| panic!("算子 `{}` 应已登记", btn.op_id))
+                .param_defs();
+            assert!(
+                !defs.is_empty(),
+                "配方按钮「{}」的算子 `{}` 应声明专业参数定义",
+                btn.label,
+                btn.op_id
+            );
+        }
+    }
+
     /// 多文档钉 1（G6-M10）：初始恰好一份文档、激活下标 0、
     /// 页签标题带脏标记（未保存的新文档显示"未命名 *"）。
     #[test]
@@ -3845,7 +4060,7 @@ mod tests {
         let mut app = BimApp::new().unwrap();
         // 造一个编辑态残留（参数表单浮窗开着）。
         app.op_form = Some(OpForm {
-            op: BuildOp::MakeBox,
+            source: OpFormSource::Native(BuildOp::MakeBox),
             values: BTreeMap::new(),
         });
         app.do_new();

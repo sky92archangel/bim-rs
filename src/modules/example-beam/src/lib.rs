@@ -30,7 +30,8 @@
 use core_sdk::{
     AnnotationContext, AnnotationNeed, AnnotationRule, BuildOp, BuildStep, CreateRequest, Element,
     ElementFactory, FieldDef, FieldType, GeometryOp, LayerSpec, Module, ModuleManifest, OpInput,
-    OpOutput, PropertyMap, PropertySchema, Registry, SdkError, SdkResult, Value, build_element,
+    OpOutput, ParamDef, ParamDefault, ParamKind, PropertyMap, PropertySchema, Registry, SdkError,
+    SdkResult, Value, build_element,
 };
 
 /// 模块 id（反向域名风格）。
@@ -183,6 +184,30 @@ impl GeometryOp for BeamGeometryOp {
         "由 宽×高×长 生成梁体，并按定位点放置"
     }
 
+    /// 专业参数定义（G6-M13：GUI 配方表单，键与 `apply` 的 `f64_or` 逐字对账）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        vec![
+            ParamDef::optional(
+                "width",
+                "截面宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "height",
+                "截面高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "length",
+                "梁长",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_LENGTH_MM),
+            ),
+        ]
+    }
+
     fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
         let width = input.f64_or("width", DEFAULT_WIDTH_MM);
         let height = input.f64_or("height", DEFAULT_HEIGHT_MM);
@@ -237,6 +262,43 @@ impl GeometryOp for BeamHoleOp {
 
     fn description(&self) -> &str {
         "由 宽×高×长 生成梁体并按孔径/孔长开孔，再按定位点放置"
+    }
+
+    /// 专业参数定义（G6-M13：含开孔专业参数 hole_radius / hole_length——
+    /// schema 未覆盖的专业参数，配方表单是它们的 GUI 入口）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        vec![
+            ParamDef::optional(
+                "width",
+                "截面宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "height",
+                "截面高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "length",
+                "梁长",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_LENGTH_MM),
+            ),
+            ParamDef::optional(
+                "hole_radius",
+                "孔半径",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HOLE_RADIUS_MM),
+            ),
+            ParamDef::optional(
+                "hole_length",
+                "孔长",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HOLE_LENGTH_MM),
+            ),
+        ]
     }
 
     fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
@@ -311,6 +373,43 @@ impl GeometryOp for BeamTeeOp {
 
     fn description(&self) -> &str {
         "由 T 形截面沿梁长方向拉伸成体，再按定位点放置"
+    }
+
+    /// 专业参数定义（G6-M13：T 形三参数 flange_width / flange_thickness /
+    /// web_thickness——schema 未覆盖的专业参数，配方表单是它们的 GUI 入口）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        vec![
+            ParamDef::optional(
+                "flange_width",
+                "翼缘宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_FLANGE_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "flange_thickness",
+                "翼缘厚",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_FLANGE_THICKNESS_MM),
+            ),
+            ParamDef::optional(
+                "web_thickness",
+                "腹板厚",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_WEB_THICKNESS_MM),
+            ),
+            ParamDef::optional(
+                "height",
+                "总高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "length",
+                "梁长",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_LENGTH_MM),
+            ),
+        ]
     }
 
     fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
@@ -831,5 +930,103 @@ mod tests {
         let text = serde_json::to_string(&out).expect("配方应可序列化");
         let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");
         assert_eq!(back, out, "JSON 往返后配方应逐字段相等");
+    }
+
+    /// **G6-M13 对账钉（静态侧）**：三算子 `param_defs` 的键序 / 键名 /
+    /// 缺省值与 `apply` 内 `f64_or` 逐字对账；参数全为可选（f64_or 自带
+    /// 缺省，用户不给值也能建几何）——防 param_defs 侧手误。
+    #[test]
+    fn param_defs_match_the_apply_fallbacks() {
+        // (算子, [(键, 缺省)])——与 apply 的 f64_or 键序一致。
+        type Case<'a> = (&'a dyn GeometryOp, &'a [(&'static str, f64)]);
+        let cases: [Case<'_>; 3] = [
+            (
+                &BeamGeometryOp,
+                &[
+                    ("width", DEFAULT_WIDTH_MM),
+                    ("height", DEFAULT_HEIGHT_MM),
+                    ("length", DEFAULT_LENGTH_MM),
+                ],
+            ),
+            (
+                &BeamHoleOp,
+                &[
+                    ("width", DEFAULT_WIDTH_MM),
+                    ("height", DEFAULT_HEIGHT_MM),
+                    ("length", DEFAULT_LENGTH_MM),
+                    ("hole_radius", DEFAULT_HOLE_RADIUS_MM),
+                    ("hole_length", DEFAULT_HOLE_LENGTH_MM),
+                ],
+            ),
+            (
+                &BeamTeeOp,
+                &[
+                    ("flange_width", DEFAULT_FLANGE_WIDTH_MM),
+                    ("flange_thickness", DEFAULT_FLANGE_THICKNESS_MM),
+                    ("web_thickness", DEFAULT_WEB_THICKNESS_MM),
+                    ("height", DEFAULT_HEIGHT_MM),
+                    ("length", DEFAULT_LENGTH_MM),
+                ],
+            ),
+        ];
+        for (op, expected) in cases {
+            let defs = op.param_defs();
+            assert_eq!(
+                defs.len(),
+                expected.len(),
+                "{} 的参数数应与 apply 对账",
+                op.id()
+            );
+            for (d, (key, default)) in defs.iter().zip(expected.iter()) {
+                assert_eq!(d.key, *key, "{} 的参数键应对账", op.id());
+                assert_eq!(
+                    d.default,
+                    Some(ParamDefault::Float(*default)),
+                    "{} 的键 `{}` 缺省应与 f64_or 一致",
+                    op.id(),
+                    d.key
+                );
+                assert!(!d.required, "{} 的键 `{}` 应为可选", op.id(), d.key);
+            }
+        }
+    }
+
+    /// **G6-M13 对账钉（行为侧）**：`param_defs` 的每个键填**非缺省哨兵值**
+    /// 后，要么配方与全缺省版**不同**（哨兵被吸收），要么触发**退化拒绝**
+    /// （BadParameter——BeamTeeOp 的 web_thickness ≥ flange_width /
+    /// flange_thickness ≥ height）——两条路都证明键名对账成立。键名对不上
+    /// 时哨兵被 `f64_or` 忽略、配方不变，此钉即红（防"表单填了但算子读不到"
+    /// 的键名漂移）。
+    #[test]
+    fn param_defs_keys_feed_the_apply_recipe() {
+        const SENTINEL: f64 = 777.0;
+        let ops: [&dyn GeometryOp; 3] = [&BeamGeometryOp, &BeamHoleOp, &BeamTeeOp];
+        for op in ops {
+            let baseline = op
+                .apply(&OpInput::new(PropertyMap::new(CATEGORY)))
+                .expect("全缺省输入应合法");
+            for def in op.param_defs() {
+                let mut input = OpInput::new(PropertyMap::new(CATEGORY));
+                input.params.set(def.key, Value::Float(SENTINEL));
+                match op.apply(&input) {
+                    Ok(out) => assert_ne!(
+                        out,
+                        baseline,
+                        "{} 的键 `{}` 填哨兵后配方应变化（键名对不上则被 f64_or 忽略）",
+                        op.id(),
+                        def.key
+                    ),
+                    Err(SdkError::BadParameter(_)) => {
+                        // 键被读到但触发退化拒绝（单键哨兵、其余全缺省：
+                        // BadParameter 只能由哨兵触发）——键名对账成立，容忍。
+                    }
+                    Err(e) => panic!(
+                        "{} 的键 `{}` 填哨兵后应只成功或 BadParameter，实得 {e}",
+                        op.id(),
+                        def.key
+                    ),
+                }
+            }
+        }
     }
 }

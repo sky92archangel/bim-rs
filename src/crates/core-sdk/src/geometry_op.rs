@@ -880,6 +880,22 @@ pub trait GeometryOp: Send + Sync {
     fn description(&self) -> &str {
         ""
     }
+
+    /// 模块算子的**专业参数定义**（G6-M13：GUI 配方表单共用，单一事实源
+    /// 照 [`BuildOp::param_defs`] 先例）。
+    ///
+    /// 缺省**无专业参数**（空表）——只实现 [`Self::id`] / [`Self::display_name`]
+    /// / [`Self::apply`] 的算子不参与配方参数化（GUI 点击直接建，照 G6-M12
+    /// 现状）。模块算子按需覆写：参数全部走 [`ParamDef::optional`] 语义——
+    /// 模块在 [`Self::apply`] 内部以 `OpInput::f64_or(key, default)` 自带缺省，
+    /// 用户不给值也能建几何。
+    ///
+    /// 键名与 `apply` 内的 `f64_or` 键**逐字对账**（各模块对账钉保证不漂移）；
+    /// **定位点不在此表**——走 `OpInput::anchor`，由放置语义承载
+    /// （`build_geometry` 以 `[0, 0, 0]` 锚构造 `OpInput`）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -1125,6 +1141,17 @@ mod tests {
     fn op_labels_are_available_for_ui() {
         assert_eq!(BuildOp::Fuse.label(), "布尔并");
         assert_eq!(BuildOp::MakeCylinder.label(), "圆柱");
+    }
+
+    /// **G6-M13 钉**：`GeometryOp::param_defs` 默认方法返回**空表**——
+    /// 只实现必需方法（id / display_name / apply）的算子不参与配方参数化，
+    /// GUI 点击直接建（照 G6-M12 现状）。[`RectTrayOp`] 未覆写，正好验证。
+    #[test]
+    fn geometry_op_param_defs_default_to_empty() {
+        assert!(
+            RectTrayOp.param_defs().is_empty(),
+            "未覆写 param_defs 的算子应返回空表"
+        );
     }
 
     /// **B6.2a 钉子 9**：8 个新算子的 `arity()` / `label()` 逐字一致；`Loft` 当时是

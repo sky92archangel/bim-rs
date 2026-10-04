@@ -53,7 +53,8 @@
 use core_sdk::{
     AnnotationContext, AnnotationNeed, AnnotationRule, BuildOp, BuildStep, CreateRequest, Element,
     ElementFactory, FieldDef, FieldType, GeometryOp, LayerSpec, Module, ModuleManifest, OpInput,
-    OpOutput, PropertyMap, PropertySchema, Registry, SdkError, SdkResult, Value, build_element,
+    OpOutput, ParamDef, ParamDefault, ParamKind, PropertyMap, PropertySchema, Registry, SdkError,
+    SdkResult, Value, build_element,
 };
 
 /// 模块 id（反向域名风格）。
@@ -219,6 +220,30 @@ impl GeometryOp for DuctRectOp {
         "由 宽×高×延米 生成长方体风管段，按定位点放置"
     }
 
+    /// 专业参数定义（G6-M13：GUI 配方表单，键与 `apply` 的 `f64_or` 逐字对账）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        vec![
+            ParamDef::optional(
+                "width",
+                "风管宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "height",
+                "风管高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "length",
+                "延米长度",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_LENGTH_MM),
+            ),
+        ]
+    }
+
     fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
         let width = input.f64_or("width", DEFAULT_WIDTH_MM);
         let height = input.f64_or("height", DEFAULT_HEIGHT_MM);
@@ -279,6 +304,44 @@ impl GeometryOp for DuctTransitionOp {
 
     fn description(&self) -> &str {
         "由 起端/末端矩形截面沿轴线放样成渐缩段（Loft），定位点为起端截面中心"
+    }
+
+    /// 专业参数定义（G6-M13：变径四参数 start_width / start_height /
+    /// end_width / end_height——schema 未覆盖的专业参数，配方表单是它们的
+    /// GUI 入口）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        vec![
+            ParamDef::optional(
+                "start_width",
+                "起端宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_START_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "start_height",
+                "起端高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_START_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "end_width",
+                "末端宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_END_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "end_height",
+                "末端高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_END_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "length",
+                "延米长度",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_LENGTH_MM),
+            ),
+        ]
     }
 
     fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
@@ -385,6 +448,31 @@ impl GeometryOp for DuctElbowOp {
 
     fn description(&self) -> &str {
         "由 矩形断面沿四分之一圆弧脊线扫成 90° 弯头（Pipe），定位点为断面中心"
+    }
+
+    /// 专业参数定义（G6-M13：含转弯半径专业参数 turn_radius——schema 未
+    /// 覆盖的专业参数，配方表单是它的 GUI 入口）。
+    fn param_defs(&self) -> Vec<ParamDef> {
+        vec![
+            ParamDef::optional(
+                "width",
+                "风管宽",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_WIDTH_MM),
+            ),
+            ParamDef::optional(
+                "height",
+                "风管高",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_HEIGHT_MM),
+            ),
+            ParamDef::optional(
+                "turn_radius",
+                "转弯半径",
+                ParamKind::Length,
+                ParamDefault::Float(DEFAULT_TURN_RADIUS_MM),
+            ),
+        ]
     }
 
     fn apply(&self, input: &OpInput) -> SdkResult<OpOutput> {
@@ -960,6 +1048,99 @@ mod tests {
         let text = serde_json::to_string(&out).expect("配方应可序列化");
         let back: OpOutput = serde_json::from_str(&text).expect("配方应可反序列化");
         assert_eq!(back, out, "JSON 往返后配方应逐字段相等");
+    }
+
+    /// **G6-M13 对账钉（静态侧）**：三算子 `param_defs` 的键序 / 键名 /
+    /// 缺省值与 `apply` 内 `f64_or` 逐字对账；参数全为可选（f64_or 自带
+    /// 缺省，用户不给值也能建几何）——防 param_defs 侧手误。
+    #[test]
+    fn param_defs_match_the_apply_fallbacks() {
+        // (算子, [(键, 缺省)])——与 apply 的 f64_or 键序一致。
+        type Case<'a> = (&'a dyn GeometryOp, &'a [(&'static str, f64)]);
+        let cases: [Case<'_>; 3] = [
+            (
+                &DuctRectOp,
+                &[
+                    ("width", DEFAULT_WIDTH_MM),
+                    ("height", DEFAULT_HEIGHT_MM),
+                    ("length", DEFAULT_LENGTH_MM),
+                ],
+            ),
+            (
+                &DuctTransitionOp,
+                &[
+                    ("start_width", DEFAULT_START_WIDTH_MM),
+                    ("start_height", DEFAULT_START_HEIGHT_MM),
+                    ("end_width", DEFAULT_END_WIDTH_MM),
+                    ("end_height", DEFAULT_END_HEIGHT_MM),
+                    ("length", DEFAULT_LENGTH_MM),
+                ],
+            ),
+            (
+                &DuctElbowOp,
+                &[
+                    ("width", DEFAULT_WIDTH_MM),
+                    ("height", DEFAULT_HEIGHT_MM),
+                    ("turn_radius", DEFAULT_TURN_RADIUS_MM),
+                ],
+            ),
+        ];
+        for (op, expected) in cases {
+            let defs = op.param_defs();
+            assert_eq!(
+                defs.len(),
+                expected.len(),
+                "{} 的参数数应与 apply 对账",
+                op.id()
+            );
+            for (d, (key, default)) in defs.iter().zip(expected.iter()) {
+                assert_eq!(d.key, *key, "{} 的参数键应对账", op.id());
+                assert_eq!(
+                    d.default,
+                    Some(ParamDefault::Float(*default)),
+                    "{} 的键 `{}` 缺省应与 f64_or 一致",
+                    op.id(),
+                    d.key
+                );
+                assert!(!d.required, "{} 的键 `{}` 应为可选", op.id(), d.key);
+            }
+        }
+    }
+
+    /// **G6-M13 对账钉（行为侧）**：`param_defs` 的每个键填**非缺省哨兵值**
+    /// 后，配方必须与全缺省版不同——键名对不上时哨兵被 `f64_or` 忽略、
+    /// 配方不变，此钉即红（防"表单填了但算子读不到"的键名漂移）。
+    #[test]
+    fn param_defs_keys_feed_the_apply_recipe() {
+        const SENTINEL: f64 = 777.0;
+        let ops: [&dyn GeometryOp; 3] = [&DuctRectOp, &DuctTransitionOp, &DuctElbowOp];
+        for op in ops {
+            let baseline = op
+                .apply(&OpInput::new(PropertyMap::new(CATEGORY)))
+                .expect("全缺省输入应合法");
+            for def in op.param_defs() {
+                let mut input = OpInput::new(PropertyMap::new(CATEGORY));
+                input.params.set(def.key, Value::Float(SENTINEL));
+                match op.apply(&input) {
+                    Ok(out) => assert_ne!(
+                        out,
+                        baseline,
+                        "{} 的键 `{}` 填哨兵后配方应变化（键名对不上则被 f64_or 忽略）",
+                        op.id(),
+                        def.key
+                    ),
+                    Err(SdkError::BadParameter(_)) => {
+                        // 键被读到但触发退化拒绝（若未来本模块算子加退化
+                        // 校验）——键名对账成立，容忍。
+                    }
+                    Err(e) => panic!(
+                        "{} 的键 `{}` 填哨兵后应只成功或 BadParameter，实得 {e}",
+                        op.id(),
+                        def.key
+                    ),
+                }
+            }
+        }
     }
 
     // ---------- 标注 / 图层 / 边界 ----------

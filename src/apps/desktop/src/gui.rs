@@ -1573,7 +1573,9 @@ impl BimApp {
     }
 
     /// Ribbon（G6-M8）：Revit 风格页签化工具区——页签行（建模/草图/视图）+
-    /// 内容行（分组面板：按钮堆叠 + 底部小标题 + 竖分隔线）。替换 G2 单行 toolbar。
+    /// 内容行（分组下拉：每组一个 menu_button，点击弹出竖排命令列表）。
+    /// 替换 G2 单行 toolbar。走查反馈 2026-10-10 二轮：横排直铺仍占面积，
+    /// 改分组下拉（Ribbon 压到两行，紧凑不占大量面积）。
     fn ribbon(&mut self, ui: &mut egui::Ui) {
         // 页签行
         ui.horizontal(|ui| {
@@ -1588,8 +1590,9 @@ impl BimApp {
             }
         });
         ui.separator();
-        // 内容行（分组面板）
-        ui.horizontal(|ui| match self.ribbon_tab {
+        // 内容行（分组下拉——走查反馈 2026-10-10 二轮：横排直铺仍占面积，
+        // 改每组一个 menu_button 下拉；horizontal_wrapped 防窄窗溢出自动换行）
+        ui.horizontal_wrapped(|ui| match self.ribbon_tab {
             RibbonTab::Model => {
                 for (icon, name, ops) in build_groups() {
                     self.ribbon_build_group(ui, icon, name, &ops);
@@ -1601,13 +1604,13 @@ impl BimApp {
         });
     }
 
-    /// 一个 Ribbon 构建分组面板：算子按钮竖排堆叠（元数启用——0 输入恒可用；
-    /// 1 输入需选中构件；2 输入需主选 + 副选；变长禁用说明，绝不静默）+
-    /// 底部小标题；点击开参数表单浮窗。照旧工具栏时期的元数口径，
-    /// 菜单下拉改为面板直铺。
+    /// 一个 Ribbon 构建分组：下拉菜单按钮（走查反馈 2026-10-10 二轮：横排
+    /// 直铺仍占面积，改每组一个 menu_button——点击弹出竖排命令列表，Ribbon
+    /// 压到两行；元数启用——0 输入恒可用；1 输入需选中构件；2 输入需主选 +
+    /// 副选；变长禁用说明，绝不静默）；命令点击开参数表单浮窗。照旧工具栏
+    /// 时期的元数口径，面板直铺改回菜单下拉。
     fn ribbon_build_group(&mut self, ui: &mut egui::Ui, icon: &str, name: &str, ops: &[BuildOp]) {
-        ui.vertical(|ui| {
-            ui.set_min_width(92.0);
+        ui.menu_button(format!("{icon} {name} ▾"), |ui| {
             for &op in ops {
                 let (ready, tip) = if op.is_variadic() {
                     (false, "变长输入：草图流程接入后可用")
@@ -1632,28 +1635,28 @@ impl BimApp {
                     .clicked()
                 {
                     self.open_op_form(op);
+                    ui.close_menu();
                 }
             }
-            ui.vertical_centered(|ui| ui.weak(name));
         });
         ui.separator();
     }
 
-    /// 模块配方面板（计划 §5.1：G6-M12 起九条配方按钮——G6-M13 起算子有
+    /// 模块配方下拉（计划 §5.1：G6-M12 起九条配方按钮——G6-M13 起算子有
     /// 专业参数定义时**先弹参数表单**（确认才建），无定义直接建兜底）。
+    /// 走查反馈 2026-10-10 二轮：横排直铺改 menu_button 下拉（紧凑不占面积）。
     fn ribbon_recipes(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
-        ui.vertical(|ui| {
-            ui.set_min_width(128.0);
+        ui.menu_button(format!("{} 模块配方 ▾", ph::PACKAGE), |ui| {
             for btn in op_buttons() {
                 if ui
                     .button(format!("{} {}", ph::PACKAGE, btn.label))
                     .clicked()
                 {
                     self.recipe_button_clicked(&btn);
+                    ui.close_menu();
                 }
             }
-            ui.vertical_centered(|ui| ui.weak("模块配方"));
         });
     }
 
@@ -1678,7 +1681,7 @@ impl BimApp {
     /// 落盘语义；放样路径先行：先选中路径构件再打开放样草图）。
     fn ribbon_sketch_entries(&mut self, ui: &mut egui::Ui) {
         use egui_phosphor::regular as ph;
-        ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (name, icon, entry) in [
                 ("通用草图", ph::VECTOR_THREE, SketchEntry::Profile),
                 ("拉伸草图", ph::FRAME_CORNERS, SketchEntry::Extrude),
@@ -1733,7 +1736,6 @@ impl BimApp {
                     }
                 }
             }
-            ui.vertical_centered(|ui| ui.weak("草图入口"));
         });
     }
 

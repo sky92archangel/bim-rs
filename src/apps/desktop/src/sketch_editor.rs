@@ -648,7 +648,9 @@ fn draw_canvas(st: &mut SketchEditorState, ui: &mut egui::Ui) -> CanvasEvent {
             // 标注（显示型）：专属青蓝底色，与几何图元区分。
             DIM_COLOR
         } else {
-            egui::Color32::from_rgb(0xe0, 0xe0, 0xe0)
+            // 浅色画布配色（走查反馈 2026-10-10）：普通实体线改深灰做前景
+            // （原 0xe0e0e0 是深色主题值，浅底上几乎隐形）。
+            egui::Color32::from_rgb(0x2e, 0x34, 0x40)
         };
         draw_entity(&painter, e, &to_px, scale, color);
     }
@@ -712,8 +714,10 @@ fn draw_grid_lines(
     st: &SketchEditorState,
     to_px: &dyn Fn(DVec2) -> egui::Pos2,
 ) {
-    let fine = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x38, 0x3d, 0x47));
-    let major = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x4c, 0x53, 0x60));
+    // 浅色画布配色（走查反馈 2026-10-10）：网格调浅退到背景层（原深色主题
+    // 值 0x383d47/0x4c5360 在浅底上喧宾夺主，盖住图形），实体深色做前景。
+    let fine = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xe2, 0xe6, 0xee));
+    let major = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xc4, 0xcc, 0xda));
     let scale = st.view_scale;
     let half_w = rect.width() as f64 / 2.0 / scale;
     let half_h = rect.height() as f64 / 2.0 / scale;

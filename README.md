@@ -6,6 +6,8 @@
 
 ---
 
+![](E:\WORKSPACE\CODE_RUST\bim-rs\README.assets\QQ图片20261016094304.jpg)
+
 ## 快速开始
 
 ```bash

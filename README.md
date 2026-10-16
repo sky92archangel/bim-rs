@@ -17,6 +17,12 @@ cargo xtask check-deps                       # 校验依赖方向（架构门禁
 
 # M0 真实内核验证（加载 occt-wasm 的 WASM，慢；务必加 --release）
 cargo test -p core-kernel --features occt --release
+
+# 桌面 GUI —— mock 内核（秒开；无真面拓扑，拾取面命中后精算必然失败，属预期边界）
+cargo run -p bim-desktop --features gui
+
+# 桌面 GUI —— 真内核 occt（拾取面/边/顶点可用；首次编译慢属正常）
+cargo run -p bim-desktop --features gui,occt
 ```
 
 依赖走本机已配置的 crates.io 镜像源，无需额外设置。
